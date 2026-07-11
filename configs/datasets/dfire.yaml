@@ -1,0 +1,13 @@
+# D-Fire dataset (official train / val / test splits)
+# Copy to your machine and set `path` to the dataset root.
+
+path: ./datasets/D-Fire/data
+train: train/images
+val: val/images
+test: test/images
+
+nc: 2
+
+names:
+  0: class0
+  1: class1

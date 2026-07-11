@@ -1,0 +1,23 @@
+# D-Fire dataset (official train / val / test splits)
+# Dataset structure:
+# datasets/D-Fire/data/
+#   ├── train/
+#   │   ├── images/
+#   │   └── labels/
+#   ├── val/
+#   │   ├── images/
+#   │   └── labels/
+#   └── test/
+#       ├── images/
+#       └── labels/
+#
+# Legacy merged split (train+val combined, tests as val): datasets/D-Fire_old/
+
+path:  ./datasets/D-Fire/data
+train: train/images
+val: val/images
+test: test/images
+
+names:
+  0: class0
+  1: class1
