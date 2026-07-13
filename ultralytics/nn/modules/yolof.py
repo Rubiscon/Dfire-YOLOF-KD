@@ -99,7 +99,7 @@ class DeconvNet(nn.Module):
 
 
 class DictionaryModule(nn.Module):
-    """Proposal 'dictionary module' for backbone distillation (CrisReport fig. 2).
+    """Early-stage backbone dictionary module (student n10 ↔ teacher x6, fig. 2).
 
     Matches every student backbone channel (query) to its closest teacher early-feature
     channel (key) via a correlation matrix of pooled channel tokens, then reorganizes the
@@ -127,11 +127,12 @@ class DictionaryModule(nn.Module):
 
     def __init__(self, c_t: int, c_s: int, t_size: int, s_size: int, grid: int = 4):
         super().__init__()
-        # Conv + BN eliminate the feature distribution discrepancy before pooling (proposal III.a).
+        # Teacher key path: Conv+BN then pool to ~1/16 spatial size (proposal early-feature encoder).
         self.key_enc = nn.Sequential(
-            nn.Conv2d(c_t, c_t, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.Conv2d(c_t, c_t, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(c_t),
         )
+        # Student query path: same encoder family without downsampling conv stride.
         self.query_enc = nn.Sequential(
             nn.Conv2d(c_s, c_s, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(c_s),

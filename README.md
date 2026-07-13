@@ -79,7 +79,10 @@ python scripts/train_baselines.py --baseline yolo26n
 # 2. YOLO26n-DCN student without distillation
 python scripts/train_baselines.py --baseline dcn-solo
 
-# 3. Online KD (dictionary + neck + response distillation)
+# 3. Early-stage KD (dictionary n10↔x6 + neck + response)
+python scripts/train_baselines.py --baseline kd-early
+
+# 4. Full KD stack (same early dict + neck + response)
 python scripts/train_baselines.py --baseline kd-p0
 
 # Run all three in sequence
@@ -112,7 +115,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 | `batch` | `112` | Shared across all baselines |
 | `online_distill` | `True` | Joint teacher training until freeze epoch |
 | `teacher_freeze_epoch` | `110` | 1-indexed; teacher frozen afterward |
-| `dict_teacher_layers` | `[4, 6]` | See planned changes below |
+| `dict_teacher_layers` | `[6]` | Early stage: teacher x6 (P4/16); late x10 added when merged |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck and response weights |
 | `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | Backbone dictionary weights |
 
@@ -124,12 +127,11 @@ Full override keys are registered in `ultralytics/cfg/__init__.py`.
 
 | Item | Current | Target |
 |------|---------|--------|
-| Dictionary teacher layers | `[4, 6]` | `[6, 10]` |
-| Offline KD preset | only via manual overrides | add `kd-offline` baseline in `train_baselines.py` |
-| Saliency weighting | `∂L_task/∂F` (channel-mean) | stricter spatial-attention gradient |
+| Late-stage dictionary | not enabled | mentor: n10↔x10 (layer 10), merge with early |
+| Offline KD preset | manual overrides | `kd-offline` baseline |
 | Model yaml location | root + `models/` duplicate | single path under `models/` |
 | Ablation configs | manual edits | `configs/ablation/*.yaml` presets |
-| `teacher_val_interval` | default `1` | set `0` during long runs to save val time |
+| `teacher_val_interval` | default `1` | set `0` during long runs |
 
 ---
 
@@ -221,7 +223,10 @@ python scripts/train_baselines.py --baseline yolo26n
 # 2. YOLO26n-DCN 无蒸馏
 python scripts/train_baselines.py --baseline dcn-solo
 
-# 3. 在线 KD（dictionary + neck + response）
+# 3. Early-stage KD（dictionary n10↔x6 + neck + response）
+python scripts/train_baselines.py --baseline kd-early
+
+# 4. 完整 KD（与 kd-early 相同 early dict + neck + response）
 python scripts/train_baselines.py --baseline kd-p0
 
 # 依次运行全部
@@ -254,7 +259,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 | `batch` | `112` | 所有基线统一 |
 | `online_distill` | `True` | 冻结前教师与 GT 联合训练 |
 | `teacher_freeze_epoch` | `110` | 1-indexed；之后教师冻结 |
-| `dict_teacher_layers` | `[4, 6]` | 见下方计划更改 |
+| `dict_teacher_layers` | `[6]` | Early：教师 x6（P4/16）；late x10 待合并 |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck / Response 权重 |
 | `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | Dictionary 两项损失 |
 
@@ -266,12 +271,11 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | 项目 | 当前 | 目标 |
 |------|------|------|
-| Dictionary 教师层 | `[4, 6]` | `[6, 10]` |
-| 离线 KD 预设 | 需手动改 overrides | 在 `train_baselines.py` 增加 `kd-offline` |
-| Saliency 权重 | `∂L_task/∂F`（channel mean） | 对 spatial attention 的严格梯度 |
+| Late-stage dictionary | 未启用 | 导师：n10↔x10（layer 10），与 early 合并 |
+| 离线 KD 预设 | 手动 overrides | `kd-offline` baseline |
 | 模型 yaml 路径 | 根目录与 `models/` 重复 | 统一到 `models/` |
 | 消融实验配置 | 手改参数 | `configs/ablation/*.yaml` 预设 |
-| `teacher_val_interval` | 默认每 epoch 验证教师 | 长训时设为 `0` 以节省时间 |
+| `teacher_val_interval` | 默认每 epoch 验证教师 | 长训时设为 `0` |
 
 ---
 

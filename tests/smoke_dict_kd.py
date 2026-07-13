@@ -35,7 +35,7 @@ args = SimpleNamespace(
     distill_iou_thres=0.5,
     dict_align_loss=0.08,
     dict_attn_loss=0.25,
-    dict_teacher_layers=[4, 6],
+    dict_teacher_layers=[6],
     dict_student_layer=10,
     dict_start_epoch=0,
     dict_weight="saliency",
@@ -61,7 +61,7 @@ teacher.requires_grad_(True)
 model.teacher = teacher
 
 model.build_distillation_modules(imgsz=imgsz)
-assert len(model.dictionary_modules) == 2, "expected 2 dictionary modules"
+assert len(model.dictionary_modules) == 1, "expected 1 early-stage dictionary module (n10↔x6)"
 print("dictionary modules built:", [type(m).__name__ for m in model.dictionary_modules])
 
 model.to(device)
@@ -118,7 +118,7 @@ model.train()
 _ = model._predict_once(batch["img"])  # populate last_feature caches and _student_tap
 copy_model = deepcopy(model)
 assert copy_model._student_tap is None
-assert len(copy_model.dictionary_modules) == 2
+assert len(copy_model.dictionary_modules) == 1
 print("deepcopy (EMA path) OK")
 
 print("\nALL SMOKE TESTS PASSED")

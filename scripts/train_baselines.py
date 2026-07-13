@@ -3,11 +3,13 @@
 Baselines:
   1. yolo26n      - YOLO26n FPN upper bound (DetectionTrainer)
   2. dcn-solo     - YOLO26n-DCN / YOLOF student without KD (DetectionTrainer)
-  3. kd-p0        - Online KD, p0-5 config (YOLOFDistillationTrainer)
+  3. kd-early     - Early-stage dictionary distillation (n10↔x6, fig. 1/2)
+  4. kd-p0        - Full KD stack (early dict + neck + response)
 
 Usage:
   python scripts/train_baselines.py --baseline yolo26n
   python scripts/train_baselines.py --baseline dcn-solo
+  python scripts/train_baselines.py --baseline kd-early
   python scripts/train_baselines.py --baseline kd-p0
   python scripts/train_baselines.py --baseline all          # run 1 -> 2 -> 3 sequentially
   python scripts/train_baselines.py --baseline yolo26n --test-only  # eval best.pt on test split
@@ -51,6 +53,30 @@ COMMON: dict[str, Any] = {
 
 DEFAULT_BATCH = 112  # shared across baselines for experiment consistency; override with --batch if OOM
 
+# Shared online KD settings (neck + response); early dictionary layers configured per baseline.
+_KD_COMMON: dict[str, Any] = {
+    "online_distill": True,
+    "teacher_freeze_epoch": 110,
+    "teacher_freeze_use_ema": True,
+    "task_loss": 1.0,
+    "teacher_task_loss": 1.0,
+    "feature_norm": "channel",
+    "feature_loss": 0.08,
+    "align": True,
+    "align_start_epoch": 20,
+    "align_loss": 0.12,
+    "align_branch": "one2many",
+    "align_cls_mode": "kl",
+    "distill_temperature": 3,
+    "align_box": 2.0,
+    "align_cls": 4.0,
+    "distill_conf_thres": 0.25,
+    "distill_iou_thres": 0.5,
+    "dict_student_layer": 10,  # student backbone output n10 (C2PSA)
+    "dict_start_epoch": 0,
+    "dict_weight": "saliency",
+}
+
 BASELINES: dict[str, dict[str, Any]] = {
     "yolo26n": {
         "trainer": "detect",
@@ -66,38 +92,30 @@ BASELINES: dict[str, dict[str, Any]] = {
         "batch": DEFAULT_BATCH,
         "description": "YOLO26n-DCN (YOLOF head) without distillation",
     },
+    "kd-early": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-kd-early",
+        "batch": DEFAULT_BATCH,
+        "description": "Early-stage dictionary distillation: student n10 ↔ teacher x6 (layer 6)",
+        **_KD_COMMON,
+        # Early stage only (fig. 1 left dictionary); late x10 left for separate merge.
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.10,
+        "dict_attn_loss": 0.30,
+    },
     "kd-p0": {
         "trainer": "kd",
         "model": "yolo26n-DCN.yaml",
         "teacher": "yolo26n.yaml",
         "name": "baseline-kd-p0",
         "batch": DEFAULT_BATCH,
-        "description": "Online KD with dictionary, neck, and response distillation",
-        # distillation
-        "online_distill": True,
-        "teacher_freeze_epoch": 110,  # 1-indexed; ep1-110 joint, ep111+ frozen teacher for distill only
-        "teacher_freeze_use_ema": True,  # copy ema.ema.teacher into live teacher before freeze
-        "task_loss": 1.0,
-        "teacher_task_loss": 1.0,
-        "feature_norm": "channel",
-        "feature_loss": 0.08,
-        "align": True,
-        "align_start_epoch": 20,
-        "align_loss": 0.12,
-        "align_branch": "one2many",
-        "align_cls_mode": "kl",
-        "distill_temperature": 3,
-        "align_box": 2.0,
-        "align_cls": 4.0,
-        "distill_conf_thres": 0.25,
-        "distill_iou_thres": 0.5,
-        # backbone distillation: dictionary modules (student n10 ↔ teacher backbone taps)
-        "dict_align_loss": 0.08,  # weighted (saliency) L2 between projected n10 and reorganized x4/x6
-        "dict_attn_loss": 0.25,  # AT-style spatial attention restriction loss
-        "dict_teacher_layers": [4, 6],
-        "dict_student_layer": 10,  # student backbone output n10 (C2PSA)
-        "dict_start_epoch": 0,
-        "dict_weight": "saliency",  # saliency (|dL_task/dF|, falls back to attention when teacher frozen) | attention | none
+        "description": "Full KD: early dictionary (n10↔x6) + neck + response distillation",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
     },
 }
 

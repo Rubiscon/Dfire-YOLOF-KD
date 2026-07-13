@@ -166,9 +166,8 @@ class YOLOFDistillationModel(DetectionModel):
         super().__init__(cfg, ch=ch, nc=nc, verbose=verbose)
         self.teacher = None
         self.feature_projectors = nn.ModuleList()
-        # Backbone distillation ("dictionary module", proposal fig. 1/2): student backbone
-        # feature (default layer 10, n10) learns from teacher early backbone features
-        # (default layers 4 and 6, x4/x6) via channel matching + weighted align loss.
+        # Early-stage backbone distillation (fig. 1/2): student n10 (layer 10) learns local
+        # structure from teacher early tap x6 (layer 6) via dictionary matching + weighted align.
         self.dictionary_modules = nn.ModuleList()
         self._dict_teacher_layers: List[int] = []
         self._dict_student_layer: int | None = None
@@ -296,7 +295,7 @@ class YOLOFDistillationModel(DetectionModel):
         """Routed forward through ``model`` that also returns intermediate outputs.
 
         Mirrors ``BaseModel._predict_once`` exactly but captures the output of every layer
-        index in ``tap_layers`` (used for backbone distillation features x4/x6/n10).
+        index in ``tap_layers`` (backbone distillation: n10, x6, …).
         """
         taps: Dict[int, torch.Tensor] = {}
         y = []
@@ -445,7 +444,7 @@ class YOLOFDistillationModel(DetectionModel):
         imgsz = imgsz or getattr(self.args, "imgsz", 640)
         dict_on = any(g > 0 for g in self._dict_gains())
         if dict_on:
-            t_layers = getattr(self.args, "dict_teacher_layers", None) or (4, 6)
+            t_layers = getattr(self.args, "dict_teacher_layers", None) or (6,)
             self._dict_teacher_layers = [int(x) for x in t_layers]
             self._dict_student_layer = int(getattr(self.args, "dict_student_layer", 10) or 10)
 
@@ -476,8 +475,9 @@ class YOLOFDistillationModel(DetectionModel):
                     t_feat = teacher_taps.get(li)
                     if t_feat is None:
                         raise RuntimeError(f"Teacher layer {li} (dict_teacher_layers) not found in teacher model.")
-                    # Proposal: teacher feature resolution decreased 16x before tokenization.
-                    grid = max(int(t_feat.shape[-1]) // 16, 2)
+                    # Proposal: avg-pool teacher tokens to ~1/16 of feature map side length.
+                    grid = max(int(t_feat.shape[-1]) // 16, 1)
+                    grid = max(grid, 2)  # min 2x2 tokens for stable channel correlation
                     modules.append(
                         DictionaryModule(
                             t_feat.shape[1], s_tap.shape[1], int(t_feat.shape[-1]), int(s_tap.shape[-1]), grid
@@ -558,23 +558,39 @@ class YOLOFDistillationModel(DetectionModel):
         start = int(getattr(self.args, "dict_start_epoch", 0) or 0)
         return self.current_epoch >= start
 
+    @staticmethod
+    def _spatial_attention(feat: torch.Tensor) -> torch.Tensor:
+        """Spatial attention map A = mean_c(F^2), shape (B, H, W) per proposal."""
+        return feat.float().pow(2).mean(dim=1)
+
     def _teacher_saliency(
         self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor | None
     ) -> Dict[int, torch.Tensor]:
-        """Saliency of teacher features w.r.t. the teacher task loss (proposal III.a).
+        """|dL_task/dA| per early teacher tap, A = spatial attention (proposal weighted align).
 
-        The saliency map is |dL_task/dF| averaged over channels: pixels whose attention the
-        task loss is most sensitive to carry the richest dark knowledge and get larger weight
-        in the weighted align loss. Only available while the teacher trains jointly (its task
-        loss graph exists); the caller falls back to the plain attention map otherwise.
+        Gradients are taken w.r.t. the spatial attention map (not raw features) while the
+        teacher is jointly trained; after freeze the caller falls back to A itself as weight.
         """
         if teacher_task_loss is None or not teacher_task_loss.requires_grad:
             return {}
-        feats = [f for f in teacher_taps.values() if f is not None and f.requires_grad]
-        if not feats:
+        attn_maps: List[torch.Tensor] = []
+        feats: List[torch.Tensor] = []
+        for li in self._dict_teacher_layers:
+            f = teacher_taps.get(li)
+            if f is None or not f.requires_grad:
+                continue
+            attn_maps.append(self._spatial_attention(f))
+            feats.append(f)
+        if not attn_maps:
             return {}
-        grads = torch.autograd.grad(teacher_task_loss.sum(), feats, retain_graph=True, allow_unused=True)
-        return {id(f): g for f, g in zip(feats, grads) if g is not None}
+        grads = torch.autograd.grad(
+            teacher_task_loss.sum(), attn_maps, retain_graph=True, allow_unused=True
+        )
+        return {
+            id(f): g.abs().unsqueeze(1)
+            for f, g in zip(feats, grads)
+            if g is not None
+        }
 
     def _dictionary_losses(
         self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor | None = None
@@ -619,10 +635,10 @@ class YOLOFDistillationModel(DetectionModel):
 
             grad = saliency.get(id(t_feat))
             if grad is not None:
-                weight = grad.abs().float().mean(dim=1, keepdim=True)
+                weight = grad.float()
             elif mode in {"saliency", "attention"}:
-                # Frozen/offline teacher: no task-loss graph; weight by teacher spatial attention.
-                weight = t_feat.detach().float().pow(2).mean(dim=1, keepdim=True)
+                # Frozen/offline teacher: no task-loss graph; weight by spatial attention A.
+                weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
             else:
                 weight = None
             if weight is not None:
@@ -631,8 +647,8 @@ class YOLOFDistillationModel(DetectionModel):
             else:
                 d_align = d_align + F.mse_loss(pred, target)
 
-            att_s = F.normalize(s_proj.float().pow(2).mean(dim=1).flatten(1), dim=1)
-            att_t = F.normalize(t_reorg.float().pow(2).mean(dim=1).flatten(1), dim=1)
+            att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
+            att_t = F.normalize(self._spatial_attention(t_reorg).flatten(1), dim=1)
             d_attn = d_attn + (att_s - att_t).pow(2).sum(dim=1).mean()
             n += 1
 
