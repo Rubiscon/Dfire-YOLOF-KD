@@ -86,6 +86,8 @@ assert torch.isfinite(total).all() and torch.isfinite(items).all(), "non-finite 
 print("joint-phase items:", [round(float(x), 4) for x in items])
 assert items[5] > 0, "dict_loss should be non-zero in joint phase"
 assert items[6] > 0, "dattn_loss should be non-zero in joint phase"
+assert len(model._cached_saliency) >= 1, "saliency cache should be populated in joint phase"
+print("saliency layers cached:", list(model._cached_saliency.keys()))
 total.backward()
 proj_grads = [p.grad is not None and p.grad.abs().sum() > 0 for p in model.dictionary_modules[0].proj.parameters()]
 assert all(proj_grads), "dictionary projector received no gradient"

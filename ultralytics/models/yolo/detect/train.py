@@ -183,6 +183,8 @@ class YOLOFDistillationModel(DetectionModel):
         self._align_bce = nn.BCEWithLogitsLoss(reduction="none")
         self.last_align_stats: Dict[str, float] = {}
         self._teacher_frozen = False
+        # Detached spatial saliency maps from a prior teacher pass (avoids retain_graph peak).
+        self._cached_saliency: Dict[int, torch.Tensor] = {}
 
     def _teacher_joint_training(self) -> bool:
         """True while the teacher receives GT task loss (online joint phase).
@@ -563,37 +565,43 @@ class YOLOFDistillationModel(DetectionModel):
         """Spatial attention map A = mean_c(F^2), shape (B, H, W) per proposal."""
         return feat.float().pow(2).mean(dim=1)
 
-    def _teacher_saliency(
-        self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor | None
-    ) -> Dict[int, torch.Tensor]:
-        """|dL_task/dA| per early teacher tap, A = spatial attention (proposal weighted align).
-
-        Gradients are taken w.r.t. the spatial attention map (not raw features) while the
-        teacher is jointly trained; after freeze the caller falls back to A itself as weight.
-        """
-        if teacher_task_loss is None or not teacher_task_loss.requires_grad:
-            return {}
-        attn_maps: List[torch.Tensor] = []
+    def _collect_dict_teacher_feats(self, teacher_taps: Dict[int, torch.Tensor]) -> List[torch.Tensor]:
+        """Teacher tap tensors that participate in dictionary saliency / align."""
         feats: List[torch.Tensor] = []
         for li in self._dict_teacher_layers:
             f = teacher_taps.get(li)
-            if f is None or not f.requires_grad:
-                continue
-            attn_maps.append(self._spatial_attention(f))
-            feats.append(f)
-        if not attn_maps:
+            if f is not None and f.requires_grad:
+                feats.append(f)
+        return feats
+
+    def _compute_teacher_saliency(
+        self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor
+    ) -> Dict[int, torch.Tensor]:
+        """Spatial saliency for weighted align: channel-mean |∂L_task/∂F| (Grad-CAM style).
+
+        Proposal writes |∂L/∂A| with A=mean_c(F²). A is a side-branch of F and is *not* an
+        ancestor of L_task, so ``autograd.grad(L, A)`` is always ``None``. Using |∂L/∂F|
+        averaged over channels yields a valid spatial weight on the same (H,W) grid as A.
+
+        ``retain_graph=False``: call this on a *throwaway* teacher forward so the training
+        graph is built in a second forward without holding two graphs (OOM / thrash risk).
+        """
+        if teacher_task_loss is None or not teacher_task_loss.requires_grad:
+            return {}
+        feats = self._collect_dict_teacher_feats(teacher_taps)
+        if not feats:
             return {}
         grads = torch.autograd.grad(
-            teacher_task_loss.sum(), attn_maps, retain_graph=True, allow_unused=True
+            teacher_task_loss.sum(), feats, retain_graph=False, allow_unused=True
         )
         return {
-            id(f): g.abs().unsqueeze(1)
+            id(f): g.detach().abs().mean(dim=1, keepdim=True)
             for f, g in zip(feats, grads)
             if g is not None
         }
 
     def _dictionary_losses(
-        self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor | None = None
+        self, teacher_taps: Dict[int, torch.Tensor], saliency: Dict[int, torch.Tensor] | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Backbone distillation losses (proposal fig. 2): (weighted align loss, attention restriction loss).
 
@@ -613,7 +621,8 @@ class YOLOFDistillationModel(DetectionModel):
 
         mode = str(getattr(self.args, "dict_weight", "saliency")).lower()
         norm = str(getattr(self.args, "feature_norm", "channel")).lower()
-        saliency = self._teacher_saliency(teacher_taps, teacher_task_loss) if mode == "saliency" else {}
+        if saliency is None:
+            saliency = self._cached_saliency if mode == "saliency" else {}
 
         d_align = zero.clone()
         d_attn = zero.clone()
@@ -633,15 +642,21 @@ class YOLOFDistillationModel(DetectionModel):
                 pred = self._channel_standardize(pred)
                 target = self._channel_standardize(target)
 
-            grad = saliency.get(id(t_feat))
-            if grad is not None:
-                weight = grad.float()
-            elif mode in {"saliency", "attention"}:
-                # Frozen/offline teacher: no task-loss graph; weight by spatial attention A.
-                weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
-            else:
-                weight = None
+            # Remap cached saliency (keyed by throwaway-forward tensor id) via layer index.
+            weight = None
+            if mode == "saliency" and saliency:
+                # Prefer layer-keyed cache from the two-pass path.
+                weight = saliency.get(li)
+                if weight is None:
+                    weight = saliency.get(id(t_feat))
             if weight is not None:
+                weight = weight.float()
+            elif mode in {"saliency", "attention"}:
+                # Frozen/offline teacher, or saliency unavailable: weight by spatial attention A.
+                weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
+            if weight is not None:
+                if weight.shape[-2:] != pred.shape[-2:]:
+                    weight = F.interpolate(weight, size=pred.shape[-2:], mode="bilinear", align_corners=False)
                 weight = (weight / weight.mean(dim=(2, 3), keepdim=True).clamp_min(1e-12)).to(pred.dtype).detach()
                 d_align = d_align + (weight * (pred - target) ** 2).mean()
             else:
@@ -916,10 +931,39 @@ class YOLOFDistillationModel(DetectionModel):
         teacher_task_loss = torch.tensor(0.0, device=batch["img"].device)
         teacher_loss_items = torch.zeros(3, device=batch["img"].device)
         teacher_taps: Dict[int, torch.Tensor] = {}
+        self._cached_saliency = {}
+        want_saliency = (
+            dict_on
+            and teacher_joint
+            and str(getattr(self.args, "dict_weight", "saliency")).lower() == "saliency"
+        )
         if teacher_joint:
-            # Joint phase: teacher learns from GT; same forward feeds distillation targets.
             self._ensure_teacher_criterion()
             self.teacher.train()
+            if want_saliency:
+                # Pass 1: throwaway teacher forward → |∂L/∂F| saliency, free graph (no retain_graph).
+                # Holding retain_graph across student+teacher at large batch was a prime OOM/thrash cause.
+                # Freeze BN running-stat updates so this pass does not double-count toward EMA stats.
+                bn_backup: List[Tuple[nn.Module, float | None]] = []
+                for m in self.teacher.modules():
+                    if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
+                        bn_backup.append((m, m.momentum))
+                        m.momentum = 0.0
+                try:
+                    with torch.enable_grad():
+                        sal_preds, sal_taps = self._forward_with_taps(self.teacher, batch["img"], tap_layers)
+                        sal_loss, _ = self.teacher.loss(batch, sal_preds)
+                        sal_maps = self._compute_teacher_saliency(sal_taps, sal_loss)
+                        self._cached_saliency = {
+                            li: sal_maps[id(sal_taps[li])]
+                            for li in self._dict_teacher_layers
+                            if li in sal_taps and id(sal_taps[li]) in sal_maps
+                        }
+                        del sal_preds, sal_taps, sal_loss, sal_maps
+                finally:
+                    for m, mom in bn_backup:
+                        m.momentum = mom
+            # Pass 2 (or only pass): training graph for teacher_task + distill targets.
             teacher_preds, teacher_taps = self._forward_with_taps(self.teacher, batch["img"], tap_layers)
             teacher_task_loss, teacher_loss_items = self.teacher.loss(batch, teacher_preds)
             teacher_loss_items = teacher_loss_items.detach()
@@ -938,9 +982,7 @@ class YOLOFDistillationModel(DetectionModel):
         dict_align_loss = torch.tensor(0.0, device=batch["img"].device)
         dict_attn_loss = torch.tensor(0.0, device=batch["img"].device)
         if dict_on:
-            dict_align_loss, dict_attn_loss = self._dictionary_losses(
-                teacher_taps, teacher_task_loss if teacher_joint else None
-            )
+            dict_align_loss, dict_attn_loss = self._dictionary_losses(teacher_taps, self._cached_saliency)
 
         alpha = getattr(self.args, "task_loss", 1.0)
         beta = getattr(self.args, "feature_loss", 0.5)

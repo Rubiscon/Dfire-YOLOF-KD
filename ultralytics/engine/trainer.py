@@ -8,6 +8,7 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import math
 import os
@@ -265,8 +266,35 @@ class BaseTrainer:
             world_size=self.world_size,
         )
 
+    def _shutdown_dataloader(self, loader) -> None:
+        """Terminate InfiniteDataLoader workers before replacing the loader (Windows hang fix)."""
+        if loader is None:
+            return
+        try:
+            if hasattr(loader, "__del__"):
+                # Prefer explicit worker teardown; __del__ on InfiniteDataLoader force-terminates.
+                iterator = getattr(loader, "iterator", None)
+                if iterator is not None and hasattr(iterator, "_workers"):
+                    for w in iterator._workers:
+                        if w.is_alive():
+                            w.terminate()
+                    with contextlib.suppress(Exception):
+                        iterator._shutdown_workers()
+        except Exception:
+            pass
+
     def _build_train_pipeline(self):
         """Build dataloaders, optimizer, and scheduler for current batch size."""
+        # Critical on Windows: replacing loaders without killing old workers deadlocks the next epoch
+        # (CPU/GPU ~0%, RAM held) — common after first-epoch OOM auto-reduce.
+        old_train, old_test = getattr(self, "train_loader", None), getattr(self, "test_loader", None)
+        self._shutdown_dataloader(old_train)
+        self._shutdown_dataloader(old_test)
+        self.train_loader = None
+        self.test_loader = None
+        if old_train is not None or old_test is not None:
+            gc.collect()
+
         batch_size = self.batch_size // max(self.world_size, 1)
         self.train_loader = self.get_dataloader(
             self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"

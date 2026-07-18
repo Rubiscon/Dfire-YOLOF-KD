@@ -25,7 +25,7 @@ Dfire-YOLOF-KD/
 ## Requirements
 
 - Python ≥ 3.10
-- CUDA GPU (KD with `batch=112` typically needs ≥ 16 GB VRAM; use `--batch` to reduce if OOM)
+- CUDA GPU (solo `batch=112`; KD defaults to `batch=32` — raise with `--batch` if VRAM allows; saliency uses a second teacher pass)
 - PyTorch + torchvision
 
 ### Install
@@ -70,7 +70,7 @@ python tests/smoke_freeze_ema.py
 
 ### Baselines
 
-All experiments use **`batch=112` by default** for consistency. Override with `--batch` only when necessary (e.g. OOM).
+Solo baselines use **`batch=112`**. KD baselines (`kd-early` / `kd-p0`) default to **`batch=32`** (student + teacher + dictionary saliency). Override with `--batch` when VRAM allows or on OOM.
 
 ```bash
 # 1. YOLO26n FPN upper bound
@@ -112,7 +112,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `batch` | `112` | Shared across all baselines |
+| `batch` | `112` (solo) / `32` (KD) | KD dual-model + saliency needs a lower default |
 | `online_distill` | `True` | Joint teacher training until freeze epoch |
 | `teacher_freeze_epoch` | `110` | 1-indexed; teacher frozen afterward |
 | `dict_teacher_layers` | `[6]` | Early stage: teacher x6 (P4/16); late x10 added when merged |
@@ -169,7 +169,7 @@ Dfire-YOLOF-KD/
 ## 环境要求
 
 - Python ≥ 3.10
-- CUDA GPU（`batch=112` 的 KD 训练通常建议 ≥ 16 GB 显存；OOM 时用 `--batch` 下调）
+- CUDA GPU（solo `batch=112`；KD 默认 `batch=32` — 显存够再上调；saliency 会多一次教师前向）
 - PyTorch + torchvision
 
 ### 安装
@@ -214,7 +214,7 @@ python tests/smoke_freeze_ema.py
 
 ### 基线训练
 
-为保持实验一致性，**默认 `batch=112`**。仅在 OOM 等情况下用 `--batch` 覆盖。
+Solo 基线默认 **`batch=112`**。KD 基线（`kd-early` / `kd-p0`）默认 **`batch=32`**（学生+教师+dictionary saliency）。显存够或 OOM 时用 `--batch` 覆盖。
 
 ```bash
 # 1. YOLO26n FPN 上界
@@ -256,7 +256,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `batch` | `112` | 所有基线统一 |
+| `batch` | `112`（solo）/ `32`（KD） | KD 双模型 + saliency 需要更低 batch |
 | `online_distill` | `True` | 冻结前教师与 GT 联合训练 |
 | `teacher_freeze_epoch` | `110` | 1-indexed；之后教师冻结 |
 | `dict_teacher_layers` | `[6]` | Early：教师 x6（P4/16）；late x10 待合并 |

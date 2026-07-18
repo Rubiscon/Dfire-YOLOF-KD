@@ -51,7 +51,8 @@ COMMON: dict[str, Any] = {
     "val": True,
 }
 
-DEFAULT_BATCH = 112  # shared across baselines for experiment consistency; override with --batch if OOM
+DEFAULT_BATCH = 112  # solo baselines; override with --batch if OOM
+DEFAULT_KD_BATCH = 32  # online KD = student + teacher + dict saliency; 112 often OOMs / hangs on rebuild
 
 # Shared online KD settings (neck + response); early dictionary layers configured per baseline.
 _KD_COMMON: dict[str, Any] = {
@@ -97,7 +98,7 @@ BASELINES: dict[str, dict[str, Any]] = {
         "model": "yolo26n-DCN.yaml",
         "teacher": "yolo26n.yaml",
         "name": "baseline-kd-early",
-        "batch": DEFAULT_BATCH,
+        "batch": DEFAULT_KD_BATCH,
         "description": "Early-stage dictionary distillation: student n10 ↔ teacher x6 (layer 6)",
         **_KD_COMMON,
         # Early stage only (fig. 1 left dictionary); late x10 left for separate merge.
@@ -110,7 +111,7 @@ BASELINES: dict[str, dict[str, Any]] = {
         "model": "yolo26n-DCN.yaml",
         "teacher": "yolo26n.yaml",
         "name": "baseline-kd-p0",
-        "batch": DEFAULT_BATCH,
+        "batch": DEFAULT_KD_BATCH,
         "description": "Full KD: early dictionary (n10↔x6) + neck + response distillation",
         **_KD_COMMON,
         "dict_teacher_layers": [6],
