@@ -1,8 +1,8 @@
 """Smoke test for backbone dictionary distillation (proposal fig. 1/2).
 
 Builds YOLOFDistillationModel (student yolo26n-DCN + teacher yolo26n) with the new
-dictionary modules and runs: joint-phase loss (saliency weights) + backward,
-frozen-phase loss (attention fallback) + backward, and an EMA-style deepcopy.
+dictionary modules and runs: joint-phase loss (Grad-CAM saliency) + backward,
+frozen-phase loss (saliency EMA fallback) + backward, and an EMA-style deepcopy.
 """
 from copy import deepcopy
 from types import SimpleNamespace
@@ -33,12 +33,18 @@ args = SimpleNamespace(
     align_cls=4.0,
     distill_conf_thres=0.25,
     distill_iou_thres=0.5,
-    dict_align_loss=0.08,
-    dict_attn_loss=0.25,
-    dict_teacher_layers=[6],
+    dict_align_loss=0.10,
+    dict_attn_loss=0.06,
+    dict_commit_loss=0.05,
+    dict_attn_start_epoch=0,
+    dict_teacher_layers=[6, 10],
     dict_student_layer=10,
     dict_start_epoch=0,
     dict_weight="saliency",
+    dict_match="soft",
+    dict_match_temp=0.07,
+    dict_feature_norm="none",
+    dict_saliency_ema=0.9,
     max_det=300,
     box=7.5,
     cls=0.5,
@@ -61,7 +67,8 @@ teacher.requires_grad_(True)
 model.teacher = teacher
 
 model.build_distillation_modules(imgsz=imgsz)
-assert len(model.dictionary_modules) == 1, "expected 1 early-stage dictionary module (n10↔x6)"
+assert len(model.dictionary_modules) == 2, "expected early+late dictionary modules (n10↔x6/x10)"
+assert model.dictionary_modules[0].match == "soft"
 print("dictionary modules built:", [type(m).__name__ for m in model.dictionary_modules])
 
 model.to(device)
@@ -78,7 +85,7 @@ batch = {
     "batch_idx": torch.tensor([0, 1, 2, 3], device=device),
 }
 
-# --- joint phase (epoch 0 < teacher_freeze_epoch): saliency weights available ---
+# --- joint phase (epoch 0 < teacher_freeze_epoch): Grad-CAM saliency available ---
 model.current_epoch = 0
 total, items = model.loss(dict(batch))
 assert items.shape[0] == 10, f"expected 10 loss items, got {items.shape[0]}"
@@ -87,15 +94,20 @@ print("joint-phase items:", [round(float(x), 4) for x in items])
 assert items[5] > 0, "dict_loss should be non-zero in joint phase"
 assert items[6] > 0, "dattn_loss should be non-zero in joint phase"
 assert len(model._cached_saliency) >= 1, "saliency cache should be populated in joint phase"
+assert len(model._saliency_ema) >= 1, "saliency EMA should update in joint phase"
 print("saliency layers cached:", list(model._cached_saliency.keys()))
 total.backward()
 proj_grads = [p.grad is not None and p.grad.abs().sum() > 0 for p in model.dictionary_modules[0].proj.parameters()]
 assert all(proj_grads), "dictionary projector received no gradient"
-print("joint-phase backward OK; projector grads flow")
+q_grads = [
+    p.grad is not None and p.grad.abs().sum() > 0 for p in model.dictionary_modules[0].query_enc.parameters()
+]
+assert any(q_grads), "soft-match query encoder should receive commitment grads"
+print("joint-phase backward OK; projector + query_enc grads flow")
 model.zero_grad(set_to_none=True)
 teacher.zero_grad(set_to_none=True)
 
-# --- frozen phase (epoch >= teacher_freeze_epoch): attention-weight fallback ---
+# --- frozen phase (epoch >= teacher_freeze_epoch): saliency EMA fallback ---
 model.current_epoch = 2
 model._apply_teacher_freeze_if_needed()
 assert model._teacher_frozen, "teacher should be frozen at epoch 3 (1-indexed)"
@@ -120,7 +132,7 @@ model.train()
 _ = model._predict_once(batch["img"])  # populate last_feature caches and _student_tap
 copy_model = deepcopy(model)
 assert copy_model._student_tap is None
-assert len(copy_model.dictionary_modules) == 1
+assert len(copy_model.dictionary_modules) == 2
 print("deepcopy (EMA path) OK")
 
 print("\nALL SMOKE TESTS PASSED")

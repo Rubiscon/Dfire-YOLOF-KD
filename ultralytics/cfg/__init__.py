@@ -541,10 +541,16 @@ def check_dict_alignment(
             # backbone distillation (dictionary module)
             "dict_align_loss",
             "dict_attn_loss",
+            "dict_commit_loss",
             "dict_teacher_layers",
             "dict_student_layer",
             "dict_start_epoch",
+            "dict_attn_start_epoch",
             "dict_weight",
+            "dict_match",
+            "dict_match_temp",
+            "dict_feature_norm",
+            "dict_saliency_ema",
             "teacher_val_interval",
         }
     if mismatched := [k for k in custom_keys if k not in base_keys and k not in allowed_custom_keys]:

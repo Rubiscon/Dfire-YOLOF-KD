@@ -1,5 +1,5 @@
 # ultralytics/nn/modules/yolof.py
-"""YOLOF dilated residual block"""
+"""YOLOF dilated residual block and dictionary distillation modules."""
 import copy
 import math
 
@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .conv import Conv
+
 
 class DilatedResBlock(nn.Module):
     def __init__(self, c1, c2, d=1):
@@ -99,23 +100,25 @@ class DeconvNet(nn.Module):
 
 
 class DictionaryModule(nn.Module):
-    """Early-stage backbone dictionary module (student n10 ↔ teacher x6, fig. 2).
+    """Early-stage backbone dictionary module (student n10 ↔ teacher x6 / x10).
 
-    Matches every student backbone channel (query) to its closest teacher early-feature
-    channel (key) via a correlation matrix of pooled channel tokens, then reorganizes the
-    teacher feature by the matched index so it can serve as a per-channel pseudo ground
-    truth for the student feature:
+    Matches every student backbone channel (query) to teacher early-feature channels
+    (keys) via a correlation matrix of pooled channel tokens, then reorganizes the
+    teacher feature so it can serve as a per-channel pseudo ground truth:
 
         key   K = flatten(avgpool(BN(Conv(x_t))))   (B, Ct, d)
         query Q = flatten(avgpool(BN(Conv(n_s))))   (B, Cs, d)
-        M = Q K^T (B, Cs, Ct);  index = M.argmax(dim=2)
-        x_c = x_t[index]                            (B, Cs, Ht, Wt)
+        M = Q K^T (B, Cs, Ct)
+
+    Matching modes (``dict_match``):
+      - ``soft`` (default): M → softmax → soft channel gather (differentiable cross-attention;
+        key/query encoders and the student backbone receive gradients — closer to the
+        proposal's mutual-information / cross-attention intent).
+      - ``hard``: index = argmax(M); non-differentiable gather (legacy). Encoders act as
+        fixed projections; freeze their params after init when hard is selected upstream.
 
     The student feature is projected (DeconvNet) to the same channel/spatial size as
-    ``x_c`` for the weighted align loss and the attention restriction loss. Note the
-    index selection is non-differentiable (hard argmax per the proposal), so the key /
-    query encoders act as fixed random projections; gradients flow to the student only
-    through the projector.
+    the reorganized teacher feature for weighted align + attention restriction losses.
 
     Args:
         c_t (int): teacher feature channels.
@@ -123,9 +126,20 @@ class DictionaryModule(nn.Module):
         t_size (int): teacher feature spatial size (H == W) at trace time.
         s_size (int): student feature spatial size (H == W) at trace time.
         grid (int): pooled token grid; token dim d = grid * grid.
+        match (str): ``soft`` or ``hard``.
+        temperature (float): softmax temperature for soft matching.
     """
 
-    def __init__(self, c_t: int, c_s: int, t_size: int, s_size: int, grid: int = 4):
+    def __init__(
+        self,
+        c_t: int,
+        c_s: int,
+        t_size: int,
+        s_size: int,
+        grid: int = 4,
+        match: str = "soft",
+        temperature: float = 0.07,
+    ):
         super().__init__()
         # Teacher key path: Conv+BN then pool to ~1/16 spatial size (proposal early-feature encoder).
         self.key_enc = nn.Sequential(
@@ -139,16 +153,46 @@ class DictionaryModule(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d(grid)
         self.proj = DeconvNet(c_s, c_s, s_size, t_size)
+        self.match = str(match).lower()
+        self.temperature = float(temperature)
+
+    def freeze_encoders(self) -> None:
+        """Freeze key/query encoders (use after init when ``match=hard``)."""
+        for p in self.key_enc.parameters():
+            p.requires_grad = False
+        for p in self.query_enc.parameters():
+            p.requires_grad = False
+        self.key_enc.eval()
+        self.query_enc.eval()
 
     def forward(self, t_feat: torch.Tensor, s_feat: torch.Tensor):
-        """Return (projected student feature, reorganized teacher feature), both (B, Cs, Ht, Wt)."""
-        b, _, h, w = t_feat.shape
+        """Return (s_proj, t_reorg, commit_loss).
+
+        ``t_reorg`` is the dictionary-reorganized teacher feature (B, Cs, Ht, Wt).
+        ``commit_loss`` pulls query tokens toward their soft-matched keys so encoders
+        learn under stopgrad(teacher) distillation (0 for hard matching).
+        """
+        _, _, h, w = t_feat.shape
         k = self.pool(self.key_enc(t_feat)).flatten(2)  # (B, Ct, d)
         q = self.pool(self.query_enc(s_feat)).flatten(2)  # (B, Cs, d)
-        m = q @ k.transpose(1, 2)  # correlation matrix (B, Cs, Ct)
-        index = m.argmax(dim=2)  # closest teacher channel per student channel (B, Cs)
-        t_reorg = torch.gather(t_feat, 1, index[:, :, None, None].expand(-1, -1, h, w))
+        # Normalize tokens so correlation is cosine-like (stable soft matching).
+        k = F.normalize(k, dim=2)
+        q = F.normalize(q, dim=2)
+        m = q @ k.transpose(1, 2)  # (B, Cs, Ct)
+        commit = t_feat.new_zeros(())
+
+        if self.match == "hard":
+            index = m.argmax(dim=2)  # (B, Cs)
+            t_reorg = torch.gather(t_feat, 1, index[:, :, None, None].expand(-1, -1, h, w))
+        else:
+            # Soft cross-attention gather: each student channel is a mixture of teacher channels.
+            w_soft = F.softmax(m / max(self.temperature, 1e-6), dim=2)  # (B, Cs, Ct)
+            t_reorg = torch.einsum("bsc,bchw->bshw", w_soft, t_feat)
+            # Commitment: queries should agree with the teacher keys they attend to.
+            k_hat = torch.einsum("bsc,bcd->bsd", w_soft.detach(), k.detach())
+            commit = (1.0 - F.cosine_similarity(q, k_hat, dim=2)).mean()
+
         s_proj = self.proj(s_feat)
         if s_proj.shape[-2:] != t_feat.shape[-2:]:  # multi-scale / rect batches
             s_proj = F.interpolate(s_proj, size=t_feat.shape[-2:], mode="bilinear", align_corners=False)
-        return s_proj, t_reorg
+        return s_proj, t_reorg, commit

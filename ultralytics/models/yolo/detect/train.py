@@ -185,6 +185,8 @@ class YOLOFDistillationModel(DetectionModel):
         self._teacher_frozen = False
         # Detached spatial saliency maps from a prior teacher pass (avoids retain_graph peak).
         self._cached_saliency: Dict[int, torch.Tensor] = {}
+        # Running EMA of Grad-CAM saliency (layer → (1,1,H,W)); used after teacher freeze.
+        self._saliency_ema: Dict[int, torch.Tensor] = {}
 
     def _teacher_joint_training(self) -> bool:
         """True while the teacher receives GT task loss (online joint phase).
@@ -427,15 +429,22 @@ class YOLOFDistillationModel(DetectionModel):
         ]
         LOGGER.info(f"Built {n} per-scale feature projectors: {pairs}")
 
-    def _dict_gains(self) -> Tuple[float, float]:
-        """(weighted align gain, attention restriction gain) for backbone dictionary distillation."""
+    def _dict_gains(self) -> Tuple[float, float, float]:
+        """(align, attention-restriction, commit) gains for backbone dictionary distillation.
+
+        ``dict_attn_start_epoch`` is 1-indexed (same as ``teacher_freeze_epoch``): attention
+        restriction is delayed so early epochs focus on saliency-weighted feature alignment.
+        """
         args = getattr(self, "args", None)
         if args is None:
-            return 0.0, 0.0
-        return (
-            float(getattr(args, "dict_align_loss", 0.0) or 0.0),
-            float(getattr(args, "dict_attn_loss", 0.0) or 0.0),
-        )
+            return 0.0, 0.0, 0.0
+        beta_d = float(getattr(args, "dict_align_loss", 0.0) or 0.0)
+        beta_a = float(getattr(args, "dict_attn_loss", 0.0) or 0.0)
+        beta_c = float(getattr(args, "dict_commit_loss", 0.0) or 0.0)
+        attn_start = int(getattr(args, "dict_attn_start_epoch", 0) or 0)
+        if attn_start > 0 and (self.current_epoch + 1) < attn_start:
+            beta_a = 0.0
+        return beta_d, beta_a, beta_c
 
     def build_distillation_modules(self, imgsz: int | None = None):
         """Trace feature shapes and create channel/spatial projectors + dictionary modules."""
@@ -444,7 +453,10 @@ class YOLOFDistillationModel(DetectionModel):
             return
 
         imgsz = imgsz or getattr(self.args, "imgsz", 640)
-        dict_on = any(g > 0 for g in self._dict_gains())
+        dict_on = any(
+            float(getattr(self.args, k, 0.0) or 0.0) > 0
+            for k in ("dict_align_loss", "dict_attn_loss", "dict_commit_loss")
+        )
         if dict_on:
             t_layers = getattr(self.args, "dict_teacher_layers", None) or (6,)
             self._dict_teacher_layers = [int(x) for x in t_layers]
@@ -472,6 +484,8 @@ class YOLOFDistillationModel(DetectionModel):
                         f"dict_student_layer={self._dict_student_layer} produced no feature; "
                         f"check the student yaml layer indices."
                     )
+                match = str(getattr(self.args, "dict_match", "soft")).lower()
+                match_temp = float(getattr(self.args, "dict_match_temp", 0.07) or 0.07)
                 modules, msgs = [], []
                 for li in self._dict_teacher_layers:
                     t_feat = teacher_taps.get(li)
@@ -480,14 +494,22 @@ class YOLOFDistillationModel(DetectionModel):
                     # Proposal: avg-pool teacher tokens to ~1/16 of feature map side length.
                     grid = max(int(t_feat.shape[-1]) // 16, 1)
                     grid = max(grid, 2)  # min 2x2 tokens for stable channel correlation
-                    modules.append(
-                        DictionaryModule(
-                            t_feat.shape[1], s_tap.shape[1], int(t_feat.shape[-1]), int(s_tap.shape[-1]), grid
-                        )
+                    mod = DictionaryModule(
+                        t_feat.shape[1],
+                        s_tap.shape[1],
+                        int(t_feat.shape[-1]),
+                        int(s_tap.shape[-1]),
+                        grid,
+                        match=match,
+                        temperature=match_temp,
                     )
+                    if match == "hard":
+                        # Hard argmax blocks encoder grads; freeze them as fixed random projections.
+                        mod.freeze_encoders()
+                    modules.append(mod)
                     msgs.append(
                         f"x{li}{tuple(t_feat.shape[1:])} <- n{self._dict_student_layer}{tuple(s_tap.shape[1:])} "
-                        f"(token grid {grid}x{grid})"
+                        f"(token grid {grid}x{grid}, match={match})"
                     )
                 self.dictionary_modules = nn.ModuleList(modules).to(device)
                 LOGGER.info(f"Built {len(modules)} dictionary modules (backbone distillation): {msgs}")
@@ -555,7 +577,8 @@ class YOLOFDistillationModel(DetectionModel):
         """Backbone dictionary distillation enabled for the current epoch."""
         if not len(self.dictionary_modules) or self.teacher is None:
             return False
-        if all(g <= 0 for g in self._dict_gains()):
+        gains = self._dict_gains()
+        if all(g <= 0 for g in gains):
             return False
         start = int(getattr(self.args, "dict_start_epoch", 0) or 0)
         return self.current_epoch >= start
@@ -577,14 +600,17 @@ class YOLOFDistillationModel(DetectionModel):
     def _compute_teacher_saliency(
         self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor
     ) -> Dict[int, torch.Tensor]:
-        """Spatial saliency for weighted align: channel-mean |∂L_task/∂F| (Grad-CAM style).
+        """Grad-CAM saliency for weighted align (proposal |∂L/∂A| surrogate).
 
-        Proposal writes |∂L/∂A| with A=mean_c(F²). A is a side-branch of F and is *not* an
-        ancestor of L_task, so ``autograd.grad(L, A)`` is always ``None``. Using |∂L/∂F|
-        averaged over channels yields a valid spatial weight on the same (H,W) grid as A.
+        Proposal writes |∂L/∂A| with A=mean_c(F²), but A is not an ancestor of L_task, so
+        ``autograd.grad(L, A)`` is always ``None``. Grad-CAM is the standard surrogate:
 
-        ``retain_graph=False``: call this on a *throwaway* teacher forward so the training
-        graph is built in a second forward without holding two graphs (OOM / thrash risk).
+            α_c = GAP(∂L_task/∂F_c),   S = ReLU(Σ_c α_c F_c)
+
+        This weights object-relevant spatial loci by both gradient importance and activation
+        strength — closer to the proposal's "richer dark knowledge" intent than mean(|∂L/∂F|).
+
+        ``retain_graph=False``: call on a throwaway teacher forward (no dual-graph OOM).
         """
         if teacher_task_loss is None or not teacher_task_loss.requires_grad:
             return {}
@@ -594,21 +620,59 @@ class YOLOFDistillationModel(DetectionModel):
         grads = torch.autograd.grad(
             teacher_task_loss.sum(), feats, retain_graph=False, allow_unused=True
         )
-        return {
-            id(f): g.detach().abs().mean(dim=1, keepdim=True)
-            for f, g in zip(feats, grads)
-            if g is not None
-        }
+        out: Dict[int, torch.Tensor] = {}
+        for f, g in zip(feats, grads):
+            if g is None:
+                continue
+            alpha = g.float().mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
+            cam = F.relu((alpha * f.float()).sum(dim=1, keepdim=True))  # (B, 1, H, W)
+            if float(cam.detach().amax()) <= 0.0:
+                cam = g.detach().abs().mean(dim=1, keepdim=True)
+            out[id(f)] = cam.detach()
+        return out
+
+    def _update_saliency_ema(self, layer_maps: Dict[int, torch.Tensor]) -> None:
+        """Update per-layer EMA of batch-mean Grad-CAM maps for post-freeze weighting."""
+        mom = float(getattr(self.args, "dict_saliency_ema", 0.9) or 0.0)
+        if mom <= 0 or not layer_maps:
+            return
+        for li, w in layer_maps.items():
+            cur = w.detach().float().mean(dim=0, keepdim=True)  # (1, 1, H, W)
+            prev = self._saliency_ema.get(li)
+            if prev is None or prev.shape != cur.shape:
+                self._saliency_ema[li] = cur
+            else:
+                self._saliency_ema[li] = mom * prev + (1.0 - mom) * cur
+
+    def _dict_norm_mode(self) -> str:
+        """Feature normalization for dictionary align (default ``none``).
+
+        Neck feature KD benefits from ``feature_norm=channel``, but applying the same
+        channel standardization to dictionary features washes out magnitude cues that
+        saliency weighting is meant to emphasize. Override with ``dict_feature_norm``.
+        """
+        raw = getattr(self.args, "dict_feature_norm", None)
+        if raw is None or str(raw).lower() in {"", "default"}:
+            return "none"
+        return str(raw).lower()
 
     def _dictionary_losses(
         self, teacher_taps: Dict[int, torch.Tensor], saliency: Dict[int, torch.Tensor] | None = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Backbone distillation losses (proposal fig. 2): (weighted align loss, attention restriction loss).
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Backbone distillation losses (CrisReport): (weighted align, attention restriction, commit).
 
-        Weighted align loss: L2 between the projected student backbone feature and the
-        reorganized teacher early feature, weighted by the teacher saliency map (fallback:
-        teacher spatial attention when the teacher is frozen and no task-loss graph exists).
-        Attention restriction loss: AT-style L2 between normalized spatial attention maps.
+        Weighted align: saliency-weighted MSE between projected student tap and dictionary-
+        reorganized teacher feature. Weight priority:
+          1) live Grad-CAM from the joint-phase throwaway pass
+          2) EMA of Grad-CAM (after freeze / when live map missing)
+          3) uniform (NOT raw attention A — A is already supervised by attention restriction,
+             so using A as the align weight double-counts and over-regularizes)
+
+        Attention restriction: AT-style MSE on L2-normalized spatial attention maps.
+        Uses mean reduction (not sum over HW) so its scale matches weighted MSE; the old
+        ``sum(dim=1)`` form was ~H·W× larger and dominated the KD budget at batch 112.
+
+        Commit: soft-matching encoder loss (queries → matched teacher keys); 0 for hard match.
         """
         device = next(self.parameters()).device
         zero = torch.tensor(0.0, device=device)
@@ -617,24 +681,29 @@ class YOLOFDistillationModel(DetectionModel):
             if not self._dict_warned:
                 LOGGER.warning("KD: student backbone tap unavailable; skipping dictionary distillation")
                 self._dict_warned = True
-            return zero, zero
+            return zero, zero, zero
 
         mode = str(getattr(self.args, "dict_weight", "saliency")).lower()
-        norm = str(getattr(self.args, "feature_norm", "channel")).lower()
+        norm = self._dict_norm_mode()
         if saliency is None:
             saliency = self._cached_saliency if mode == "saliency" else {}
 
         d_align = zero.clone()
         d_attn = zero.clone()
+        d_commit = zero.clone()
         n = 0
         for j, li in enumerate(self._dict_teacher_layers):
             t_feat = teacher_taps.get(li)
             if t_feat is None or j >= len(self.dictionary_modules):
                 continue
-            s_proj, t_reorg = self.dictionary_modules[j](t_feat.detach(), s_feat)
-            t_reorg = t_reorg.detach()
+            # Detach teacher activations so dict KD does not update the teacher backbone.
+            # Reorganized teacher is always stopgrad'd as the KD target; soft encoders learn
+            # via the commitment term instead of through the align residual.
+            s_proj, t_reorg, commit = self.dictionary_modules[j](t_feat.detach(), s_feat)
+            target = t_reorg.detach()
+            pred = s_proj
+            d_commit = d_commit + commit
 
-            pred, target = s_proj, t_reorg
             if norm == "l2":
                 pred = F.normalize(pred, dim=1)
                 target = F.normalize(target, dim=1)
@@ -642,19 +711,21 @@ class YOLOFDistillationModel(DetectionModel):
                 pred = self._channel_standardize(pred)
                 target = self._channel_standardize(target)
 
-            # Remap cached saliency (keyed by throwaway-forward tensor id) via layer index.
             weight = None
-            if mode == "saliency" and saliency:
-                # Prefer layer-keyed cache from the two-pass path.
-                weight = saliency.get(li)
-                if weight is None:
+            if mode == "saliency":
+                weight = saliency.get(li) if saliency else None
+                if weight is None and saliency:
                     weight = saliency.get(id(t_feat))
+                if weight is None:
+                    ema = self._saliency_ema.get(li)
+                    if ema is not None:
+                        weight = ema.expand(pred.shape[0], -1, -1, -1)
+            elif mode == "attention":
+                weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
+            # mode == "none" / unknown → uniform MSE
+
             if weight is not None:
                 weight = weight.float()
-            elif mode in {"saliency", "attention"}:
-                # Frozen/offline teacher, or saliency unavailable: weight by spatial attention A.
-                weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
-            if weight is not None:
                 if weight.shape[-2:] != pred.shape[-2:]:
                     weight = F.interpolate(weight, size=pred.shape[-2:], mode="bilinear", align_corners=False)
                 weight = (weight / weight.mean(dim=(2, 3), keepdim=True).clamp_min(1e-12)).to(pred.dtype).detach()
@@ -663,12 +734,13 @@ class YOLOFDistillationModel(DetectionModel):
                 d_align = d_align + F.mse_loss(pred, target)
 
             att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
-            att_t = F.normalize(self._spatial_attention(t_reorg).flatten(1), dim=1)
-            d_attn = d_attn + (att_s - att_t).pow(2).sum(dim=1).mean()
+            att_t = F.normalize(self._spatial_attention(target).flatten(1), dim=1)
+            # Mean over the flattened spatial dim keeps scale comparable to feature MSE.
+            d_attn = d_attn + F.mse_loss(att_s, att_t)
             n += 1
 
         n = max(n, 1)
-        return d_align / n, d_attn / n
+        return d_align / n, d_attn / n, d_commit / n
 
     def _ensure_align_assigner(self):
         """Lazy-init TAL assigner for align (defaults match task-loss TAL topk=10)."""
@@ -959,6 +1031,7 @@ class YOLOFDistillationModel(DetectionModel):
                             for li in self._dict_teacher_layers
                             if li in sal_taps and id(sal_taps[li]) in sal_maps
                         }
+                        self._update_saliency_ema(self._cached_saliency)
                         del sal_preds, sal_taps, sal_loss, sal_maps
                 finally:
                     for m, mom in bn_backup:
@@ -978,17 +1051,20 @@ class YOLOFDistillationModel(DetectionModel):
         if getattr(self.args, "align", True) and self.current_epoch >= align_start:
             align_loss = self._alignment_loss(student_raw, teacher_raw)
 
-        # Backbone distillation (dictionary modules): weighted align + attention restriction.
+        # Backbone distillation (dictionary modules): weighted align + attention restriction + commit.
         dict_align_loss = torch.tensor(0.0, device=batch["img"].device)
         dict_attn_loss = torch.tensor(0.0, device=batch["img"].device)
+        dict_commit_loss = torch.tensor(0.0, device=batch["img"].device)
         if dict_on:
-            dict_align_loss, dict_attn_loss = self._dictionary_losses(teacher_taps, self._cached_saliency)
+            dict_align_loss, dict_attn_loss, dict_commit_loss = self._dictionary_losses(
+                teacher_taps, self._cached_saliency
+            )
 
         alpha = getattr(self.args, "task_loss", 1.0)
         beta = getattr(self.args, "feature_loss", 0.5)
         gamma = getattr(self.args, "align_loss", 0.5)
         delta = getattr(self.args, "teacher_task_loss", 1.0) if teacher_joint else 0.0
-        beta_d, beta_a = self._dict_gains()
+        beta_d, beta_a, beta_c = self._dict_gains()
         # Task losses come back as (per-component loss * batch_size); the distillation losses are plain
         # per-batch means. Scale the distill terms by batch size (and sum the task vectors) so every
         # term shares the same per-sample footing and the nominal weights truly control relative
@@ -998,7 +1074,14 @@ class YOLOFDistillationModel(DetectionModel):
         total_loss = (
             alpha * student_task_loss.sum()
             + delta * teacher_task_loss.sum()
-            + bs * (beta * feature_loss + gamma * align_loss + beta_d * dict_align_loss + beta_a * dict_attn_loss)
+            + bs
+            * (
+                beta * feature_loss
+                + gamma * align_loss
+                + beta_d * dict_align_loss
+                + beta_a * dict_attn_loss
+                + beta_c * dict_commit_loss
+            )
         )
 
         all_loss_items = torch.stack(

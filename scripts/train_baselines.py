@@ -54,14 +54,14 @@ COMMON: dict[str, Any] = {
 DEFAULT_BATCH = 112  # solo baselines; override with --batch if OOM
 DEFAULT_KD_BATCH = 32  # online KD = student + teacher + dict saliency; 112 often OOMs / hangs on rebuild
 
-# Shared online KD settings (neck + response); early dictionary layers configured per baseline.
+# Shared online KD settings (neck + response); dictionary layers configured per baseline.
 _KD_COMMON: dict[str, Any] = {
     "online_distill": True,
     "teacher_freeze_epoch": 110,
     "teacher_freeze_use_ema": True,
     "task_loss": 1.0,
     "teacher_task_loss": 1.0,
-    "feature_norm": "channel",
+    "feature_norm": "channel",  # neck FPN MSE only
     "feature_loss": 0.08,
     "align": True,
     "align_start_epoch": 20,
@@ -76,6 +76,13 @@ _KD_COMMON: dict[str, Any] = {
     "dict_student_layer": 10,  # student backbone output n10 (C2PSA)
     "dict_start_epoch": 0,
     "dict_weight": "saliency",
+    # Dictionary improvements (CrisReport constraints, rebalanced):
+    "dict_match": "soft",  # differentiable cross-attention gather (proposal MI intent)
+    "dict_match_temp": 0.07,
+    "dict_feature_norm": "none",  # do not channel-whiten saliency-weighted align
+    "dict_saliency_ema": 0.9,  # Grad-CAM EMA used after teacher freeze
+    "dict_attn_start_epoch": 20,  # 1-indexed; delay AT so align leads
+    "dict_commit_loss": 0.05,  # soft-matching query↔key commitment
 }
 
 BASELINES: dict[str, dict[str, Any]] = {
@@ -101,10 +108,10 @@ BASELINES: dict[str, dict[str, Any]] = {
         "batch": DEFAULT_KD_BATCH,
         "description": "Early-stage dictionary distillation: student n10 ↔ teacher x6 (layer 6)",
         **_KD_COMMON,
-        # Early stage only (fig. 1 left dictionary); late x10 left for separate merge.
         "dict_teacher_layers": [6],
-        "dict_align_loss": 0.10,
-        "dict_attn_loss": 0.30,
+        # Align leads; attn is mean-scaled (was ~HW× too strong with sum reduction).
+        "dict_align_loss": 0.12,
+        "dict_attn_loss": 0.08,
     },
     "kd-p0": {
         "trainer": "kd",
@@ -112,11 +119,12 @@ BASELINES: dict[str, dict[str, Any]] = {
         "teacher": "yolo26n.yaml",
         "name": "baseline-kd-p0",
         "batch": DEFAULT_KD_BATCH,
-        "description": "Full KD: early dictionary (n10↔x6) + neck + response distillation",
+        "description": "Full KD: early+late dictionary (n10↔x6/x10) + neck + response",
         **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
+        # Local (x6) + semantic (x10) teacher taps — CrisReport "two parts" of lost info.
+        "dict_teacher_layers": [6, 10],
+        "dict_align_loss": 0.10,
+        "dict_attn_loss": 0.06,
     },
 }
 

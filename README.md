@@ -104,7 +104,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | Component | Mechanism |
 |-----------|-----------|
-| Backbone | Dictionary module: channel matching + weighted align + attention restriction |
+| Backbone | Soft dictionary matching + Grad-CAM weighted align + AT attention restriction + commit |
 | Neck | `DeconvNet` projectors: student dilated blocks ↔ teacher FPN features |
 | Response | Teacher NMS pseudo-labels → TAL assignment → box CIoU + cls KL |
 
@@ -112,12 +112,16 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | Parameter | Default | Notes |
 |-----------|---------|-------|
-| `batch` | `112` (solo) / `32` (KD) | KD dual-model + saliency needs a lower default |
+| `batch` | `112` (solo) / `32` (KD) | KD dual-model + saliency needs a lower default; use `--batch 112` if VRAM allows |
 | `online_distill` | `True` | Joint teacher training until freeze epoch |
 | `teacher_freeze_epoch` | `110` | 1-indexed; teacher frozen afterward |
-| `dict_teacher_layers` | `[6]` | Early stage: teacher x6 (P4/16); late x10 added when merged |
+| `dict_teacher_layers` | `[6, 10]` (`kd-p0`) / `[6]` (`kd-early`) | Early local (x6) + late semantic (x10) |
+| `dict_match` | `soft` | Soft cross-attention gather; `hard` = legacy argmax |
+| `dict_feature_norm` | `none` | Dict path; neck still uses `feature_norm=channel` |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck and response weights |
-| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | Backbone dictionary weights |
+| `dict_align_loss` / `dict_attn_loss` | `0.10` / `0.06` | Attn uses mean MSE (not HW-sum) |
+| `dict_commit_loss` | `0.05` | Soft-match query↔key commitment |
+| `dict_attn_start_epoch` | `20` | 1-indexed delay for attention restriction |
 
 Full override keys are registered in `ultralytics/cfg/__init__.py`.
 
@@ -127,7 +131,6 @@ Full override keys are registered in `ultralytics/cfg/__init__.py`.
 
 | Item | Current | Target |
 |------|---------|--------|
-| Late-stage dictionary | not enabled | mentor: n10↔x10 (layer 10), merge with early |
 | Offline KD preset | manual overrides | `kd-offline` baseline |
 | Model yaml location | root + `models/` duplicate | single path under `models/` |
 | Ablation configs | manual edits | `configs/ablation/*.yaml` presets |
@@ -248,7 +251,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | 模块 | 机制 |
 |------|------|
-| Backbone | Dictionary：通道匹配 + 加权对齐 + attention 约束 |
+| Backbone | 软字典匹配 + Grad-CAM 加权对齐 + AT attention 约束 + commit |
 | Neck | `DeconvNet` 投影：学生 dilated 块 ↔ 教师 FPN 特征 |
 | Response | 教师 NMS 伪标签 → TAL 分配 → box CIoU + cls KL |
 
@@ -256,12 +259,16 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `batch` | `112`（solo）/ `32`（KD） | KD 双模型 + saliency 需要更低 batch |
+| `batch` | `112`（solo）/ `32`（KD） | KD 双模型 + saliency；显存够可用 `--batch 112` |
 | `online_distill` | `True` | 冻结前教师与 GT 联合训练 |
 | `teacher_freeze_epoch` | `110` | 1-indexed；之后教师冻结 |
-| `dict_teacher_layers` | `[6]` | Early：教师 x6（P4/16）；late x10 待合并 |
+| `dict_teacher_layers` | `[6, 10]`（kd-p0）/ `[6]`（kd-early） | early 局部 + late 语义 |
+| `dict_match` | `soft` | 软交叉注意力聚合；`hard` 为旧版 argmax |
+| `dict_feature_norm` | `none` | 字典路径；neck 仍用 `feature_norm=channel` |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck / Response 权重 |
-| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | Dictionary 两项损失 |
+| `dict_align_loss` / `dict_attn_loss` | `0.10` / `0.06` | attn 为 mean MSE（非 HW-sum） |
+| `dict_commit_loss` | `0.05` | 软匹配 query↔key commitment |
+| `dict_attn_start_epoch` | `20` | 1-indexed，延迟启动 attention 约束 |
 
 完整配置键见 `ultralytics/cfg/__init__.py`。
 
@@ -271,7 +278,6 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | 项目 | 当前 | 目标 |
 |------|------|------|
-| Late-stage dictionary | 未启用 | 导师：n10↔x10（layer 10），与 early 合并 |
 | 离线 KD 预设 | 手动 overrides | `kd-offline` baseline |
 | 模型 yaml 路径 | 根目录与 `models/` 重复 | 统一到 `models/` |
 | 消融实验配置 | 手改参数 | `configs/ablation/*.yaml` 预设 |
