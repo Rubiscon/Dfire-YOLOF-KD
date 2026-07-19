@@ -33,17 +33,17 @@ args = SimpleNamespace(
     align_cls=4.0,
     distill_conf_thres=0.25,
     distill_iou_thres=0.5,
-    dict_align_loss=0.10,
-    dict_attn_loss=0.06,
-    dict_commit_loss=0.05,
+    dict_align_loss=0.08,
+    dict_attn_loss=0.25,
+    dict_commit_loss=0.0,
     dict_attn_start_epoch=0,
-    dict_teacher_layers=[6, 10],
+    dict_teacher_layers=[4, 6],
     dict_student_layer=10,
     dict_start_epoch=0,
-    dict_weight="saliency",
-    dict_match="soft",
+    dict_weight="attention",
+    dict_match="hard",
     dict_match_temp=0.07,
-    dict_feature_norm="none",
+    dict_feature_norm="channel",
     dict_saliency_ema=0.9,
     max_det=300,
     box=7.5,
@@ -67,8 +67,8 @@ teacher.requires_grad_(True)
 model.teacher = teacher
 
 model.build_distillation_modules(imgsz=imgsz)
-assert len(model.dictionary_modules) == 2, "expected early+late dictionary modules (n10↔x6/x10)"
-assert model.dictionary_modules[0].match == "soft"
+assert len(model.dictionary_modules) == 2, "expected dictionary modules for teacher layers 4 and 6"
+assert model.dictionary_modules[0].match == "hard"
 print("dictionary modules built:", [type(m).__name__ for m in model.dictionary_modules])
 
 model.to(device)
@@ -91,19 +91,13 @@ total, items = model.loss(dict(batch))
 assert items.shape[0] == 10, f"expected 10 loss items, got {items.shape[0]}"
 assert torch.isfinite(total).all() and torch.isfinite(items).all(), "non-finite loss (joint)"
 print("joint-phase items:", [round(float(x), 4) for x in items])
-assert items[5] > 0, "dict_loss should be non-zero in joint phase"
-assert items[6] > 0, "dattn_loss should be non-zero in joint phase"
-assert len(model._cached_saliency) >= 1, "saliency cache should be populated in joint phase"
-assert len(model._saliency_ema) >= 1, "saliency EMA should update in joint phase"
-print("saliency layers cached:", list(model._cached_saliency.keys()))
+assert items[5] > 0.1, f"dict_loss should stay O(1) with channel norm, got {float(items[5])}"
+assert items[6] > 0.05, f"dattn_loss should stay O(0.1–1) with AT sum reduction, got {float(items[6])}"
+print("joint dict/dattn scale OK:", round(float(items[5]), 4), round(float(items[6]), 4))
 total.backward()
 proj_grads = [p.grad is not None and p.grad.abs().sum() > 0 for p in model.dictionary_modules[0].proj.parameters()]
 assert all(proj_grads), "dictionary projector received no gradient"
-q_grads = [
-    p.grad is not None and p.grad.abs().sum() > 0 for p in model.dictionary_modules[0].query_enc.parameters()
-]
-assert any(q_grads), "soft-match query encoder should receive commitment grads"
-print("joint-phase backward OK; projector + query_enc grads flow")
+print("joint-phase backward OK; projector grads flow")
 model.zero_grad(set_to_none=True)
 teacher.zero_grad(set_to_none=True)
 
@@ -134,5 +128,29 @@ copy_model = deepcopy(model)
 assert copy_model._student_tap is None
 assert len(copy_model.dictionary_modules) == 2
 print("deepcopy (EMA path) OK")
+
+# Soft-match + Grad-CAM path (optional stack)
+args.dict_match = "soft"
+args.dict_commit_loss = 0.05
+args.dict_weight = "saliency"
+model2 = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=nc, ch=3, verbose=False)
+model2.args = args
+model2.nc = nc
+model2.names = model.names
+teacher2 = DetectionModel("yolo26n.yaml", nc=nc, ch=3, verbose=False)
+teacher2.nc = nc
+teacher2.names = model.names
+teacher2.args = args
+teacher2.train()
+teacher2.requires_grad_(True)
+model2.teacher = teacher2
+model2.build_distillation_modules(imgsz=imgsz)
+model2.to(device)
+model2.train()
+model2.current_epoch = 0
+total3, items3 = model2.loss(dict(batch))
+assert torch.isfinite(total3).all()
+assert len(model2._cached_saliency) >= 1
+print("soft+saliency path OK; saliency layers:", list(model2._cached_saliency.keys()))
 
 print("\nALL SMOKE TESTS PASSED")

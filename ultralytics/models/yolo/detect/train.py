@@ -645,15 +645,15 @@ class YOLOFDistillationModel(DetectionModel):
                 self._saliency_ema[li] = mom * prev + (1.0 - mom) * cur
 
     def _dict_norm_mode(self) -> str:
-        """Feature normalization for dictionary align (default ``none``).
+        """Feature normalization for dictionary align (default ``channel``).
 
-        Neck feature KD benefits from ``feature_norm=channel``, but applying the same
-        channel standardization to dictionary features washes out magnitude cues that
-        saliency weighting is meant to emphasize. Override with ``dict_feature_norm``.
+        Channel standardization keeps ``dict_loss`` on the same ~O(1) scale as the
+        proven n_kd_n_batch112 recipe. ``none`` collapses dict_loss by ~50× and
+        effectively turns backbone KD off at the usual ``dict_align_loss`` weights.
         """
         raw = getattr(self.args, "dict_feature_norm", None)
         if raw is None or str(raw).lower() in {"", "default"}:
-            return "none"
+            return "channel"
         return str(raw).lower()
 
     def _dictionary_losses(
@@ -668,9 +668,10 @@ class YOLOFDistillationModel(DetectionModel):
           3) uniform (NOT raw attention A — A is already supervised by attention restriction,
              so using A as the align weight double-counts and over-regularizes)
 
-        Attention restriction: AT-style MSE on L2-normalized spatial attention maps.
-        Uses mean reduction (not sum over HW) so its scale matches weighted MSE; the old
-        ``sum(dim=1)`` form was ~H·W× larger and dominated the KD budget at batch 112.
+        Attention restriction: AT-style squared L2 on unit-normalized spatial attention
+        maps — ``||A_s - A_t||_2^2`` via ``sum(dim=1).mean()``. Do **not** use elementwise
+        ``mse_loss`` mean here: that divides by H·W (~400–1600×) and kills the AT signal
+        (observed: dattn 0.45 → 0.0003, backbone KD nearly off).
 
         Commit: soft-matching encoder loss (queries → matched teacher keys); 0 for hard match.
         """
@@ -735,8 +736,8 @@ class YOLOFDistillationModel(DetectionModel):
 
             att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
             att_t = F.normalize(self._spatial_attention(target).flatten(1), dim=1)
-            # Mean over the flattened spatial dim keeps scale comparable to feature MSE.
-            d_attn = d_attn + F.mse_loss(att_s, att_t)
+            # AT / Zagoruyko: squared Euclidean distance between unit vectors (scale ~0.2–1).
+            d_attn = d_attn + (att_s - att_t).pow(2).sum(dim=1).mean()
             n += 1
 
         n = max(n, 1)

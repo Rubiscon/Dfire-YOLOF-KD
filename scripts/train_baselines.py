@@ -51,17 +51,18 @@ COMMON: dict[str, Any] = {
     "val": True,
 }
 
-DEFAULT_BATCH = 112  # solo baselines; override with --batch if OOM
-DEFAULT_KD_BATCH = 32  # online KD = student + teacher + dict saliency; 112 often OOMs / hangs on rebuild
+DEFAULT_BATCH = 112  # solo / KD when VRAM allows (matches n_kd_n_batch112)
+DEFAULT_KD_BATCH = 112  # proven KD recipe; drop to 32 with --batch if saliency OOM
 
-# Shared online KD settings (neck + response); dictionary layers configured per baseline.
+# Shared online KD settings — aligned to Log/n_kd_n_batch112 (best mAP50≈0.728).
 _KD_COMMON: dict[str, Any] = {
     "online_distill": True,
-    "teacher_freeze_epoch": 110,
+    # 200 = never freeze during a 200-ep run (same as the winning log).
+    "teacher_freeze_epoch": 200,
     "teacher_freeze_use_ema": True,
     "task_loss": 1.0,
     "teacher_task_loss": 1.0,
-    "feature_norm": "channel",  # neck FPN MSE only
+    "feature_norm": "channel",
     "feature_loss": 0.08,
     "align": True,
     "align_start_epoch": 20,
@@ -73,16 +74,20 @@ _KD_COMMON: dict[str, Any] = {
     "align_cls": 4.0,
     "distill_conf_thres": 0.25,
     "distill_iou_thres": 0.5,
-    "dict_student_layer": 10,  # student backbone output n10 (C2PSA)
+    "dict_student_layer": 10,
     "dict_start_epoch": 0,
-    "dict_weight": "saliency",
-    # Dictionary improvements (CrisReport constraints, rebalanced):
-    "dict_match": "soft",  # differentiable cross-attention gather (proposal MI intent)
+    # Winning run used broken |dL/dA| → always fell back to attention A as weight.
+    # Keep attention weighting for recipe match; Grad-CAM via dict_weight=saliency.
+    "dict_weight": "attention",
+    "dict_match": "hard",  # match winning hard-argmax dictionary
     "dict_match_temp": 0.07,
-    "dict_feature_norm": "none",  # do not channel-whiten saliency-weighted align
-    "dict_saliency_ema": 0.9,  # Grad-CAM EMA used after teacher freeze
-    "dict_attn_start_epoch": 20,  # 1-indexed; delay AT so align leads
-    "dict_commit_loss": 0.05,  # soft-matching query↔key commitment
+    "dict_feature_norm": "channel",  # required for dict_loss ~O(1); none collapses KD
+    "dict_saliency_ema": 0.9,
+    "dict_attn_start_epoch": 0,
+    "dict_commit_loss": 0.0,
+    # Student init from YOLO26n backbone weights — largest gap vs early_7-19* scratch runs.
+    "pretrained": "yolo26n.pt",
+    "teacher_weights": "yolo26n.pt",
 }
 
 BASELINES: dict[str, dict[str, Any]] = {
@@ -91,6 +96,7 @@ BASELINES: dict[str, dict[str, Any]] = {
         "model": "yolo26n.yaml",
         "name": "baseline-yolo26n",
         "batch": DEFAULT_BATCH,
+        "pretrained": "yolo26n.pt",
         "description": "YOLO26n FPN teacher upper bound",
     },
     "dcn-solo": {
@@ -98,6 +104,7 @@ BASELINES: dict[str, dict[str, Any]] = {
         "model": "yolo26n-DCN.yaml",
         "name": "baseline-dcn-solo",
         "batch": DEFAULT_BATCH,
+        "pretrained": "yolo26n.pt",
         "description": "YOLO26n-DCN (YOLOF head) without distillation",
     },
     "kd-early": {
@@ -106,12 +113,12 @@ BASELINES: dict[str, dict[str, Any]] = {
         "teacher": "yolo26n.yaml",
         "name": "baseline-kd-early",
         "batch": DEFAULT_KD_BATCH,
-        "description": "Early-stage dictionary distillation: student n10 ↔ teacher x6 (layer 6)",
+        # CrisReport early stage: student n10 learns local structure from teacher early tap x6 only.
+        "description": "CrisReport early dictionary: n10↔x6, hard match, pretrained student",
         **_KD_COMMON,
         "dict_teacher_layers": [6],
-        # Align leads; attn is mean-scaled (was ~HW× too strong with sum reduction).
-        "dict_align_loss": 0.12,
-        "dict_attn_loss": 0.08,
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
     },
     "kd-p0": {
         "trainer": "kd",
@@ -119,12 +126,12 @@ BASELINES: dict[str, dict[str, Any]] = {
         "teacher": "yolo26n.yaml",
         "name": "baseline-kd-p0",
         "batch": DEFAULT_KD_BATCH,
-        "description": "Full KD: early+late dictionary (n10↔x6/x10) + neck + response",
+        "description": "kd-early + Grad-CAM saliency (dict_weight=saliency ablation)",
         **_KD_COMMON,
-        # Local (x6) + semantic (x10) teacher taps — CrisReport "two parts" of lost info.
-        "dict_teacher_layers": [6, 10],
-        "dict_align_loss": 0.10,
-        "dict_attn_loss": 0.06,
+        "dict_teacher_layers": [6],
+        "dict_weight": "saliency",  # Grad-CAM; compare against kd-early attention weights
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
     },
 }
 
