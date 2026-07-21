@@ -1,18 +1,14 @@
 """Unified D-Fire baselines on official train/val/test split (dfire.yaml).
 
 Baselines:
-  1. yolo26n      - YOLO26n FPN upper bound (DetectionTrainer)
-  2. dcn-solo     - YOLO26n-DCN / YOLOF student without KD (DetectionTrainer)
-  3. kd-early     - Early-stage dictionary distillation (n10↔x6, fig. 1/2)
-  4. kd-p0        - Full KD stack (early dict + neck + response)
+  yolo26n / dcn-solo / kd-early / kd-p0
+  early-B / early-C  - early attn-weight sweeps (dict_attn_loss 0.35 / 0.40)
 
 Usage:
-  python scripts/train_baselines.py --baseline yolo26n
-  python scripts/train_baselines.py --baseline dcn-solo
   python scripts/train_baselines.py --baseline kd-early
-  python scripts/train_baselines.py --baseline kd-p0
-  python scripts/train_baselines.py --baseline all          # run 1 -> 2 -> 3 sequentially
-  python scripts/train_baselines.py --baseline yolo26n --test-only  # eval best.pt on test split
+  python scripts/train_baselines.py --baseline early-B,early-C   # run B then C in one command
+  python scripts/train_baselines.py --baseline all               # all registered baselines, in order
+  python scripts/train_baselines.py --baseline kd-early --test-only
 
 After each train run, val mAP drives best.pt; use --test-only (or the printed command) for final test mAP.
 """
@@ -133,7 +129,98 @@ BASELINES: dict[str, dict[str, Any]] = {
         "dict_align_loss": 0.08,
         "dict_attn_loss": 0.25,
     },
+    # --- early hyperparameter sweep (vs kd-early / early-3) ---
+    "early-B": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-B-attn035",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "early sweep B: dict_attn_loss=0.35 (restore AT budget vs x6-only)",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.35,
+    },
+    "early-C": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-C-attn040",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "early sweep C: dict_attn_loss=0.40",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.40,
+    },
+    # Round-2 sweeps after B/C: higher AT hurt mAP50-95; pivot to lower AT / align / saliency.
+    "early-D": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-D-attn020",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "early sweep D: dict_attn_loss=0.20 (below early-3)",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.20,
+    },
+    "early-E": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-E-align015",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "early sweep E: align_loss=0.15 (attn kept at 0.25)",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
+        "align_loss": 0.15,
+    },
+    "early-F": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-F-saliency",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "early sweep F: dict_weight=saliency (Grad-CAM), attn=0.25",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
+        "dict_weight": "saliency",
+    },
+    "early-G": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-G-dLdA",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "early sweep G: dict_weight=saliency_dLdA (analytic |∂L/∂A|), attn=0.25",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
+        "dict_weight": "saliency_dLdA",
+    },
 }
+
+
+def resolve_baseline_keys(spec: str) -> list[str]:
+    """Parse ``--baseline``: ``all``, a single name, or comma-separated names (e.g. early-B,early-C)."""
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("Empty --baseline")
+    if spec == "all":
+        return list(BASELINES)
+    keys = [k.strip() for k in spec.split(",") if k.strip()]
+    unknown = [k for k in keys if k not in BASELINES]
+    if unknown:
+        raise ValueError(f"Unknown baseline(s) {unknown}. Choose from: {list(BASELINES)} or 'all'")
+    return keys
 
 
 def build_overrides(baseline_key: str, args: argparse.Namespace) -> dict[str, Any]:
@@ -213,9 +300,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="D-Fire unified baseline training (train/val/test split)")
     parser.add_argument(
         "--baseline",
-        choices=[*BASELINES.keys(), "all"],
         default="yolo26n",
-        help="which baseline to train (default: yolo26n)",
+        help=(
+            "baseline name, comma-separated list, or 'all'. "
+            f"Available: {', '.join(BASELINES)} (e.g. early-B,early-C)"
+        ),
     )
     parser.add_argument("--epochs", type=int, default=None, help=f"override epochs (default: {COMMON['epochs']})")
     parser.add_argument("--patience", type=int, default=None, help=f"override patience (default: {COMMON['patience']})")
@@ -244,23 +333,29 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    try:
+        keys = resolve_baseline_keys(args.baseline)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if args.test_only:
-        if args.baseline == "all":
-            raise SystemExit("--test-only requires a single --baseline, not 'all'")
+        if len(keys) != 1:
+            raise SystemExit("--test-only requires a single --baseline, not a list or 'all'")
         if args.weights:
             best = Path(args.weights)
         else:
-            overrides = build_overrides(args.baseline, args)
+            overrides = build_overrides(keys[0], args)
             best = weights_path(str(overrides["project"]), str(overrides["name"]))
         run_test_eval(best, args)
         return
 
-    keys = list(BASELINES) if args.baseline == "all" else [args.baseline]
-    for key in keys:
+    print(f"Queue ({len(keys)} run(s)): {' -> '.join(keys)}")
+    for i, key in enumerate(keys, 1):
+        print(f"\n>>> [{i}/{len(keys)}] starting {key}")
         best = train_baseline(key, args)
         if args.test_after_train:
             run_test_eval(best, args)
+        print(f">>> [{i}/{len(keys)}] finished {key} -> {best}")
 
 
 if __name__ == "__main__":

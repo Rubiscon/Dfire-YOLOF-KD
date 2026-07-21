@@ -597,18 +597,36 @@ class YOLOFDistillationModel(DetectionModel):
                 feats.append(f)
         return feats
 
+    @staticmethod
+    def _dict_weight_mode(args) -> str:
+        """Normalize ``dict_weight`` to a canonical mode string."""
+        raw = str(getattr(args, "dict_weight", "saliency") or "saliency").lower().replace("-", "_")
+        if raw in {"dlda", "saliency_dlda"} or "dlda" in raw:
+            return "saliency_dlda"
+        if raw in {"gradcam", "saliency_gradcam"}:
+            return "saliency"
+        return raw
+
+    def _dict_weight_needs_task_grad(self) -> bool:
+        """True if weighted align needs ∂L/∂F from a teacher task-loss graph."""
+        return self._dict_weight_mode(self.args) in {"saliency", "saliency_dlda"}
+
     def _compute_teacher_saliency(
         self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor
     ) -> Dict[int, torch.Tensor]:
-        """Grad-CAM saliency for weighted align (proposal |∂L/∂A| surrogate).
+        """Spatial weight maps for dictionary align from teacher task gradients.
 
-        Proposal writes |∂L/∂A| with A=mean_c(F²), but A is not an ancestor of L_task, so
-        ``autograd.grad(L, A)`` is always ``None``. Grad-CAM is the standard surrogate:
+        Modes (``dict_weight``):
+          - ``saliency`` / Grad-CAM:
+                α_c = GAP(∂L/∂F_c),  S = ReLU(Σ_c α_c F_c)
+          - ``saliency_dLdA`` (proposal-faithful analytic |∂L/∂A|):
+                A = mean_c(F²). Literal autograd.grad(L, A) is undefined because A is not
+                used when computing L_task. Under the chain-rule model
+                ∂L/∂F_c = (2/C) F_c · ∂L/∂A, the least-squares solution is
 
-            α_c = GAP(∂L_task/∂F_c),   S = ReLU(Σ_c α_c F_c)
+                    ∂L/∂A = (Σ_c F_c · ∂L/∂F_c) / (2A + ε),   S = |∂L/∂A|
 
-        This weights object-relevant spatial loci by both gradient importance and activation
-        strength — closer to the proposal's "richer dark knowledge" intent than mean(|∂L/∂F|).
+                which keeps per-location structure (no spatial GAP on gradients).
 
         ``retain_graph=False``: call on a throwaway teacher forward (no dual-graph OOM).
         """
@@ -620,19 +638,31 @@ class YOLOFDistillationModel(DetectionModel):
         grads = torch.autograd.grad(
             teacher_task_loss.sum(), feats, retain_graph=False, allow_unused=True
         )
+        mode = self._dict_weight_mode(self.args)
         out: Dict[int, torch.Tensor] = {}
         for f, g in zip(feats, grads):
             if g is None:
                 continue
-            alpha = g.float().mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
-            cam = F.relu((alpha * f.float()).sum(dim=1, keepdim=True))  # (B, 1, H, W)
-            if float(cam.detach().amax()) <= 0.0:
-                cam = g.detach().abs().mean(dim=1, keepdim=True)
+            f_f = f.float()
+            g_f = g.float()
+            if mode == "saliency_dlda":
+                # A: (B,1,H,W); numerator: Σ_c F_c ∂L/∂F_c
+                a_map = f_f.pow(2).mean(dim=1, keepdim=True).clamp_min(1e-12)
+                numer = (f_f * g_f).sum(dim=1, keepdim=True)
+                cam = (numer / (2.0 * a_map)).abs()
+                if float(cam.detach().amax()) <= 0.0:
+                    cam = g_f.detach().abs().mean(dim=1, keepdim=True)
+            else:
+                # Grad-CAM (default ``saliency``)
+                alpha = g_f.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
+                cam = F.relu((alpha * f_f).sum(dim=1, keepdim=True))  # (B, 1, H, W)
+                if float(cam.detach().amax()) <= 0.0:
+                    cam = g_f.detach().abs().mean(dim=1, keepdim=True)
             out[id(f)] = cam.detach()
         return out
 
     def _update_saliency_ema(self, layer_maps: Dict[int, torch.Tensor]) -> None:
-        """Update per-layer EMA of batch-mean Grad-CAM maps for post-freeze weighting."""
+        """Update per-layer EMA of batch-mean saliency maps for post-freeze weighting."""
         mom = float(getattr(self.args, "dict_saliency_ema", 0.9) or 0.0)
         if mom <= 0 or not layer_maps:
             return
@@ -661,12 +691,13 @@ class YOLOFDistillationModel(DetectionModel):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Backbone distillation losses (CrisReport): (weighted align, attention restriction, commit).
 
-        Weighted align: saliency-weighted MSE between projected student tap and dictionary-
-        reorganized teacher feature. Weight priority:
-          1) live Grad-CAM from the joint-phase throwaway pass
-          2) EMA of Grad-CAM (after freeze / when live map missing)
-          3) uniform (NOT raw attention A — A is already supervised by attention restriction,
-             so using A as the align weight double-counts and over-regularizes)
+        Weighted align: task-saliency-weighted MSE between projected student tap and
+        dictionary-reorganized teacher feature. Weight priority for
+        ``dict_weight`` in {saliency, saliency_dLdA}:
+          1) live map from the joint-phase throwaway pass (Grad-CAM or analytic |∂L/∂A|)
+          2) EMA of that map (after freeze / when live map missing)
+          3) uniform MSE
+        ``dict_weight=attention`` uses A=mean_c(F²) directly (no task gradient).
 
         Attention restriction: AT-style squared L2 on unit-normalized spatial attention
         maps — ``||A_s - A_t||_2^2`` via ``sum(dim=1).mean()``. Do **not** use elementwise
@@ -684,10 +715,12 @@ class YOLOFDistillationModel(DetectionModel):
                 self._dict_warned = True
             return zero, zero, zero
 
-        mode = str(getattr(self.args, "dict_weight", "saliency")).lower()
+        mode = self._dict_weight_mode(self.args)
         norm = self._dict_norm_mode()
+        # Grad-CAM / analytic |∂L/∂A| maps share the same cache + EMA path.
+        use_grad_map = mode in {"saliency", "saliency_dlda"}
         if saliency is None:
-            saliency = self._cached_saliency if mode == "saliency" else {}
+            saliency = self._cached_saliency if use_grad_map else {}
 
         d_align = zero.clone()
         d_attn = zero.clone()
@@ -713,7 +746,7 @@ class YOLOFDistillationModel(DetectionModel):
                 target = self._channel_standardize(target)
 
             weight = None
-            if mode == "saliency":
+            if use_grad_map:
                 weight = saliency.get(li) if saliency else None
                 if weight is None and saliency:
                     weight = saliency.get(id(t_feat))
@@ -1005,16 +1038,12 @@ class YOLOFDistillationModel(DetectionModel):
         teacher_loss_items = torch.zeros(3, device=batch["img"].device)
         teacher_taps: Dict[int, torch.Tensor] = {}
         self._cached_saliency = {}
-        want_saliency = (
-            dict_on
-            and teacher_joint
-            and str(getattr(self.args, "dict_weight", "saliency")).lower() == "saliency"
-        )
+        want_saliency = dict_on and teacher_joint and self._dict_weight_needs_task_grad()
         if teacher_joint:
             self._ensure_teacher_criterion()
             self.teacher.train()
             if want_saliency:
-                # Pass 1: throwaway teacher forward → |∂L/∂F| saliency, free graph (no retain_graph).
+                # Pass 1: throwaway teacher forward → saliency map from ∂L/∂F, free graph.
                 # Holding retain_graph across student+teacher at large batch was a prime OOM/thrash cause.
                 # Freeze BN running-stat updates so this pass does not double-count toward EMA stats.
                 bn_backup: List[Tuple[nn.Module, float | None]] = []
