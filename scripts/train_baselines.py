@@ -2,11 +2,16 @@
 
 Baselines:
   yolo26n / dcn-solo / kd-early / kd-p0
-  early-B / early-C  - early attn-weight sweeps (dict_attn_loss 0.35 / 0.40)
+  early-B..G  - attn / response-align / Grad-CAM / analytic-dLdA sweeps
+  early-H1/H2 - saliency_dLdA × dict_align_loss (0.10 / 0.12)
+  early-S1a/S1b - A-gated dLdA (+ optional blur/clip); main saliency track
+  early-I1/I2 - attention ablations only (not the main recipe)
 
 Usage:
   python scripts/train_baselines.py --baseline kd-early
-  python scripts/train_baselines.py --baseline early-B,early-C   # run B then C in one command
+  python scripts/train_baselines.py --baseline early-S1a,early-S1b  # gated dLdA track
+  python scripts/train_baselines.py --baseline early-H1,early-H2 # dLdA × dict_align sweep
+  python scripts/train_baselines.py --baseline early-I1,early-I2 # attention ablation
   python scripts/train_baselines.py --baseline all               # all registered baselines, in order
   python scripts/train_baselines.py --baseline kd-early --test-only
 
@@ -205,6 +210,92 @@ BASELINES: dict[str, dict[str, Any]] = {
         "dict_align_loss": 0.08,
         "dict_attn_loss": 0.25,
         "dict_weight": "saliency_dLdA",
+    },
+    # --- Phase H: dLdA × dict_align (Log/S_0.10, S_0.12) ---
+    # Result: H1 underperforms G; H2 recovers mAP50 but still trails attention@0.10 on mAP50-95.
+    "early-H1": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-H1-dLdA-align010",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "H1: saliency_dLdA + dict_align_loss=0.10 (attn=0.25)",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.10,
+        "dict_attn_loss": 0.25,
+        "dict_weight": "saliency_dLdA",
+    },
+    "early-H2": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-H2-dLdA-align012",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "H2: saliency_dLdA + dict_align_loss=0.12 (attn=0.25)",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.12,
+        "dict_attn_loss": 0.25,
+        "dict_weight": "saliency_dLdA",
+    },
+    # --- Phase S1: stabilize analytic |∂L/∂A| (main track; λ locked to G) ---
+    "early-S1a": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-S1a-dLdA-gate",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "S1a: saliency_dLdA_gate (A·|∂L/∂A|), align=0.08, attn=0.25",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
+        "dict_weight": "saliency_dLdA_gate",
+        "dict_saliency_blur": 0.0,
+        "dict_saliency_clip": 0.0,
+    },
+    "early-S1b": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-S1b-dLdA-gate-stable",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "S1b: dLdA_gate + blurσ=1 + clip=0.9 (align=0.08, attn=0.25)",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
+        "dict_weight": "saliency_dLdA_gate",
+        "dict_saliency_blur": 1.0,
+        "dict_saliency_clip": 0.9,
+    },
+    # --- Phase I: attention ablations only (upper-bound / report controls) ---
+    "early-I1": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-I1-attn-align012",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "ABLATION I1: attention + dict_align_loss=0.12",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.12,
+        "dict_attn_loss": 0.25,
+        "dict_weight": "attention",
+    },
+    "early-I2": {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "name": "baseline-early-I2-attn-align010-attn020",
+        "batch": DEFAULT_KD_BATCH,
+        "description": "ABLATION I2: attention + dict_align=0.10 + dict_attn=0.20",
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.10,
+        "dict_attn_loss": 0.20,
+        "dict_weight": "attention",
     },
 }
 
