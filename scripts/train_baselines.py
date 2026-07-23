@@ -1,21 +1,26 @@
 """Unified D-Fire baselines on official train/val/test split (dfire.yaml).
 
-Baselines:
-  yolo26n / dcn-solo / kd-early / kd-p0
-  early-B..G  - attn / response-align / Grad-CAM / analytic-dLdA sweeps
-  early-H1/H2 - saliency_dLdA × dict_align_loss (0.10 / 0.12)
-  early-S1a/S1b - A-gated dLdA (+ optional blur/clip); main saliency track
-  early-I1/I2 - attention ablations only (not the main recipe)
+Baselines (kept lean):
+  yolo26n       - YOLO26n FPN upper bound
+  dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
+  early         - CrisReport early dictionary (n10↔x6, attention weight)
+  early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
+  early-tune1/2 - editable copies for hyperparameter sweeps
+
+Hyperparameters below match the previous script bit-for-bit for these recipes
+(pretrained / batch / teacher_weights / KD gains). Sweep entries (early-B..T3,
+kd-p0, …) were removed; use early-tune* instead.
 
 Usage:
-  python scripts/train_baselines.py --baseline kd-early
-  python scripts/train_baselines.py --baseline early-S1a,early-S1b  # gated dLdA track
-  python scripts/train_baselines.py --baseline early-H1,early-H2 # dLdA × dict_align sweep
-  python scripts/train_baselines.py --baseline early-I1,early-I2 # attention ablation
-  python scripts/train_baselines.py --baseline all               # all registered baselines, in order
-  python scripts/train_baselines.py --baseline kd-early --test-only
+  python scripts/train_baselines.py --baseline yolo26n
+  python scripts/train_baselines.py --baseline dcn-solo
+  python scripts/train_baselines.py --baseline early
+  python scripts/train_baselines.py --baseline early-dldx
+  python scripts/train_baselines.py --baseline early-tune1,early-tune2
+  python scripts/train_baselines.py --baseline all
+  python scripts/train_baselines.py --baseline early --test-only
 
-After each train run, val mAP drives best.pt; use --test-only (or the printed command) for final test mAP.
+Aliases (old names still work): kd-early → early, early-S1a → early-dldx.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from ultralytics import YOLO
 from ultralytics.models.yolo.detect.train import DetectionTrainer, YOLOFDistillationTrainer
 
 # ---------------------------------------------------------------------------
-# Shared training config (new official split: datasets/D-Fire/data)
+# Shared training config (official split: datasets/D-Fire/data)
 # ---------------------------------------------------------------------------
 COMMON: dict[str, Any] = {
     "data": "dfire.yaml",
@@ -53,12 +58,11 @@ COMMON: dict[str, Any] = {
 }
 
 DEFAULT_BATCH = 112  # solo / KD when VRAM allows (matches n_kd_n_batch112)
-DEFAULT_KD_BATCH = 112  # proven KD recipe; drop to 32 with --batch if saliency OOM
+DEFAULT_KD_BATCH = 112  # proven KD recipe; drop with --batch if saliency OOM
 
-# Shared online KD settings — aligned to Log/n_kd_n_batch112 (best mAP50≈0.728).
+# Shared online KD — aligned to Log/n_kd_n_batch112 (best mAP50≈0.728).
 _KD_COMMON: dict[str, Any] = {
     "online_distill": True,
-    # 200 = never freeze during a 200-ep run (same as the winning log).
     "teacher_freeze_epoch": 200,
     "teacher_freeze_use_ema": True,
     "task_loss": 1.0,
@@ -77,19 +81,33 @@ _KD_COMMON: dict[str, Any] = {
     "distill_iou_thres": 0.5,
     "dict_student_layer": 10,
     "dict_start_epoch": 0,
-    # Winning run used broken |dL/dA| → always fell back to attention A as weight.
-    # Keep attention weighting for recipe match; Grad-CAM via dict_weight=saliency.
     "dict_weight": "attention",
-    "dict_match": "hard",  # match winning hard-argmax dictionary
+    "dict_match": "hard",
     "dict_match_temp": 0.07,
-    "dict_feature_norm": "channel",  # required for dict_loss ~O(1); none collapses KD
+    "dict_feature_norm": "channel",
     "dict_saliency_ema": 0.9,
     "dict_attn_start_epoch": 0,
     "dict_commit_loss": 0.0,
-    # Student init from YOLO26n backbone weights — largest gap vs early_7-19* scratch runs.
     "pretrained": "yolo26n.pt",
     "teacher_weights": "yolo26n.pt",
 }
+
+
+def _kd_early(**overrides: Any) -> dict[str, Any]:
+    """KD early recipe: student n10 ↔ teacher x6. Overrides must not silently drop shared keys."""
+    cfg: dict[str, Any] = {
+        "trainer": "kd",
+        "model": "yolo26n-DCN.yaml",
+        "teacher": "yolo26n.yaml",
+        "batch": DEFAULT_KD_BATCH,
+        **_KD_COMMON,
+        "dict_teacher_layers": [6],
+        "dict_align_loss": 0.08,
+        "dict_attn_loss": 0.25,
+    }
+    cfg.update(overrides)
+    return cfg
+
 
 BASELINES: dict[str, dict[str, Any]] = {
     "yolo26n": {
@@ -108,214 +126,74 @@ BASELINES: dict[str, dict[str, Any]] = {
         "pretrained": "yolo26n.pt",
         "description": "YOLO26n-DCN (YOLOF head) without distillation",
     },
-    "kd-early": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-kd-early",
-        "batch": DEFAULT_KD_BATCH,
-        # CrisReport early stage: student n10 learns local structure from teacher early tap x6 only.
-        "description": "CrisReport early dictionary: n10↔x6, hard match, pretrained student",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
-    },
-    "kd-p0": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-kd-p0",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "kd-early + Grad-CAM saliency (dict_weight=saliency ablation)",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_weight": "saliency",  # Grad-CAM; compare against kd-early attention weights
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
-    },
-    # --- early hyperparameter sweep (vs kd-early / early-3) ---
-    "early-B": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-B-attn035",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "early sweep B: dict_attn_loss=0.35 (restore AT budget vs x6-only)",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.35,
-    },
-    "early-C": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-C-attn040",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "early sweep C: dict_attn_loss=0.40",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.40,
-    },
-    # Round-2 sweeps after B/C: higher AT hurt mAP50-95; pivot to lower AT / align / saliency.
-    "early-D": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-D-attn020",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "early sweep D: dict_attn_loss=0.20 (below early-3)",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.20,
-    },
-    "early-E": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-E-align015",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "early sweep E: align_loss=0.15 (attn kept at 0.25)",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
-        "align_loss": 0.15,
-    },
-    "early-F": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-F-saliency",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "early sweep F: dict_weight=saliency (Grad-CAM), attn=0.25",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
-        "dict_weight": "saliency",
-    },
-    "early-G": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-G-dLdA",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "early sweep G: dict_weight=saliency_dLdA (analytic |∂L/∂A|), attn=0.25",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
-        "dict_weight": "saliency_dLdA",
-    },
-    # --- Phase H: dLdA × dict_align (Log/S_0.10, S_0.12) ---
-    # Result: H1 underperforms G; H2 recovers mAP50 but still trails attention@0.10 on mAP50-95.
-    "early-H1": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-H1-dLdA-align010",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "H1: saliency_dLdA + dict_align_loss=0.10 (attn=0.25)",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.10,
-        "dict_attn_loss": 0.25,
-        "dict_weight": "saliency_dLdA",
-    },
-    "early-H2": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-H2-dLdA-align012",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "H2: saliency_dLdA + dict_align_loss=0.12 (attn=0.25)",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.12,
-        "dict_attn_loss": 0.25,
-        "dict_weight": "saliency_dLdA",
-    },
-    # --- Phase S1: stabilize analytic |∂L/∂A| (main track; λ locked to G) ---
-    "early-S1a": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-S1a-dLdA-gate",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "S1a: saliency_dLdA_gate (A·|∂L/∂A|), align=0.08, attn=0.25",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
-        "dict_weight": "saliency_dLdA_gate",
-        "dict_saliency_blur": 0.0,
-        "dict_saliency_clip": 0.0,
-    },
-    "early-S1b": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-S1b-dLdA-gate-stable",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "S1b: dLdA_gate + blurσ=1 + clip=0.9 (align=0.08, attn=0.25)",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
-        "dict_weight": "saliency_dLdA_gate",
-        "dict_saliency_blur": 1.0,
-        "dict_saliency_clip": 0.9,
-    },
-    # --- Phase I: attention ablations only (upper-bound / report controls) ---
-    "early-I1": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-I1-attn-align012",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "ABLATION I1: attention + dict_align_loss=0.12",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.12,
-        "dict_attn_loss": 0.25,
-        "dict_weight": "attention",
-    },
-    "early-I2": {
-        "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
-        "teacher": "yolo26n.yaml",
-        "name": "baseline-early-I2-attn-align010-attn020",
-        "batch": DEFAULT_KD_BATCH,
-        "description": "ABLATION I2: attention + dict_align=0.10 + dict_attn=0.20",
-        **_KD_COMMON,
-        "dict_teacher_layers": [6],
-        "dict_align_loss": 0.10,
-        "dict_attn_loss": 0.20,
-        "dict_weight": "attention",
-    },
+    # Former kd-early / early-3 attention recipe (hyperparams unchanged).
+    "early": _kd_early(
+        name="baseline-kd-early",
+        description="CrisReport early dictionary: n10↔x6, hard match, attention weight, pretrained student",
+    ),
+    # Former early-S1a (hyperparams unchanged).
+    "early-dldx": _kd_early(
+        name="baseline-early-S1a-dLdx",
+        description="early + saliency_dLdx (mean_c|∂J_task/∂x^e|); blur/clip off",
+        dict_weight="saliency_dLdx",
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+    # --- Sweep slots: start from known recipes; edit align / attn / weight as needed ---
+    # Former early-S1a clone (0.08 / 0.25 / dLdx).
+    "early-tune1": _kd_early(
+        name="baseline-early-tune1",
+        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as early-dldx)",
+        dict_weight="saliency_dLdx",
+        dict_align_loss=0.08,
+        dict_attn_loss=0.25,
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+    # Former early-SA3 (0.10 / 0.25 / dLdx) — historical best gate λ pair.
+    "early-tune2": _kd_early(
+        name="baseline-early-tune2",
+        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as align=0.10, attn=0.25, dLdx)",
+        dict_weight="saliency_dLdx",
+        dict_align_loss=0.10,
+        dict_attn_loss=0.25,
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+}
+
+# Old CLI names → current keys (resume/docs convenience).
+_ALIASES: dict[str, str] = {
+    "kd-early": "early",
+    "early-S1a": "early-dldx",
+    "early-SA3": "early-tune2",
 }
 
 
+def _canonical(key: str) -> str:
+    return _ALIASES.get(key, key)
+
+
 def resolve_baseline_keys(spec: str) -> list[str]:
-    """Parse ``--baseline``: ``all``, a single name, or comma-separated names (e.g. early-B,early-C)."""
+    """Parse ``--baseline``: ``all``, a single name, or comma-separated names."""
     spec = (spec or "").strip()
     if not spec:
         raise ValueError("Empty --baseline")
     if spec == "all":
         return list(BASELINES)
-    keys = [k.strip() for k in spec.split(",") if k.strip()]
+    keys = [_canonical(k.strip()) for k in spec.split(",") if k.strip()]
     unknown = [k for k in keys if k not in BASELINES]
     if unknown:
-        raise ValueError(f"Unknown baseline(s) {unknown}. Choose from: {list(BASELINES)} or 'all'")
+        raise ValueError(
+            f"Unknown baseline(s) {unknown}. Choose from: {list(BASELINES)} "
+            f"(aliases: {list(_ALIASES)}) or 'all'"
+        )
     return keys
 
 
 def build_overrides(baseline_key: str, args: argparse.Namespace) -> dict[str, Any]:
     """Merge COMMON + baseline-specific overrides + CLI overrides."""
+    baseline_key = _canonical(baseline_key)
     if baseline_key not in BASELINES:
         raise ValueError(f"Unknown baseline {baseline_key!r}. Choose from: {list(BASELINES)}")
 
@@ -368,6 +246,7 @@ def run_test_eval(weights: Path, args: argparse.Namespace) -> None:
 
 def train_baseline(baseline_key: str, args: argparse.Namespace) -> Path:
     """Train one baseline; return path to best.pt."""
+    baseline_key = _canonical(baseline_key)
     spec = BASELINES[baseline_key]
     overrides = build_overrides(baseline_key, args)
     trainer_cls = YOLOFDistillationTrainer if spec["trainer"] == "kd" else DetectionTrainer
@@ -394,7 +273,7 @@ def parse_args() -> argparse.Namespace:
         default="yolo26n",
         help=(
             "baseline name, comma-separated list, or 'all'. "
-            f"Available: {', '.join(BASELINES)} (e.g. early-B,early-C)"
+            f"Available: {', '.join(BASELINES)}"
         ),
     )
     parser.add_argument("--epochs", type=int, default=None, help=f"override epochs (default: {COMMON['epochs']})")
@@ -407,7 +286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--weights",
         default="",
-        help="checkpoint for --resume or --test-only (e.g. runs/detect/dfire-baselines/baseline-yolo26n/weights/best.pt)",
+        help="checkpoint for --resume or --test-only",
     )
     parser.add_argument(
         "--test-only",

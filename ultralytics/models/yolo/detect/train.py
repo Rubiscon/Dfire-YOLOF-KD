@@ -585,7 +585,7 @@ class YOLOFDistillationModel(DetectionModel):
 
     @staticmethod
     def _spatial_attention(feat: torch.Tensor) -> torch.Tensor:
-        """Spatial attention map A = mean_c(F^2), shape (B, H, W) per proposal."""
+        """AT spatial map A = mean_c(F^2), shape (B, H, W) (Zagoruyko-style; not saliency)."""
         return feat.float().pow(2).mean(dim=1)
 
     def _collect_dict_teacher_feats(self, teacher_taps: Dict[int, torch.Tensor]) -> List[torch.Tensor]:
@@ -599,17 +599,28 @@ class YOLOFDistillationModel(DetectionModel):
 
     # Task-gradient saliency modes used for dictionary weighted align (not attention-A).
     _SALIENCY_GRAD_MODES = frozenset(
-        {"saliency", "saliency_dlda", "saliency_dlda_gate", "saliency_dlda_absf"}
+        {
+            "saliency_dldx",
+            "saliency",
+            "saliency_dlda",
+            "saliency_dlda_gate",
+            "saliency_dlda_absf",
+        }
     )
 
     @staticmethod
     def _dict_weight_mode(args) -> str:
         """Normalize ``dict_weight`` to a canonical mode string.
 
-        Check longer ``dLdA_*`` suffixes before bare ``dLdA`` so ``saliency_dLdA_gate``
-        is not collapsed to ``saliency_dlda``.
+        Preferred (advisor / proposal intent): ``saliency_dLdx`` = spatial map from
+        |∂J_task/∂x^e| on the teacher backbone tap (main-path feature).
+
+        Longer ``dLdA_*`` / ``dLdx`` suffixes are matched before bare ``dLdA`` so
+        ``saliency_dLdA_gate`` is not collapsed to ``saliency_dlda``.
         """
-        raw = str(getattr(args, "dict_weight", "saliency") or "saliency").lower().replace("-", "_")
+        raw = str(getattr(args, "dict_weight", "saliency_dLdx") or "saliency_dLdx").lower().replace("-", "_")
+        if raw in {"dldx", "saliency_dldx", "xe", "saliency_xe"} or raw.endswith("dldx"):
+            return "saliency_dldx"
         if raw in {"dlda_gate", "saliency_dlda_gate", "gate"} or raw.endswith("dlda_gate"):
             return "saliency_dlda_gate"
         if raw in {"dlda_absf", "saliency_dlda_absf", "absf"} or raw.endswith("dlda_absf"):
@@ -617,21 +628,39 @@ class YOLOFDistillationModel(DetectionModel):
         if raw in {"dlda", "saliency_dlda"} or raw.endswith("dlda"):
             return "saliency_dlda"
         if raw in {"gradcam", "saliency_gradcam"}:
-            return "saliency"
+            return "saliency"  # legacy Grad-CAM ablation
         return raw
 
     def _dict_weight_needs_task_grad(self) -> bool:
-        """True if weighted align needs ∂L/∂F from a teacher task-loss graph."""
+        """True if weighted align needs ∂J/∂x^e from a teacher task-loss graph."""
         return self._dict_weight_mode(self.args) in self._SALIENCY_GRAD_MODES
 
     @staticmethod
+    def _build_xe_saliency(g: torch.Tensor) -> torch.Tensor:
+        """Spatial saliency from teacher ∂J_task/∂x^e (advisor / proposal intent).
+
+        ``g`` has shape (B,C,H,W). Align needs a (B,1,H,W) weight, so we take the
+        channel-mean absolute gradient at each location:
+
+            S_{h,w} = mean_c |∂J_task / ∂x^e_{c,h,w}|
+
+        Absolute value matches the proposal text (importance ∝ |partial|). This uses
+        the main-path feature ``x^e`` only — no side-branch spatial map A.
+        """
+        cam = g.abs().mean(dim=1, keepdim=True)
+        if float(cam.detach().amax()) <= 0.0:
+            cam = g.detach().abs().sum(dim=1, keepdim=True)
+        return cam
+
+    @staticmethod
     def _build_dlda_saliency(f: torch.Tensor, g: torch.Tensor, mode: str) -> torch.Tensor:
-        """Build a (B,1,H,W) map from features/grads for analytic |∂L/∂A| family.
+        """Legacy analytic |∂L/∂A| family (A = mean_c(F²) side-branch; ablation only).
 
         Shared pieces: A = mean_c(F²), numer = Σ_c F_c ∂L/∂F_c.
-          - ``saliency_dlda``:      S = |numer / (2A)|   (literal |∂L/∂A|; 1/A can spike on background)
-          - ``saliency_dlda_gate``: S = A·|∂L/∂A| = |numer|/2  (A-gated; preferred for training)
-          - ``saliency_dlda_absf``: S = |numer|              (numerator only; same spatial prior as gate)
+          - ``saliency_dlda``:      S = |numer / (2A)|
+          - ``saliency_dlda_gate``: S = A·|∂L/∂A| = |numer|/2
+          - ``saliency_dlda_absf``: S = |numer|
+        Prefer ``saliency_dLdx`` for new runs (∂J/∂x^e).
         """
         a_map = f.pow(2).mean(dim=1, keepdim=True).clamp_min(1e-12)
         numer = (f * g).sum(dim=1, keepdim=True)
@@ -690,23 +719,116 @@ class YOLOFDistillationModel(DetectionModel):
             cam = self._gaussian_blur_bchw(cam, blur)
         return cam
 
+    @staticmethod
+    def _letterbox_content_mask(
+        img: torch.Tensor,
+        ratio_pad=None,
+        pad_value: float = 114.0 / 255.0,
+        tol: float = 2.0 / 255.0,
+    ) -> torch.Tensor:
+        """Build (B,1,H,W) mask with 1 on letterboxed content and 0 on gray pad.
+
+        Prefers ``ratio_pad`` ((rh,rw),(left,top)) when present (val / letterbox path).
+        Otherwise infers constant pad-colored borders from the image (YOLO pad=114).
+        Mosaic / full-bleed images typically yield an all-ones mask.
+        """
+        b, _, h, w = img.shape
+        device, dtype = img.device, img.dtype
+        mask = torch.ones(b, 1, h, w, device=device, dtype=dtype)
+
+        def _fill_box(bi: int, top: int, bottom: int, left: int, right: int) -> None:
+            top = max(0, min(h, int(top)))
+            bottom = max(0, min(h - top, int(bottom)))
+            left = max(0, min(w, int(left)))
+            right = max(0, min(w - left, int(right)))
+            if top + bottom >= h or left + right >= w:
+                return
+            mask[bi].zero_()
+            mask[bi, :, top : h - bottom, left : w - right] = 1
+
+        used_rp = False
+        if ratio_pad is not None:
+            # collate keeps a sequence of per-image ratio_pad entries
+            try:
+                rps = list(ratio_pad)
+            except TypeError:
+                rps = [ratio_pad]
+            if len(rps) == b:
+                for bi, rp in enumerate(rps):
+                    # Expect ((rh, rw), (left, top)) from LetterBox
+                    if (
+                        isinstance(rp, (list, tuple))
+                        and len(rp) == 2
+                        and isinstance(rp[1], (list, tuple))
+                        and len(rp[1]) >= 2
+                    ):
+                        left, top = float(rp[1][0]), float(rp[1][1])
+                        # Center letterbox ≈ symmetric pads
+                        _fill_box(bi, top, top, left, left)
+                        used_rp = True
+                if used_rp:
+                    return mask
+
+        # Image-inferred borders (works when ratio_pad missing, e.g. some train paths)
+        for bi in range(b):
+            x = img[bi]
+            near = (x - pad_value).abs().amax(dim=0) <= tol  # HW
+            row_pad = near.all(dim=1)
+            col_pad = near.all(dim=0)
+            top = 0
+            while top < h and bool(row_pad[top].item()):
+                top += 1
+            bottom = 0
+            while bottom < h - top and bool(row_pad[h - 1 - bottom].item()):
+                bottom += 1
+            left = 0
+            while left < w and bool(col_pad[left].item()):
+                left += 1
+            right = 0
+            while right < w - left and bool(col_pad[w - 1 - right].item()):
+                right += 1
+            if top or bottom or left or right:
+                _fill_box(bi, top, bottom, left, right)
+        return mask
+
+    @staticmethod
+    def _apply_content_mask(weight: torch.Tensor, content_mask: torch.Tensor | None) -> torch.Tensor:
+        """Zero letterbox regions on a (B,1,H,W) weight map (nearest resize of mask)."""
+        if content_mask is None or weight is None:
+            return weight
+        m = content_mask
+        if m.shape[-2:] != weight.shape[-2:]:
+            m = F.interpolate(m.float(), size=weight.shape[-2:], mode="nearest")
+        if m.shape[0] == 1 and weight.shape[0] > 1:
+            m = m.expand(weight.shape[0], -1, -1, -1)
+        elif m.shape[0] > weight.shape[0]:
+            m = m[: weight.shape[0]]
+        elif m.shape[0] < weight.shape[0]:
+            # EMA (1,1,H,W) vs batch weight — broadcast batch later by caller
+            pass
+        return weight * m.to(device=weight.device, dtype=weight.dtype)
+
+    def _letterbox_mask_enabled(self) -> bool:
+        """Default on: zero saliency/attention weights on YOLO letterbox gray pads."""
+        raw = getattr(self.args, "dict_letterbox_mask", True)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in {"0", "false", "off", "no"}
+        return bool(raw)
+
     def _compute_teacher_saliency(
         self, teacher_taps: Dict[int, torch.Tensor], teacher_task_loss: torch.Tensor
     ) -> Dict[int, torch.Tensor]:
         """Spatial weight maps for dictionary align from teacher task gradients.
 
         Modes (``dict_weight``):
-          - ``saliency`` / Grad-CAM:
-                α_c = GAP(∂L/∂F_c),  S = ReLU(Σ_c α_c F_c)
-          - ``saliency_dLdA`` (literal analytic |∂L/∂A|):
-                A = mean_c(F²),  ∂L/∂A ≈ (Σ_c F_c ∂L/∂F_c) / (2A+ε),  S = |∂L/∂A|
-                Note: 1/A amplifies low-activation (background) noise.
-          - ``saliency_dLdA_gate`` (preferred): S = A·|∂L/∂A| = |Σ_c F_c ∂L/∂F_c| / 2
-          - ``saliency_dLdA_absF``: S = |Σ_c F_c ∂L/∂F_c|
+          - ``saliency_dLdx`` (preferred, advisor/proposal intent):
+                g = ∂J_task/∂x^e on teacher tap,  S = mean_c(|g|)
+          - ``saliency`` / Grad-CAM (ablation):
+                α_c = GAP(∂J/∂x^e_c),  S = ReLU(Σ_c α_c x^e_c)
+          - ``saliency_dLdA`` / ``_gate`` / ``_absF`` (ablation):
+                legacy side-branch A=mean_c((x^e)²) analytic family
 
-        Optional ``dict_saliency_clip`` (e.g. 0.9) and ``dict_saliency_blur`` (σ>0)
-        stabilize maps without changing the proposal family.
-
+        Optional ``dict_saliency_clip`` / ``dict_saliency_blur`` stabilize maps.
         ``retain_graph=False``: call on a throwaway teacher forward (no dual-graph OOM).
         """
         if teacher_task_loss is None or not teacher_task_loss.requires_grad:
@@ -724,10 +846,12 @@ class YOLOFDistillationModel(DetectionModel):
                 continue
             f_f = f.float()
             g_f = g.float()
-            if mode in {"saliency_dlda", "saliency_dlda_gate", "saliency_dlda_absf"}:
+            if mode == "saliency_dldx":
+                cam = self._build_xe_saliency(g_f)
+            elif mode in {"saliency_dlda", "saliency_dlda_gate", "saliency_dlda_absf"}:
                 cam = self._build_dlda_saliency(f_f, g_f, mode)
             else:
-                # Grad-CAM (default ``saliency``)
+                # Grad-CAM (legacy ``saliency``)
                 alpha = g_f.mean(dim=(2, 3), keepdim=True)  # (B, C, 1, 1)
                 cam = F.relu((alpha * f_f).sum(dim=1, keepdim=True))  # (B, 1, H, W)
                 if float(cam.detach().amax()) <= 0.0:
@@ -768,7 +892,7 @@ class YOLOFDistillationModel(DetectionModel):
 
         Weighted align: task-saliency-weighted MSE between projected student tap and
         dictionary-reorganized teacher feature. Weight priority for task-grad modes
-        (``saliency``, ``saliency_dLdA``, ``saliency_dLdA_gate``, ``saliency_dLdA_absF``):
+        (``saliency_dLdx``, ``saliency``, ``saliency_dLdA*``):
           1) live map from the joint-phase throwaway pass
           2) EMA of that map (after freeze / when live map missing)
           3) uniform MSE
@@ -837,6 +961,8 @@ class YOLOFDistillationModel(DetectionModel):
                 weight = weight.float()
                 if weight.shape[-2:] != pred.shape[-2:]:
                     weight = F.interpolate(weight, size=pred.shape[-2:], mode="bilinear", align_corners=False)
+                # Zero letterbox gray pads (also covers attention-A weights).
+                weight = self._apply_content_mask(weight, getattr(self, "_content_mask", None))
                 weight = (weight / weight.mean(dim=(2, 3), keepdim=True).clamp_min(1e-12)).to(pred.dtype).detach()
                 d_align = d_align + (weight * (pred - target) ** 2).mean()
             else:
@@ -1113,12 +1239,15 @@ class YOLOFDistillationModel(DetectionModel):
         teacher_loss_items = torch.zeros(3, device=batch["img"].device)
         teacher_taps: Dict[int, torch.Tensor] = {}
         self._cached_saliency = {}
+        self._content_mask = None
         want_saliency = dict_on and teacher_joint and self._dict_weight_needs_task_grad()
+        if dict_on and self._letterbox_mask_enabled():
+            self._content_mask = self._letterbox_content_mask(batch["img"], batch.get("ratio_pad"))
         if teacher_joint:
             self._ensure_teacher_criterion()
             self.teacher.train()
             if want_saliency:
-                # Pass 1: throwaway teacher forward → saliency map from ∂L/∂F, free graph.
+                # Pass 1: throwaway teacher forward → saliency from ∂J_task/∂x^e, free graph.
                 # Holding retain_graph across student+teacher at large batch was a prime OOM/thrash cause.
                 # Freeze BN running-stat updates so this pass does not double-count toward EMA stats.
                 bn_backup: List[Tuple[nn.Module, float | None]] = []
@@ -1136,6 +1265,11 @@ class YOLOFDistillationModel(DetectionModel):
                             for li in self._dict_teacher_layers
                             if li in sal_taps and id(sal_taps[li]) in sal_maps
                         }
+                        if self._content_mask is not None:
+                            self._cached_saliency = {
+                                li: self._apply_content_mask(w, self._content_mask)
+                                for li, w in self._cached_saliency.items()
+                            }
                         self._update_saliency_ema(self._cached_saliency)
                         del sal_preds, sal_taps, sal_loss, sal_maps
                 finally:
