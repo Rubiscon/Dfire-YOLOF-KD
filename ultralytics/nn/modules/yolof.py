@@ -106,10 +106,15 @@ class DictionaryModule(nn.Module):
     teacher feature as per-channel pseudo-GT, then projects the student for
     the proposal weighted-align loss (Fig. 2):
 
-        key   K = flatten(avgpool(BN(Conv(x^e))))   (B, Ct, d)
+        value V = flatten(avgpool(BN(Conv(x^e))))   (B, Ct, d)
         query Q = flatten(avgpool(BN(Conv(n))))     (B, Cs, d)
-        M = Q K^T (B, Cs, Ct)
+        M = Q V^T (B, Cs, Ct), equivalent to Q^T V under column-token notation
         hard (proposal): index = argmax(M, dim=Ct); x_org = gather(x^e, index)
+
+    Attention restriction uses the same two independent projection branches:
+
+        A = softmax(M, dim=2)
+        J_AT = -mean(sum(-A * log(A + 1e-10), dim=1))
 
     Pool target is H/4 × W/4 so d = (H/4)·(W/4) (proposal: resolution ↓16× in area).
 
@@ -176,11 +181,29 @@ class DictionaryModule(nn.Module):
         for p in self.query_enc.parameters():
             p.requires_grad = False
 
-    def forward(self, t_feat: torch.Tensor, s_feat: torch.Tensor):
-        """Return (s_proj, t_reorg, commit_loss).
+    @staticmethod
+    def attention_restriction_loss(logits: torch.Tensor) -> torch.Tensor:
+        """Return the mentor-specified negative attention entropy.
+
+        ``logits`` has shape ``(B, n1, n2)``. Rows are normalized over
+        ``dim=2`` and the entropy terms are summed over ``dim=1`` exactly as
+        specified. Minimizing this negative entropy encourages less-peaked
+        channel correspondence.
+        """
+        attention = F.softmax(logits.float(), dim=2)
+        return -torch.mean(torch.sum(-attention * torch.log(attention + 1e-10), dim=1))
+
+    def forward(
+        self,
+        t_feat: torch.Tensor,
+        s_feat: torch.Tensor,
+        compute_attention_loss: bool = False,
+    ):
+        """Return (s_proj, t_reorg, commit_loss, attention_restriction_loss).
 
         ``t_reorg`` is the dictionary-reorganized teacher feature (B, Cs, Ht, Wt).
         ``commit_loss`` is 0 for hard matching (proposal); soft match only otherwise.
+        ``attention_restriction_loss`` is 0 when its configured gain is inactive.
         """
         _, _, h, w = t_feat.shape
         # Proposal: M = Q K^T without token L2-normalization.
@@ -188,6 +211,7 @@ class DictionaryModule(nn.Module):
         q = self.pool(self.query_enc(s_feat)).flatten(2)  # (B, Cs, d)
         m = q @ k.transpose(1, 2)  # (B, Cs, Ct)
         commit = t_feat.new_zeros(())
+        attention_loss = self.attention_restriction_loss(m) if compute_attention_loss else t_feat.new_zeros(())
 
         if self.match == "hard":
             # Proposal: index = torch.max(M, dim=1)[1]  (argmax over teacher channels).
@@ -204,4 +228,4 @@ class DictionaryModule(nn.Module):
         s_proj = self.proj(s_feat)
         if s_proj.shape[-2:] != t_feat.shape[-2:]:
             s_proj = F.interpolate(s_proj, size=t_feat.shape[-2:], mode="bilinear", align_corners=False)
-        return s_proj, t_reorg, commit
+        return s_proj, t_reorg, commit, attention_loss

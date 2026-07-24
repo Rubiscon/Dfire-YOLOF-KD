@@ -430,17 +430,17 @@ class YOLOFDistillationModel(DetectionModel):
         LOGGER.info(f"Built {n} per-scale feature projectors: {pairs}")
 
     def _dict_gains(self) -> Tuple[float, float, float]:
-        """(align, disabled-AT, commit) gains for backbone dictionary distillation.
-
-        Fig. 2 names attention restriction but the supplied text gives no formula; AT is
-        deliberately disabled for the current early-only implementation.
-        """
+        """Return (weighted-align, attention-restriction, commit) gains."""
         args = getattr(self, "args", None)
         if args is None:
             return 0.0, 0.0, 0.0
         beta_d = float(getattr(args, "dict_align_loss", 0.0) or 0.0)
+        beta_a = float(getattr(args, "dict_attn_loss", 0.0) or 0.0)
         beta_c = float(getattr(args, "dict_commit_loss", 0.0) or 0.0)
-        return beta_d, 0.0, beta_c
+        attn_start = int(getattr(args, "dict_attn_start_epoch", 0) or 0)
+        if self.current_epoch < attn_start:
+            beta_a = 0.0
+        return beta_d, beta_a, beta_c
 
     def build_distillation_modules(self, imgsz: int | None = None):
         """Trace feature shapes and create channel/spatial projectors + early dictionary modules."""
@@ -451,7 +451,7 @@ class YOLOFDistillationModel(DetectionModel):
         imgsz = imgsz or getattr(self.args, "imgsz", 640)
         dict_on = any(
             float(getattr(self.args, k, 0.0) or 0.0) > 0
-            for k in ("dict_align_loss", "dict_commit_loss")
+            for k in ("dict_align_loss", "dict_attn_loss", "dict_commit_loss")
         )
         if dict_on:
             self._dict_student_layer = int(getattr(self.args, "dict_student_layer", 10) or 10)
@@ -500,9 +500,11 @@ class YOLOFDistillationModel(DetectionModel):
                         match=match,
                         temperature=match_temp,
                     )
-                    if match == "hard":
+                    if match == "hard" and float(getattr(self.args, "dict_attn_loss", 0.0) or 0.0) <= 0:
                         # Argmax blocks encoder gradients. DictionaryModule initializes these
                         # Conv+BN paths as identity transforms before freezing their parameters.
+                        # With attention restriction enabled, its differentiable softmax path
+                        # trains both encoders, so they must remain trainable.
                         mod.freeze_encoders()
                     modules.append(mod)
                     tag = "late" if li >= self._dict_student_layer else "early"
@@ -938,8 +940,8 @@ class YOLOFDistillationModel(DetectionModel):
           3) uniform MSE
         ``dict_weight=attention`` uses Eq.(4) x_spatial=mean_c(x^e) as W (ablation).
 
-        Fig. 2 names attention restriction, but its formula is absent from the supplied
-        text. Per the current experiment decision, AT is disabled and ``d_attn=0``.
+        Attention restriction: negative entropy of the dictionary correlation attention,
+        using the mentor-specified softmax/sum dimensions.
 
         Commit: soft-matching encoder loss only; 0 for hard match (proposal).
         """
@@ -959,17 +961,22 @@ class YOLOFDistillationModel(DetectionModel):
             saliency = self._cached_saliency if use_grad_map else {}
 
         d_align = zero.clone()
+        d_attn = zero.clone()
         d_commit = zero.clone()
+        compute_attention_loss = self._dict_gains()[1] > 0
         n = 0
         for j, li in enumerate(self._dict_teacher_layers):
             t_feat = teacher_taps.get(li)
             if t_feat is None or j >= len(self.dictionary_modules):
                 continue
             # Detach teacher activations so dict KD does not update the teacher backbone.
-            s_proj, t_reorg, commit = self.dictionary_modules[j](t_feat.detach(), s_feat)
+            s_proj, t_reorg, commit, attention_loss = self.dictionary_modules[j](
+                t_feat.detach(), s_feat, compute_attention_loss=compute_attention_loss
+            )
             target = t_reorg.detach()
             pred = s_proj
             d_commit = d_commit + commit
+            d_attn = d_attn + attention_loss
 
             if norm == "l2":
                 pred = F.normalize(pred, dim=1)
@@ -1011,8 +1018,7 @@ class YOLOFDistillationModel(DetectionModel):
             n += 1
 
         n = max(n, 1)
-        # AT deliberately disabled; second return stays 0 for logger/checkpoint compatibility.
-        return d_align / n, zero, d_commit / n
+        return d_align / n, d_attn / n, d_commit / n
 
     def _ensure_align_assigner(self):
         """Lazy-init TAL assigner for align (defaults match task-loss TAL topk=10)."""
@@ -1327,7 +1333,7 @@ class YOLOFDistillationModel(DetectionModel):
         if getattr(self.args, "align", True) and self.current_epoch >= align_start:
             align_loss = self._alignment_loss(student_raw, teacher_raw)
 
-        # Backbone distillation (dictionary): weighted align + optional commit (no AT).
+        # Backbone distillation: weighted align + attention restriction + optional commit.
         dict_align_loss = torch.tensor(0.0, device=batch["img"].device)
         dict_attn_loss = torch.tensor(0.0, device=batch["img"].device)
         dict_commit_loss = torch.tensor(0.0, device=batch["img"].device)

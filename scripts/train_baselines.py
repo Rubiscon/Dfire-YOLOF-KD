@@ -3,7 +3,7 @@
 Baselines (kept lean):
   yolo26n       - YOLO26n FPN upper bound
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
-  early         - CrisReport early dictionary (n10↔x6, proposal saliency, no AT)
+  early         - CrisReport early dictionary (n10↔x6, proposal saliency + attention restriction)
   early-dldx    - same recipe but dict_weight=saliency_dLdx (ablation)
   early-tune1/2 - editable copies for hyperparameter sweeps
 
@@ -60,7 +60,7 @@ COMMON: dict[str, Any] = {
 DEFAULT_BATCH = 112  # solo / KD when VRAM allows (matches n_kd_n_batch112)
 DEFAULT_KD_BATCH = 112  # proven KD recipe; drop with --batch if saliency OOM
 
-# Shared online KD — CrisReport Fig.2 early dict (saliency Eq.5 weighted align; no AT / no late).
+# Shared online KD — CrisReport Fig.2 early dictionary distillation (late disabled).
 _KD_COMMON: dict[str, Any] = {
     "online_distill": True,
     "teacher_freeze_epoch": 200,
@@ -96,7 +96,7 @@ _KD_COMMON: dict[str, Any] = {
 
 
 def _kd_early(**overrides: Any) -> dict[str, Any]:
-    """KD early recipe: student n10 ↔ teacher x6 only (late disabled; AT off)."""
+    """KD early recipe: student n10 ↔ teacher x6 only (late disabled)."""
     cfg: dict[str, Any] = {
         "trainer": "kd",
         "model": "yolo26n-DCN.yaml",
@@ -105,7 +105,7 @@ def _kd_early(**overrides: Any) -> dict[str, Any]:
         **_KD_COMMON,
         "dict_teacher_layers": [6],
         "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.0,
+        "dict_attn_loss": 0.25,
     }
     cfg.update(overrides)
     return cfg
@@ -130,7 +130,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     },
     "early": _kd_early(
         name="baseline-kd-proposal",
-        description="CrisReport early dict: n10↔x6, hard match, saliency Eq.5 weighted align (no AT, no late)",
+        description="CrisReport early dict: n10↔x6, saliency weighted align + negative-entropy attention restriction",
     ),
     "early-dldx": _kd_early(
         name="baseline-early-S1a-dLdx",
@@ -141,19 +141,19 @@ BASELINES: dict[str, dict[str, Any]] = {
     ),
     "early-tune1": _kd_early(
         name="baseline-early-tune1",
-        description="TUNABLE: edit dict_align_loss / dict_weight (AT off)",
+        description="TUNABLE: align=0.08, AT=0.25, proposal saliency",
         dict_weight="saliency",
         dict_align_loss=0.08,
-        dict_attn_loss=0.0,
+        dict_attn_loss=0.25,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
     "early-tune2": _kd_early(
         name="baseline-early-tune2",
-        description="TUNABLE: starts at align=0.10, proposal saliency, AT off",
+        description="TUNABLE: align=0.10, AT=0.25, proposal saliency",
         dict_weight="saliency",
         dict_align_loss=0.10,
-        dict_attn_loss=0.0,
+        dict_attn_loss=0.25,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
