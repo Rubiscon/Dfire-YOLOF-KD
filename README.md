@@ -1,6 +1,6 @@
 # D-Fire YOLOF Knowledge Distillation
 
-Ultralytics fork for knowledge distillation on the D-Fire dataset: a **YOLO26n FPN teacher** trains a **YOLO26n-DCN YOLOF student** using backbone dictionary matching, neck feature alignment, and response-level supervision.
+Ultralytics fork for knowledge distillation on the D-Fire dataset: a **YOLO26n FPN teacher** trains a **YOLO26n-DCN YOLOF student** using early-backbone dictionary matching, neck feature alignment, and supplementary prediction alignment.
 
 ---
 
@@ -79,7 +79,7 @@ python scripts/train_baselines.py --baseline yolo26n
 # 2. YOLO26n-DCN student without distillation
 python scripts/train_baselines.py --baseline dcn-solo
 
-# 3. Early-stage KD (dictionary n10↔x6 + neck + response)
+# 3. Early KD (dictionary n10↔x6 + neck + response; AT/late off)
 python scripts/train_baselines.py --baseline kd-early
 
 # 4. Full KD stack (same early dict + neck + response)
@@ -104,9 +104,9 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | Component | Mechanism |
 |-----------|-----------|
-| Backbone | Soft dictionary matching + Grad-CAM weighted align + AT attention restriction + commit |
+| Backbone | Hard Q/K channel matching + proposal Eq.(5) saliency-weighted L2 align |
 | Neck | `DeconvNet` projectors: student dilated blocks ↔ teacher FPN features |
-| Response | Teacher NMS pseudo-labels → TAL assignment → box CIoU + cls KL |
+| Response | Teacher NMS pseudo-labels → TAL assignment → box CIoU + cls KL; starts after epoch 20 |
 
 ### Key hyperparameters (defaults in `scripts/train_baselines.py`)
 
@@ -114,14 +114,13 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 |-----------|---------|-------|
 | `batch` | `112` (solo) / `32` (KD) | KD dual-model + saliency needs a lower default; use `--batch 112` if VRAM allows |
 | `online_distill` | `True` | Joint teacher training until freeze epoch |
-| `teacher_freeze_epoch` | `110` | 1-indexed; teacher frozen afterward |
-| `dict_teacher_layers` | `[6, 10]` (`kd-p0`) / `[6]` (`kd-early`) | Early local (x6) + late semantic (x10) |
-| `dict_match` | `soft` | Soft cross-attention gather; `hard` = legacy argmax |
-| `dict_feature_norm` | `none` | Dict path; neck still uses `feature_norm=channel` |
-| `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck and response weights |
-| `dict_align_loss` / `dict_attn_loss` | `0.10` / `0.06` | Attn uses mean MSE (not HW-sum) |
-| `dict_commit_loss` | `0.05` | Soft-match query↔key commitment |
-| `dict_attn_start_epoch` | `20` | 1-indexed delay for attention restriction |
+| `teacher_freeze_epoch` | `200` | Teacher remains joint-trained for the 200-epoch run |
+| `dict_teacher_layers` | `[6]` | Early local x6 only; late x10 disabled |
+| `dict_match` | `hard` | Proposal argmax channel matching |
+| `dict_feature_norm` | `channel` | Stabilizes teacher/student scale; saliency controls spatial importance |
+| `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck feature KD / supplementary response KD |
+| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.0` | Mean-normalized saliency-weighted L2; AT deliberately disabled |
+| `dict_commit_loss` | `0.0` | Hard match has no commitment term |
 
 Full override keys are registered in `ultralytics/cfg/__init__.py`.
 
@@ -226,7 +225,7 @@ python scripts/train_baselines.py --baseline yolo26n
 # 2. YOLO26n-DCN 无蒸馏
 python scripts/train_baselines.py --baseline dcn-solo
 
-# 3. Early-stage KD（dictionary n10↔x6 + neck + response）
+# 3. Early KD（dictionary n10↔x6 + neck + response；关闭 AT/late）
 python scripts/train_baselines.py --baseline kd-early
 
 # 4. 完整 KD（与 kd-early 相同 early dict + neck + response）
@@ -251,9 +250,9 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | 模块 | 机制 |
 |------|------|
-| Backbone | 软字典匹配 + Grad-CAM 加权对齐 + AT attention 约束 + commit |
+| Backbone | Hard Q/K 通道匹配 + Proposal Eq.(5) saliency 加权 L2 |
 | Neck | `DeconvNet` 投影：学生 dilated 块 ↔ 教师 FPN 特征 |
-| Response | 教师 NMS 伪标签 → TAL 分配 → box CIoU + cls KL |
+| Response | 教师 NMS 伪标签 → TAL 分配 → box CIoU + cls KL；第 20 epoch 后启用 |
 
 ### 主要超参（默认值见 `scripts/train_baselines.py`）
 
@@ -261,14 +260,13 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 |------|--------|------|
 | `batch` | `112`（solo）/ `32`（KD） | KD 双模型 + saliency；显存够可用 `--batch 112` |
 | `online_distill` | `True` | 冻结前教师与 GT 联合训练 |
-| `teacher_freeze_epoch` | `110` | 1-indexed；之后教师冻结 |
-| `dict_teacher_layers` | `[6, 10]`（kd-p0）/ `[6]`（kd-early） | early 局部 + late 语义 |
-| `dict_match` | `soft` | 软交叉注意力聚合；`hard` 为旧版 argmax |
-| `dict_feature_norm` | `none` | 字典路径；neck 仍用 `feature_norm=channel` |
-| `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck / Response 权重 |
-| `dict_align_loss` / `dict_attn_loss` | `0.10` / `0.06` | attn 为 mean MSE（非 HW-sum） |
-| `dict_commit_loss` | `0.05` | 软匹配 query↔key commitment |
-| `dict_attn_start_epoch` | `20` | 1-indexed，延迟启动 attention 约束 |
+| `teacher_freeze_epoch` | `200` | 200 epoch 内教师保持联合训练 |
+| `dict_teacher_layers` | `[6]` | 仅 early x6；关闭 late x10 |
+| `dict_match` | `hard` | Proposal 的 argmax 通道匹配 |
+| `dict_feature_norm` | `channel` | 稳定师生特征尺度；saliency 仍独占空间权重 |
+| `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck 特征 KD / 补充 proposal 的 Response KD |
+| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.0` | mean-norm saliency 加权 L2；AT 按当前决定关闭 |
+| `dict_commit_loss` | `0.0` | Hard match 不使用 commitment |
 
 完整配置键见 `ultralytics/cfg/__init__.py`。
 

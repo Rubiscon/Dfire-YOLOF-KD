@@ -3,8 +3,8 @@
 Baselines (kept lean):
   yolo26n       - YOLO26n FPN upper bound
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
-  early         - CrisReport early dictionary (n10↔x6, attention weight)
-  early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
+  early         - CrisReport early dictionary (n10↔x6, proposal saliency, no AT)
+  early-dldx    - same recipe but dict_weight=saliency_dLdx (ablation)
   early-tune1/2 - editable copies for hyperparameter sweeps
 
 Hyperparameters below match the previous script bit-for-bit for these recipes
@@ -60,7 +60,7 @@ COMMON: dict[str, Any] = {
 DEFAULT_BATCH = 112  # solo / KD when VRAM allows (matches n_kd_n_batch112)
 DEFAULT_KD_BATCH = 112  # proven KD recipe; drop with --batch if saliency OOM
 
-# Shared online KD — aligned to Log/n_kd_n_batch112 (best mAP50≈0.728).
+# Shared online KD — CrisReport Fig.2 early dict (saliency Eq.5 weighted align; no AT / no late).
 _KD_COMMON: dict[str, Any] = {
     "online_distill": True,
     "teacher_freeze_epoch": 200,
@@ -69,6 +69,7 @@ _KD_COMMON: dict[str, Any] = {
     "teacher_task_loss": 1.0,
     "feature_norm": "channel",
     "feature_loss": 0.08,
+    # Supplementary proposal: enable FPN→YOLOF prediction alignment after 20 epochs.
     "align": True,
     "align_start_epoch": 20,
     "align_loss": 0.12,
@@ -81,9 +82,10 @@ _KD_COMMON: dict[str, Any] = {
     "distill_iou_thres": 0.5,
     "dict_student_layer": 10,
     "dict_start_epoch": 0,
-    "dict_weight": "attention",
+    "dict_weight": "saliency",
     "dict_match": "hard",
     "dict_match_temp": 0.07,
+    # Stabilize teacher/student feature scale; saliency still exclusively controls space.
     "dict_feature_norm": "channel",
     "dict_saliency_ema": 0.9,
     "dict_attn_start_epoch": 0,
@@ -94,7 +96,7 @@ _KD_COMMON: dict[str, Any] = {
 
 
 def _kd_early(**overrides: Any) -> dict[str, Any]:
-    """KD early recipe: student n10 ↔ teacher x6. Overrides must not silently drop shared keys."""
+    """KD early recipe: student n10 ↔ teacher x6 only (late disabled; AT off)."""
     cfg: dict[str, Any] = {
         "trainer": "kd",
         "model": "yolo26n-DCN.yaml",
@@ -103,7 +105,7 @@ def _kd_early(**overrides: Any) -> dict[str, Any]:
         **_KD_COMMON,
         "dict_teacher_layers": [6],
         "dict_align_loss": 0.08,
-        "dict_attn_loss": 0.25,
+        "dict_attn_loss": 0.0,
     }
     cfg.update(overrides)
     return cfg
@@ -126,37 +128,32 @@ BASELINES: dict[str, dict[str, Any]] = {
         "pretrained": "yolo26n.pt",
         "description": "YOLO26n-DCN (YOLOF head) without distillation",
     },
-    # Former kd-early / early-3 attention recipe (hyperparams unchanged).
     "early": _kd_early(
-        name="baseline-kd-early",
-        description="CrisReport early dictionary: n10↔x6, hard match, attention weight, pretrained student",
+        name="baseline-kd-proposal",
+        description="CrisReport early dict: n10↔x6, hard match, saliency Eq.5 weighted align (no AT, no late)",
     ),
-    # Former early-S1a (hyperparams unchanged).
     "early-dldx": _kd_early(
         name="baseline-early-S1a-dLdx",
-        description="early + saliency_dLdx (mean_c|∂J_task/∂x^e|); blur/clip off",
+        description="early recipe but dict_weight=saliency_dLdx (mean|g| ablation)",
         dict_weight="saliency_dLdx",
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
-    # --- Sweep slots: start from known recipes; edit align / attn / weight as needed ---
-    # Former early-S1a clone (0.08 / 0.25 / dLdx).
     "early-tune1": _kd_early(
         name="baseline-early-tune1",
-        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as early-dldx)",
-        dict_weight="saliency_dLdx",
+        description="TUNABLE: edit dict_align_loss / dict_weight (AT off)",
+        dict_weight="saliency",
         dict_align_loss=0.08,
-        dict_attn_loss=0.25,
+        dict_attn_loss=0.0,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
-    # Former early-SA3 (0.10 / 0.25 / dLdx) — historical best gate λ pair.
     "early-tune2": _kd_early(
         name="baseline-early-tune2",
-        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as align=0.10, attn=0.25, dLdx)",
-        dict_weight="saliency_dLdx",
+        description="TUNABLE: starts at align=0.10, proposal saliency, AT off",
+        dict_weight="saliency",
         dict_align_loss=0.10,
-        dict_attn_loss=0.25,
+        dict_attn_loss=0.0,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
