@@ -104,7 +104,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | Component | Mechanism |
 |-----------|-----------|
-| Backbone | Hard Q/V channel matching + Eq.(5) saliency-weighted L2 + negative-entropy attention restriction |
+| Backbone | Hard Q/V channel matching + Eq.(5) saliency-weighted L2 + restored spatial-energy AT |
 | Neck | `DeconvNet` projectors: student dilated blocks ↔ teacher FPN features |
 | Response | Teacher NMS pseudo-labels → TAL assignment → box CIoU + cls KL; starts after epoch 20 |
 
@@ -119,7 +119,10 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 | `dict_match` | `hard` | Proposal argmax channel matching |
 | `dict_feature_norm` | `channel` | Stabilizes teacher/student scale; saliency controls spatial importance |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck feature KD / supplementary response KD |
-| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | Mean-normalized saliency-weighted L2 / mentor-specified negative attention entropy |
+| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | Mean-normalized saliency-weighted L2 / spatial-energy AT |
+| `dict_attn_mode` | `spatial` | `spatial` (historical), `entropy` (mentor negative entropy), or `off` |
+| `dict_attn_warmup_epochs` | `0` | Linear AT-gain warmup; `0` exactly reproduces historical sudden-on behavior |
+| `dict_grad_log_interval` | `0` | Optional align/AT gradient norms and cosine in `dict_grad_stats.csv` |
 | `dict_commit_loss` | `0.0` | Hard match has no commitment term |
 
 Full override keys are registered in `ultralytics/cfg/__init__.py`.
@@ -250,7 +253,7 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 
 | 模块 | 机制 |
 |------|------|
-| Backbone | Hard Q/V 通道匹配 + Eq.(5) saliency 加权 L2 + attention 负熵约束 |
+| Backbone | Hard Q/V 通道匹配 + Eq.(5) saliency 加权 L2 + 恢复的空间能量 AT |
 | Neck | `DeconvNet` 投影：学生 dilated 块 ↔ 教师 FPN 特征 |
 | Response | 教师 NMS 伪标签 → TAL 分配 → box CIoU + cls KL；第 20 epoch 后启用 |
 
@@ -265,7 +268,10 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 | `dict_match` | `hard` | Proposal 的 argmax 通道匹配 |
 | `dict_feature_norm` | `channel` | 稳定师生特征尺度；saliency 仍独占空间权重 |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck 特征 KD / 补充 proposal 的 Response KD |
-| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | mean-norm saliency 加权 L2 / 导师指定的 attention 负熵约束 |
+| `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | mean-norm saliency 加权 L2 / spatial-energy AT |
+| `dict_attn_mode` | `spatial` | `spatial`（历史实现）、`entropy`（导师负熵）或 `off` |
+| `dict_attn_warmup_epochs` | `0` | AT gain 线性 warmup；`0` 精确复现历史突然启用 |
+| `dict_grad_log_interval` | `0` | 可选记录 align/AT 梯度范数及余弦到 `dict_grad_stats.csv` |
 | `dict_commit_loss` | `0.0` | Hard match 不使用 commitment |
 
 完整配置键见 `ultralytics/cfg/__init__.py`。

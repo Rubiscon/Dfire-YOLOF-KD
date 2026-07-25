@@ -187,6 +187,9 @@ class YOLOFDistillationModel(DetectionModel):
         self._cached_saliency: Dict[int, torch.Tensor] = {}
         # Running EMA of Grad-CAM saliency (layer → (1,1,H,W)); used after teacher freeze.
         self._saliency_ema: Dict[int, torch.Tensor] = {}
+        # Optional per-term gradient diagnostics for dictionary align vs attention.
+        self._dict_loss_calls = 0
+        self.last_dict_grad_stats: Dict[str, float | str] = {}
 
     def _teacher_joint_training(self) -> bool:
         """True while the teacher receives GT task loss (online joint phase).
@@ -429,18 +432,78 @@ class YOLOFDistillationModel(DetectionModel):
         ]
         LOGGER.info(f"Built {n} per-scale feature projectors: {pairs}")
 
+    def _dict_attn_mode(self) -> str:
+        """Resolve dictionary attention mode without changing legacy configs.
+
+        Modes:
+          - ``spatial``: historical spatial-energy AT, restored for reproducibility.
+          - ``entropy``: mentor-specified negative channel-correlation entropy.
+          - ``off``: no attention loss.
+        Configs created before ``dict_attn_mode`` existed keep ``entropy`` semantics.
+        """
+        raw = str(getattr(self.args, "dict_attn_mode", "entropy") or "entropy").strip().lower()
+        aliases = {
+            "spatial_at": "spatial",
+            "energy": "spatial",
+            "legacy": "spatial",
+            "negative_entropy": "entropy",
+            "nt": "entropy",
+            "none": "off",
+            "disabled": "off",
+        }
+        mode = aliases.get(raw, raw)
+        if mode not in {"spatial", "entropy", "off"}:
+            raise ValueError(f"Unknown dict_attn_mode={raw!r}; expected spatial, entropy, or off")
+        return mode
+
     def _dict_gains(self) -> Tuple[float, float, float]:
-        """Return (weighted-align, attention-restriction, commit) gains."""
+        """Return effective (weighted-align, attention, commit) gains.
+
+        ``dict_attn_start_epoch`` and ``dict_attn_warmup_epochs`` are zero-indexed.
+        A zero warmup reproduces the historical sudden-on behavior exactly.
+        """
         args = getattr(self, "args", None)
         if args is None:
             return 0.0, 0.0, 0.0
         beta_d = float(getattr(args, "dict_align_loss", 0.0) or 0.0)
         beta_a = float(getattr(args, "dict_attn_loss", 0.0) or 0.0)
         beta_c = float(getattr(args, "dict_commit_loss", 0.0) or 0.0)
+        if self._dict_attn_mode() == "off":
+            beta_a = 0.0
         attn_start = int(getattr(args, "dict_attn_start_epoch", 0) or 0)
         if self.current_epoch < attn_start:
             beta_a = 0.0
+        else:
+            warmup = int(getattr(args, "dict_attn_warmup_epochs", 0) or 0)
+            if beta_a > 0 and warmup > 0:
+                progress = min(max((self.current_epoch - attn_start + 1) / warmup, 0.0), 1.0)
+                beta_a *= progress
         return beta_d, beta_a, beta_c
+
+    def configure_dictionary_encoders(self) -> None:
+        """Apply explicit Q/K trainability policy after generic trainer setup.
+
+        Hard matching has no align gradient into Q/K. Spatial AT also bypasses
+        Q/K, so its historical identity encoders must remain frozen and in eval
+        mode. Entropy AT intentionally trains them. ``dict_train_encoders`` can
+        override this automatic policy for controlled ablations.
+        """
+        if not len(self.dictionary_modules):
+            return
+        override = getattr(self.args, "dict_train_encoders", None)
+        if override is None:
+            train_encoders = (
+                str(getattr(self.args, "dict_match", "hard")).lower() != "hard"
+                or self._dict_attn_mode() == "entropy"
+                or float(getattr(self.args, "dict_commit_loss", 0.0) or 0.0) > 0
+            )
+        else:
+            train_encoders = bool(override)
+        for module in self.dictionary_modules:
+            if train_encoders:
+                module.unfreeze_encoders()
+            else:
+                module.freeze_encoders()
 
     def build_distillation_modules(self, imgsz: int | None = None):
         """Trace feature shapes and create channel/spatial projectors + early dictionary modules."""
@@ -500,12 +563,6 @@ class YOLOFDistillationModel(DetectionModel):
                         match=match,
                         temperature=match_temp,
                     )
-                    if match == "hard" and float(getattr(self.args, "dict_attn_loss", 0.0) or 0.0) <= 0:
-                        # Argmax blocks encoder gradients. DictionaryModule initializes these
-                        # Conv+BN paths as identity transforms before freezing their parameters.
-                        # With attention restriction enabled, its differentiable softmax path
-                        # trains both encoders, so they must remain trainable.
-                        mod.freeze_encoders()
                     modules.append(mod)
                     tag = "late" if li >= self._dict_student_layer else "early"
                     msgs.append(
@@ -513,6 +570,7 @@ class YOLOFDistillationModel(DetectionModel):
                         f"(token grid {grid}x{grid}, match={match})"
                     )
                 self.dictionary_modules = nn.ModuleList(modules).to(device)
+                self.configure_dictionary_encoders()
                 LOGGER.info(f"Built {len(modules)} dictionary modules (backbone distillation): {msgs}")
 
         self._student_tap = None
@@ -622,6 +680,65 @@ class YOLOFDistillationModel(DetectionModel):
         Used to define proposal saliency; ``dict_weight=attention`` remains an ablation.
         """
         return feat.float().mean(dim=1)
+
+    @staticmethod
+    def _spatial_energy_attention(feat: torch.Tensor) -> torch.Tensor:
+        """Historical spatial AT map: channel-mean activation energy, shape (B,H,W).
+
+        Kept separate from proposal Eq.(4), which is ``mean_c(F)`` rather than
+        ``mean_c(F²)``.
+        """
+        return feat.float().pow(2).mean(dim=1)
+
+    @classmethod
+    def _spatial_attention_loss(cls, student: torch.Tensor, teacher: torch.Tensor) -> torch.Tensor:
+        """Historical spatial AT with exact N-run normalization and reduction.
+
+        The teacher target is detached here as a safety invariant. Per-image
+        flattened maps are L2-normalized, then squared distance is summed over
+        space and averaged over the batch. Replacing this with elementwise MSE
+        would divide by H×W and reproduce the historical ~0.0003 scale bug.
+        """
+        att_s = F.normalize(cls._spatial_energy_attention(student).flatten(1), dim=1)
+        att_t = F.normalize(cls._spatial_energy_attention(teacher.detach()).flatten(1), dim=1)
+        return (att_s - att_t).pow(2).sum(dim=1).mean()
+
+    def _maybe_record_dict_grad_stats(
+        self, d_align: torch.Tensor, d_attn: torch.Tensor, student_tap: torch.Tensor
+    ) -> None:
+        """Optionally measure weighted align/AT gradients on the shared student tap.
+
+        Disabled by default because separate ``autograd.grad`` calls retain the
+        graph and add overhead. When enabled, the trainer appends the latest
+        sample to ``dict_grad_stats.csv``.
+        """
+        self._dict_loss_calls += 1
+        interval = int(getattr(self.args, "dict_grad_log_interval", 0) or 0)
+        if interval <= 0 or self._dict_loss_calls % interval != 0 or not student_tap.requires_grad:
+            return
+        beta_d, beta_a, _ = self._dict_gains()
+
+        def grad_of(loss: torch.Tensor, gain: float) -> torch.Tensor | None:
+            if gain <= 0 or not loss.requires_grad:
+                return None
+            return torch.autograd.grad(gain * loss, student_tap, retain_graph=True, allow_unused=True)[0]
+
+        g_align = grad_of(d_align, beta_d)
+        g_attn = grad_of(d_attn, beta_a)
+        align_norm = float(g_align.float().norm().detach()) if g_align is not None else 0.0
+        attn_norm = float(g_attn.float().norm().detach()) if g_attn is not None else 0.0
+        cosine = 0.0
+        if g_align is not None and g_attn is not None and align_norm > 0 and attn_norm > 0:
+            cosine = float(F.cosine_similarity(g_align.float().flatten(), g_attn.float().flatten(), dim=0).detach())
+        self.last_dict_grad_stats = {
+            "step": float(self._dict_loss_calls),
+            "epoch": float(self.current_epoch + 1),
+            "mode": self._dict_attn_mode(),
+            "attn_gain": float(beta_a),
+            "align_grad_norm": align_norm,
+            "attn_grad_norm": attn_norm,
+            "grad_cosine": cosine,
+        }
 
     def _collect_dict_teacher_feats(self, teacher_taps: Dict[int, torch.Tensor]) -> List[torch.Tensor]:
         """Teacher tap tensors that participate in dictionary saliency / align."""
@@ -930,7 +1047,7 @@ class YOLOFDistillationModel(DetectionModel):
     def _dictionary_losses(
         self, teacher_taps: Dict[int, torch.Tensor], saliency: Dict[int, torch.Tensor] | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Backbone distillation losses (CrisReport Fig. 2): (weighted align, unused AT slot, commit).
+        """Backbone distillation losses: (weighted align, mode-selected attention, commit).
 
         Weighted align: task-saliency-weighted MSE between projected student tap and
         dictionary-reorganized teacher feature (proposal Fig. 2 / weighted align loss).
@@ -940,8 +1057,10 @@ class YOLOFDistillationModel(DetectionModel):
           3) uniform MSE
         ``dict_weight=attention`` uses Eq.(4) x_spatial=mean_c(x^e) as W (ablation).
 
-        Attention restriction: negative entropy of the dictionary correlation attention,
-        using the mentor-specified softmax/sum dimensions.
+        Attention modes:
+          - spatial: historical L2-normalized spatial-energy distance.
+          - entropy: mentor-specified negative correlation-attention entropy.
+          - off: zero.
 
         Commit: soft-matching encoder loss only; 0 for hard match (proposal).
         """
@@ -963,7 +1082,9 @@ class YOLOFDistillationModel(DetectionModel):
         d_align = zero.clone()
         d_attn = zero.clone()
         d_commit = zero.clone()
-        compute_attention_loss = self._dict_gains()[1] > 0
+        attn_mode = self._dict_attn_mode()
+        configured_attn = float(getattr(self.args, "dict_attn_loss", 0.0) or 0.0) > 0
+        compute_entropy_loss = configured_attn and attn_mode == "entropy"
         n = 0
         for j, li in enumerate(self._dict_teacher_layers):
             t_feat = teacher_taps.get(li)
@@ -971,12 +1092,15 @@ class YOLOFDistillationModel(DetectionModel):
                 continue
             # Detach teacher activations so dict KD does not update the teacher backbone.
             s_proj, t_reorg, commit, attention_loss = self.dictionary_modules[j](
-                t_feat.detach(), s_feat, compute_attention_loss=compute_attention_loss
+                t_feat.detach(), s_feat, compute_attention_loss=compute_entropy_loss
             )
             target = t_reorg.detach()
             pred = s_proj
             d_commit = d_commit + commit
-            d_attn = d_attn + attention_loss
+            if configured_attn and attn_mode == "spatial":
+                d_attn = d_attn + self._spatial_attention_loss(s_proj, target)
+            elif compute_entropy_loss:
+                d_attn = d_attn + attention_loss
 
             if norm == "l2":
                 pred = F.normalize(pred, dim=1)
@@ -1018,7 +1142,11 @@ class YOLOFDistillationModel(DetectionModel):
             n += 1
 
         n = max(n, 1)
-        return d_align / n, d_attn / n, d_commit / n
+        d_align = d_align / n
+        d_attn = d_attn / n
+        d_commit = d_commit / n
+        self._maybe_record_dict_grad_stats(d_align, d_attn, s_feat)
+        return d_align, d_attn, d_commit
 
     def _ensure_align_assigner(self):
         """Lazy-init TAL assigner for align (defaults match task-loss TAL topk=10)."""
@@ -1401,8 +1529,11 @@ class YOLOFDistillationTrainer(DetectionTrainer):
             "t_dfl_loss",
         )
         self.add_callback("on_train_start", self._freeze_teacher_callback)
+        self.add_callback("on_train_start", self._configure_dictionary_encoders_callback)
         self.add_callback("on_train_start", self._log_split_grad_clip_callback)
         self.add_callback("on_train_epoch_start", self._update_current_epoch)
+        self.add_callback("on_train_batch_end", self._append_dict_grad_stats_callback)
+        self._last_dict_grad_step_written = -1
 
     _GRAD_CLIP_MAX_NORM = 10.0  # match BaseTrainer.optimizer_step
 
@@ -1435,6 +1566,37 @@ class YOLOFDistillationTrainer(DetectionTrainer):
             f"{colorstr('KD:')} Split grad clipping enabled (student / teacher / distill, "
             f"max_norm={self._GRAD_CLIP_MAX_NORM}) with shared {opt} optimizer"
         )
+
+    def _configure_dictionary_encoders_callback(self, trainer):
+        """Reapply dictionary encoder policy after BaseTrainer re-enables frozen params."""
+        model = unwrap_model(trainer.model)
+        if hasattr(model, "configure_dictionary_encoders"):
+            model.configure_dictionary_encoders()
+
+    def _append_dict_grad_stats_callback(self, trainer):
+        """Persist optional per-term gradient diagnostics without altering results.csv."""
+        if RANK not in {-1, 0}:
+            return
+        model = unwrap_model(trainer.model)
+        stats = getattr(model, "last_dict_grad_stats", None)
+        if not stats:
+            return
+        step = int(float(stats["step"]))
+        if step == self._last_dict_grad_step_written:
+            return
+        self._last_dict_grad_step_written = step
+        path = self.save_dir / "dict_grad_stats.csv"
+        if not path.exists():
+            path.write_text(
+                "step,epoch,mode,attn_gain,align_grad_norm,attn_grad_norm,grad_cosine\n",
+                encoding="utf-8",
+            )
+        with path.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{step},{int(float(stats['epoch']))},{stats['mode']},{float(stats['attn_gain']):.8g},"
+                f"{float(stats['align_grad_norm']):.8g},{float(stats['attn_grad_norm']):.8g},"
+                f"{float(stats['grad_cosine']):.8g}\n"
+            )
 
     def optimizer_step(self):
         """Clip gradients per branch so student/distill norms do not shrink teacher updates."""
@@ -1472,6 +1634,8 @@ class YOLOFDistillationTrainer(DetectionTrainer):
     def _update_current_epoch(self, trainer):
         model = unwrap_model(trainer.model)
         model.current_epoch = trainer.epoch
+        if hasattr(model, "configure_dictionary_encoders"):
+            model.configure_dictionary_encoders()
         if hasattr(model, "_apply_teacher_freeze_if_needed"):
             model._apply_teacher_freeze_if_needed(trainer)
         if hasattr(model, "_set_teacher_criterion_epoch"):

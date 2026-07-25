@@ -6,6 +6,8 @@ Baselines (kept lean):
   early         - CrisReport early dictionary (n10↔x6, proposal saliency + attention restriction)
   early-dldx    - same recipe but dict_weight=saliency_dLdx (ablation)
   early-tune1/2 - editable copies for hyperparameter sweeps
+  spatial-repro - exact historical .10/.30 dLdx + spatial-AT recipe
+  spatial-warmup / spatial-warmup-m95 - improved spatial-AT candidates
 
 Hyperparameters below match the previous script bit-for-bit for these recipes
 (pretrained / batch / teacher_weights / KD gains). Sweep entries (early-B..T3,
@@ -88,7 +90,12 @@ _KD_COMMON: dict[str, Any] = {
     # Stabilize teacher/student feature scale; saliency still exclusively controls space.
     "dict_feature_norm": "channel",
     "dict_saliency_ema": 0.9,
+    # Historical spatial-energy AT. Entropy remains available via dict_attn_mode="entropy".
+    "dict_attn_mode": "spatial",
     "dict_attn_start_epoch": 0,
+    "dict_attn_warmup_epochs": 0,
+    "dict_grad_log_interval": 0,
+    "dict_train_encoders": False,
     "dict_commit_loss": 0.0,
     "pretrained": "yolo26n.pt",
     "teacher_weights": "yolo26n.pt",
@@ -130,7 +137,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     },
     "early": _kd_early(
         name="baseline-kd-proposal",
-        description="CrisReport early dict: n10↔x6, saliency weighted align + negative-entropy attention restriction",
+        description="CrisReport early dict: n10↔x6, Eq.5 weighted align + restored spatial-energy AT",
     ),
     "early-dldx": _kd_early(
         name="baseline-early-S1a-dLdx",
@@ -141,7 +148,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     ),
     "early-tune1": _kd_early(
         name="baseline-early-tune1",
-        description="TUNABLE: align=0.08, AT=0.25, proposal saliency",
+        description="TUNABLE: align=0.08, spatial AT=0.25, proposal saliency",
         dict_weight="saliency",
         dict_align_loss=0.08,
         dict_attn_loss=0.25,
@@ -150,10 +157,46 @@ BASELINES: dict[str, dict[str, Any]] = {
     ),
     "early-tune2": _kd_early(
         name="baseline-early-tune2",
-        description="TUNABLE: align=0.10, AT=0.25, proposal saliency",
+        description="TUNABLE: align=0.10, spatial AT=0.25, proposal saliency",
         dict_weight="saliency",
         dict_align_loss=0.10,
         dict_attn_loss=0.25,
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+    "spatial-repro": _kd_early(
+        name="baseline-spatial-repro-a010-at030",
+        description="Exact N-style recipe: dLdx, align=0.10, spatial AT=0.30, no warmup",
+        dict_weight="saliency_dLdx",
+        dict_align_loss=0.10,
+        dict_attn_loss=0.30,
+        dict_attn_mode="spatial",
+        dict_attn_warmup_epochs=0,
+        dict_grad_log_interval=0,
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+    "spatial-warmup": _kd_early(
+        name="baseline-spatial-warmup-a010-at030",
+        description="Improved spatial AT: dLdx, align=0.10, AT=0.30 with 10-epoch warmup",
+        dict_weight="saliency_dLdx",
+        dict_align_loss=0.10,
+        dict_attn_loss=0.30,
+        dict_attn_mode="spatial",
+        dict_attn_warmup_epochs=10,
+        dict_grad_log_interval=100,
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+    "spatial-warmup-m95": _kd_early(
+        name="baseline-spatial-warmup-a012-at030",
+        description="Improved strict-IoU candidate: dLdx, align=0.12, spatial AT=0.30 with warmup",
+        dict_weight="saliency_dLdx",
+        dict_align_loss=0.12,
+        dict_attn_loss=0.30,
+        dict_attn_mode="spatial",
+        dict_attn_warmup_epochs=10,
+        dict_grad_log_interval=100,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),

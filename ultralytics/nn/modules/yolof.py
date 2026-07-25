@@ -175,11 +175,31 @@ class DictionaryModule(nn.Module):
                 bn.running_var.fill_(1.0)
 
     def freeze_encoders(self) -> None:
-        """Freeze hard-match encoder parameters; BN running statistics still calibrate."""
+        """Freeze hard-match encoders and their BN running statistics."""
         for p in self.key_enc.parameters():
             p.requires_grad = False
         for p in self.query_enc.parameters():
             p.requires_grad = False
+        self.key_enc.eval()
+        self.query_enc.eval()
+
+    def unfreeze_encoders(self) -> None:
+        """Enable Q/K encoder training for differentiable matching objectives."""
+        for p in self.key_enc.parameters():
+            p.requires_grad = True
+        for p in self.query_enc.parameters():
+            p.requires_grad = True
+        self.key_enc.train(self.training)
+        self.query_enc.train(self.training)
+
+    def train(self, mode: bool = True):
+        """Keep frozen encoder BN layers in eval mode when the parent trains."""
+        super().train(mode)
+        if not any(p.requires_grad for p in self.key_enc.parameters()):
+            self.key_enc.eval()
+        if not any(p.requires_grad for p in self.query_enc.parameters()):
+            self.query_enc.eval()
+        return self
 
     @staticmethod
     def attention_restriction_loss(logits: torch.Tensor) -> torch.Tensor:
