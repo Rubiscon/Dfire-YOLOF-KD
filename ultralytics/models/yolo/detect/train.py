@@ -456,6 +456,27 @@ class YOLOFDistillationModel(DetectionModel):
             raise ValueError(f"Unknown dict_attn_mode={raw!r}; expected spatial, entropy, or off")
         return mode
 
+    def _dict_match_profile(self) -> str:
+        """Resolve channel-matching numerics independently from attention mode.
+
+        ``legacy`` reproduces the high-performing N/F path initialization and
+        numerics: random Conv, cosine-like 2×2 pooled channel tokens.
+        ``proposal`` preserves identity initialization, raw-dot, H/4-grid
+        numerics. Encoder trainability/BN state is selected separately by
+        :meth:`configure_dictionary_encoders`.
+        """
+        raw = str(getattr(self.args, "dict_match_profile", "proposal") or "proposal").strip().lower()
+        aliases = {
+            "historical": "legacy",
+            "performance": "legacy",
+            "current": "proposal",
+            "strict": "proposal",
+        }
+        profile = aliases.get(raw, raw)
+        if profile not in {"legacy", "proposal"}:
+            raise ValueError(f"Unknown dict_match_profile={raw!r}; expected legacy or proposal")
+        return profile
+
     def _dict_gains(self) -> Tuple[float, float, float]:
         """Return effective (weighted-align, attention, commit) gains.
 
@@ -484,9 +505,10 @@ class YOLOFDistillationModel(DetectionModel):
         """Apply explicit Q/K trainability policy after generic trainer setup.
 
         Hard matching has no align gradient into Q/K. Spatial AT also bypasses
-        Q/K, so its historical identity encoders must remain frozen and in eval
-        mode. Entropy AT intentionally trains them. ``dict_train_encoders`` can
-        override this automatic policy for controlled ablations.
+        Q/K, so historical legacy encoders remain frozen with batch-stat BN,
+        while proposal encoders remain frozen in eval mode. Entropy AT
+        intentionally trains either profile's branches. ``dict_train_encoders``
+        can override this automatic policy for controlled ablations.
         """
         if not len(self.dictionary_modules):
             return
@@ -503,7 +525,9 @@ class YOLOFDistillationModel(DetectionModel):
             if train_encoders:
                 module.unfreeze_encoders()
             else:
-                module.freeze_encoders()
+                # Historical matching freezes affine parameters but deliberately
+                # retains batch-stat BN; proposal matching freezes BN too.
+                module.freeze_encoders(freeze_bn=self._dict_match_profile() != "legacy")
 
     def build_distillation_modules(self, imgsz: int | None = None):
         """Trace feature shapes and create channel/spatial projectors + early dictionary modules."""
@@ -547,13 +571,18 @@ class YOLOFDistillationModel(DetectionModel):
                     )
                 match = str(getattr(self.args, "dict_match", "hard")).lower()
                 match_temp = float(getattr(self.args, "dict_match_temp", 0.07) or 0.07)
+                match_profile = self._dict_match_profile()
                 modules, msgs = [], []
                 for li in self._dict_teacher_layers:
                     t_feat = teacher_taps.get(li)
                     if t_feat is None:
                         raise RuntimeError(f"Teacher layer {li} (dict_teacher_layers) not found in teacher model.")
-                    # Proposal: avg-pool to H/4 × W/4 ⇒ area ↓16×, d=(H/4)·(W/4).
-                    grid = max(int(t_feat.shape[-1]) // 4, 1)
+                    if match_profile == "legacy":
+                        # Historical N/F matcher: coarse 2×2 tokens for x6@40.
+                        grid = max(int(t_feat.shape[-1]) // 16, 2)
+                    else:
+                        # Proposal profile: H/4 × W/4 ⇒ area ↓16×.
+                        grid = max(int(t_feat.shape[-1]) // 4, 1)
                     mod = DictionaryModule(
                         t_feat.shape[1],
                         s_tap.shape[1],
@@ -562,12 +591,13 @@ class YOLOFDistillationModel(DetectionModel):
                         grid,
                         match=match,
                         temperature=match_temp,
+                        match_profile=match_profile,
                     )
                     modules.append(mod)
                     tag = "late" if li >= self._dict_student_layer else "early"
                     msgs.append(
                         f"{tag} x{li}{tuple(t_feat.shape[1:])} <- n{self._dict_student_layer}{tuple(s_tap.shape[1:])} "
-                        f"(token grid {grid}x{grid}, match={match})"
+                        f"(token grid {grid}x{grid}, match={match}, profile={match_profile})"
                     )
                 self.dictionary_modules = nn.ModuleList(modules).to(device)
                 self.configure_dictionary_encoders()
@@ -704,7 +734,11 @@ class YOLOFDistillationModel(DetectionModel):
         return (att_s - att_t).pow(2).sum(dim=1).mean()
 
     def _maybe_record_dict_grad_stats(
-        self, d_align: torch.Tensor, d_attn: torch.Tensor, student_tap: torch.Tensor
+        self,
+        d_align: torch.Tensor,
+        d_attn: torch.Tensor,
+        student_tap: torch.Tensor,
+        match_stats: Dict[str, float] | None = None,
     ) -> None:
         """Optionally measure weighted align/AT gradients on the shared student tap.
 
@@ -721,7 +755,11 @@ class YOLOFDistillationModel(DetectionModel):
         def grad_of(loss: torch.Tensor, gain: float) -> torch.Tensor | None:
             if gain <= 0 or not loss.requires_grad:
                 return None
-            return torch.autograd.grad(gain * loss, student_tap, retain_graph=True, allow_unused=True)[0]
+            # The optimized objective multiplies all mean-reduced distillation
+            # terms by batch size; diagnostics must report that actual scale.
+            return torch.autograd.grad(
+                student_tap.shape[0] * gain * loss, student_tap, retain_graph=True, allow_unused=True
+            )[0]
 
         g_align = grad_of(d_align, beta_d)
         g_attn = grad_of(d_attn, beta_a)
@@ -738,6 +776,9 @@ class YOLOFDistillationModel(DetectionModel):
             "align_grad_norm": align_norm,
             "attn_grad_norm": attn_norm,
             "grad_cosine": cosine,
+            "used_teacher_ratio": float((match_stats or {}).get("used_teacher_ratio", 0.0)),
+            "max_teacher_share": float((match_stats or {}).get("max_teacher_share", 0.0)),
+            "match_margin": float((match_stats or {}).get("match_margin", 0.0)),
         }
 
     def _collect_dict_teacher_feats(self, teacher_taps: Dict[int, torch.Tensor]) -> List[torch.Tensor]:
@@ -1085,6 +1126,11 @@ class YOLOFDistillationModel(DetectionModel):
         attn_mode = self._dict_attn_mode()
         configured_attn = float(getattr(self.args, "dict_attn_loss", 0.0) or 0.0) > 0
         compute_entropy_loss = configured_attn and attn_mode == "entropy"
+        diagnostic_interval = int(getattr(self.args, "dict_grad_log_interval", 0) or 0)
+        collect_match_diagnostics = (
+            diagnostic_interval > 0 and (self._dict_loss_calls + 1) % diagnostic_interval == 0
+        )
+        match_samples: List[Dict[str, float]] = []
         n = 0
         for j, li in enumerate(self._dict_teacher_layers):
             t_feat = teacher_taps.get(li)
@@ -1092,8 +1138,15 @@ class YOLOFDistillationModel(DetectionModel):
                 continue
             # Detach teacher activations so dict KD does not update the teacher backbone.
             s_proj, t_reorg, commit, attention_loss = self.dictionary_modules[j](
-                t_feat.detach(), s_feat, compute_attention_loss=compute_entropy_loss
+                t_feat.detach(),
+                s_feat,
+                compute_attention_loss=compute_entropy_loss,
+                collect_match_diagnostics=collect_match_diagnostics,
             )
+            if collect_match_diagnostics and self.dictionary_modules[j].last_match_stats:
+                match_samples.append(
+                    {k: float(v) for k, v in self.dictionary_modules[j].last_match_stats.items()}
+                )
             target = t_reorg.detach()
             pred = s_proj
             d_commit = d_commit + commit
@@ -1145,7 +1198,12 @@ class YOLOFDistillationModel(DetectionModel):
         d_align = d_align / n
         d_attn = d_attn / n
         d_commit = d_commit / n
-        self._maybe_record_dict_grad_stats(d_align, d_attn, s_feat)
+        match_stats = (
+            {k: sum(sample[k] for sample in match_samples) / len(match_samples) for k in match_samples[0]}
+            if match_samples
+            else None
+        )
+        self._maybe_record_dict_grad_stats(d_align, d_attn, s_feat, match_stats)
         return d_align, d_attn, d_commit
 
     def _ensure_align_assigner(self):
@@ -1530,6 +1588,7 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         )
         self.add_callback("on_train_start", self._freeze_teacher_callback)
         self.add_callback("on_train_start", self._configure_dictionary_encoders_callback)
+        self.add_callback("on_train_start", self._seed_dict_grad_diagnostics_callback)
         self.add_callback("on_train_start", self._log_split_grad_clip_callback)
         self.add_callback("on_train_epoch_start", self._update_current_epoch)
         self.add_callback("on_train_batch_end", self._append_dict_grad_stats_callback)
@@ -1573,6 +1632,27 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         if hasattr(model, "configure_dictionary_encoders"):
             model.configure_dictionary_encoders()
 
+    def _seed_dict_grad_diagnostics_callback(self, trainer):
+        """Continue diagnostic step numbering across resume / reused save_dir."""
+        path = self.save_dir / "dict_grad_stats.csv"
+        if not path.exists():
+            return
+        last_step = -1
+        with path.open("r", encoding="utf-8") as f:
+            next(f, None)
+            for line in f:
+                parts = line.strip().split(",")
+                if not parts or not parts[0]:
+                    continue
+                try:
+                    last_step = max(last_step, int(float(parts[0])))
+                except ValueError:
+                    continue
+        self._last_dict_grad_step_written = last_step
+        model = unwrap_model(trainer.model)
+        if hasattr(model, "_dict_loss_calls"):
+            model._dict_loss_calls = max(int(getattr(model, "_dict_loss_calls", 0)), last_step)
+
     def _append_dict_grad_stats_callback(self, trainer):
         """Persist optional per-term gradient diagnostics without altering results.csv."""
         if RANK not in {-1, 0}:
@@ -1582,21 +1662,32 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         if not stats:
             return
         step = int(float(stats["step"]))
-        if step == self._last_dict_grad_step_written:
+        if step <= self._last_dict_grad_step_written:
             return
         self._last_dict_grad_step_written = step
         path = self.save_dir / "dict_grad_stats.csv"
+        header = (
+            "step,epoch,mode,attn_gain,align_grad_norm,attn_grad_norm,grad_cosine,"
+            "used_teacher_ratio,max_teacher_share,match_margin\n"
+        )
         if not path.exists():
-            path.write_text(
-                "step,epoch,mode,attn_gain,align_grad_norm,attn_grad_norm,grad_cosine\n",
-                encoding="utf-8",
-            )
+            path.write_text(header, encoding="utf-8")
+        with path.open("r", encoding="utf-8") as f:
+            existing_header = f.readline().rstrip()
+        has_match_columns = existing_header == header.rstrip()
         with path.open("a", encoding="utf-8") as f:
-            f.write(
+            row = (
                 f"{step},{int(float(stats['epoch']))},{stats['mode']},{float(stats['attn_gain']):.8g},"
                 f"{float(stats['align_grad_norm']):.8g},{float(stats['attn_grad_norm']):.8g},"
-                f"{float(stats['grad_cosine']):.8g}\n"
+                f"{float(stats['grad_cosine']):.8g}"
             )
+            if has_match_columns:
+                row += (
+                    f",{float(stats.get('used_teacher_ratio', 0.0)):.8g},"
+                    f"{float(stats.get('max_teacher_share', 0.0)):.8g},"
+                    f"{float(stats.get('match_margin', 0.0)):.8g}"
+                )
+            f.write(row + "\n")
 
     def optimizer_step(self):
         """Clip gradients per branch so student/distill norms do not shrink teacher updates."""

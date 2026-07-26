@@ -552,6 +552,7 @@ def check_dict_alignment(
             "dict_train_encoders",
             "dict_weight",
             "dict_match",
+            "dict_match_profile",
             "dict_match_temp",
             "dict_feature_norm",
             "dict_saliency_ema",

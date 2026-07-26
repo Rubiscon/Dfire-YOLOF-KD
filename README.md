@@ -116,13 +116,14 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 | `online_distill` | `True` | Joint teacher training until freeze epoch |
 | `teacher_freeze_epoch` | `200` | Teacher remains joint-trained for the 200-epoch run |
 | `dict_teacher_layers` | `[6]` | Early local x6 only; late x10 disabled |
-| `dict_match` | `hard` | Proposal argmax channel matching |
+| `dict_match` | `hard` | Argmax channel matching |
+| `dict_match_profile` | `legacy` | Performance profile: random frozen Conv + batch-stat BN + normalized 2×2 tokens; use `proposal` for identity/eval-BN/raw-dot/H÷4 |
 | `dict_feature_norm` | `channel` | Stabilizes teacher/student scale; saliency controls spatial importance |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck feature KD / supplementary response KD |
 | `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | Mean-normalized saliency-weighted L2 / spatial-energy AT |
 | `dict_attn_mode` | `spatial` | `spatial` (historical), `entropy` (mentor negative entropy), or `off` |
 | `dict_attn_warmup_epochs` | `0` | Linear AT-gain warmup; `0` exactly reproduces historical sudden-on behavior |
-| `dict_grad_log_interval` | `0` | Optional align/AT gradient norms and cosine in `dict_grad_stats.csv` |
+| `dict_grad_log_interval` | `0` | Optional align/AT gradients plus matcher occupancy, concentration, and top-2 margin in `dict_grad_stats.csv` |
 | `dict_commit_loss` | `0.0` | Hard match has no commitment term |
 
 Full override keys are registered in `ultralytics/cfg/__init__.py`.
@@ -265,13 +266,14 @@ python scripts/train_baselines.py --baseline kd-p0 --test-only \
 | `online_distill` | `True` | 冻结前教师与 GT 联合训练 |
 | `teacher_freeze_epoch` | `200` | 200 epoch 内教师保持联合训练 |
 | `dict_teacher_layers` | `[6]` | 仅 early x6；关闭 late x10 |
-| `dict_match` | `hard` | Proposal 的 argmax 通道匹配 |
+| `dict_match` | `hard` | argmax 通道匹配 |
+| `dict_match_profile` | `legacy` | 性能型历史 matcher：随机冻结 Conv + batch-stat BN + 归一化 2×2 token；`proposal` 为 identity/eval-BN/raw-dot/H÷4 |
 | `dict_feature_norm` | `channel` | 稳定师生特征尺度；saliency 仍独占空间权重 |
 | `feature_loss` / `align_loss` | `0.08` / `0.12` | Neck 特征 KD / 补充 proposal 的 Response KD |
 | `dict_align_loss` / `dict_attn_loss` | `0.08` / `0.25` | mean-norm saliency 加权 L2 / spatial-energy AT |
 | `dict_attn_mode` | `spatial` | `spatial`（历史实现）、`entropy`（导师负熵）或 `off` |
 | `dict_attn_warmup_epochs` | `0` | AT gain 线性 warmup；`0` 精确复现历史突然启用 |
-| `dict_grad_log_interval` | `0` | 可选记录 align/AT 梯度范数及余弦到 `dict_grad_stats.csv` |
+| `dict_grad_log_interval` | `0` | 可选记录 align/AT 梯度及 matcher 占用率、集中度和 top-2 margin 到 `dict_grad_stats.csv` |
 | `dict_commit_loss` | `0.0` | Hard match 不使用 commitment |
 
 完整配置键见 `ultralytics/cfg/__init__.py`。

@@ -116,7 +116,10 @@ class DictionaryModule(nn.Module):
         A = softmax(M, dim=2)
         J_AT = -mean(sum(-A * log(A + 1e-10), dim=1))
 
-    Pool target is H/4 × W/4 so d = (H/4)·(W/4) (proposal: resolution ↓16× in area).
+    Matcher profiles (``dict_match_profile``):
+      - ``legacy``: random frozen Conv, train-mode BN, normalized coarse tokens
+        (2×2 for the historical x6@40 path).
+      - ``proposal``: identity Conv, frozen BN, raw-dot H/4 × W/4 tokens.
 
     Matching modes (``dict_match``):
       - ``hard`` (proposal default): ``torch.max`` / argmax gather.
@@ -125,9 +128,10 @@ class DictionaryModule(nn.Module):
     Args:
         c_t, c_s: teacher / student channels.
         t_size, s_size: spatial size (H==W) at build time.
-        grid: pooled token side length (proposal: ~H_e/4).
+        grid: pooled token side length selected by the matching profile.
         match: ``hard`` or ``soft``.
         temperature: softmax temperature for soft matching.
+        match_profile: ``legacy`` performance profile or ``proposal`` strict profile.
     """
 
     def __init__(
@@ -139,6 +143,7 @@ class DictionaryModule(nn.Module):
         grid: int = 4,
         match: str = "hard",
         temperature: float = 0.07,
+        match_profile: str = "proposal",
     ):
         super().__init__()
         # Proposal: Conv + BN, then average-pool (no stride-conv downsample).
@@ -154,7 +159,18 @@ class DictionaryModule(nn.Module):
         self.proj = DeconvNet(c_s, c_s, s_size, t_size)
         self.match = str(match).lower()
         self.temperature = float(temperature)
-        if self.match == "hard":
+        profile_aliases = {
+            "historical": "legacy",
+            "performance": "legacy",
+            "current": "proposal",
+            "strict": "proposal",
+        }
+        self.match_profile = profile_aliases.get(str(match_profile).lower(), str(match_profile).lower())
+        if self.match_profile not in {"legacy", "proposal"}:
+            raise ValueError(f"Unknown dictionary match_profile={match_profile!r}; expected legacy or proposal")
+        self._freeze_encoder_bn = False
+        self.last_match_stats: dict[str, torch.Tensor] | None = None
+        if self.match == "hard" and self.match_profile == "proposal":
             # Hard argmax has no derivative with respect to Q/K, so randomly initialized
             # encoders would remain random forever. Start from an identity channel transform;
             # BatchNorm still calibrates the two feature distributions as stated in Fig. 2.
@@ -174,17 +190,28 @@ class DictionaryModule(nn.Module):
                 bn.running_mean.zero_()
                 bn.running_var.fill_(1.0)
 
-    def freeze_encoders(self) -> None:
-        """Freeze hard-match encoders and their BN running statistics."""
+    def freeze_encoders(self, freeze_bn: bool = True) -> None:
+        """Freeze hard-match encoder parameters with selectable BN behavior.
+
+        Historical N runs kept frozen random Conv+BN encoders in train mode so
+        matching used current-batch BN statistics. Proposal mode freezes BN as
+        well for a stable identity transform.
+        """
         for p in self.key_enc.parameters():
             p.requires_grad = False
         for p in self.query_enc.parameters():
             p.requires_grad = False
-        self.key_enc.eval()
-        self.query_enc.eval()
+        self._freeze_encoder_bn = bool(freeze_bn)
+        if self._freeze_encoder_bn:
+            self.key_enc.eval()
+            self.query_enc.eval()
+        else:
+            self.key_enc.train(self.training)
+            self.query_enc.train(self.training)
 
     def unfreeze_encoders(self) -> None:
         """Enable Q/K encoder training for differentiable matching objectives."""
+        self._freeze_encoder_bn = False
         for p in self.key_enc.parameters():
             p.requires_grad = True
         for p in self.query_enc.parameters():
@@ -195,9 +222,9 @@ class DictionaryModule(nn.Module):
     def train(self, mode: bool = True):
         """Keep frozen encoder BN layers in eval mode when the parent trains."""
         super().train(mode)
-        if not any(p.requires_grad for p in self.key_enc.parameters()):
+        if self._freeze_encoder_bn and not any(p.requires_grad for p in self.key_enc.parameters()):
             self.key_enc.eval()
-        if not any(p.requires_grad for p in self.query_enc.parameters()):
+        if self._freeze_encoder_bn and not any(p.requires_grad for p in self.query_enc.parameters()):
             self.query_enc.eval()
         return self
 
@@ -218,6 +245,7 @@ class DictionaryModule(nn.Module):
         t_feat: torch.Tensor,
         s_feat: torch.Tensor,
         compute_attention_loss: bool = False,
+        collect_match_diagnostics: bool = False,
     ):
         """Return (s_proj, t_reorg, commit_loss, attention_restriction_loss).
 
@@ -229,6 +257,12 @@ class DictionaryModule(nn.Module):
         # Proposal: M = Q K^T without token L2-normalization.
         k = self.pool(self.key_enc(t_feat)).flatten(2)  # (B, Ct, d)
         q = self.pool(self.query_enc(s_feat)).flatten(2)  # (B, Cs, d)
+        if self.match_profile == "legacy":
+            # Historical N/F runs used cosine-like pooled channel tokens. Key
+            # normalization is especially important because raw-dot argmax
+            # otherwise favors high-norm teacher channels.
+            k = F.normalize(k, dim=2)
+            q = F.normalize(q, dim=2)
         m = q @ k.transpose(1, 2)  # (B, Cs, Ct)
         commit = t_feat.new_zeros(())
         attention_loss = self.attention_restriction_loss(m) if compute_attention_loss else t_feat.new_zeros(())
@@ -244,6 +278,23 @@ class DictionaryModule(nn.Module):
             q_n = F.normalize(q, dim=2)
             k_hat = torch.einsum("bsc,bcd->bsd", w_soft.detach(), k_n.detach())
             commit = (1.0 - F.cosine_similarity(q_n, k_hat, dim=2)).mean()
+
+        if collect_match_diagnostics:
+            with torch.no_grad():
+                index = m.argmax(dim=2)
+                counts = F.one_hot(index, num_classes=m.shape[2]).sum(dim=1).float()
+                if m.shape[2] > 1:
+                    top2 = m.topk(2, dim=2).values
+                    margin = (top2[:, :, 0] - top2[:, :, 1]).mean()
+                else:
+                    margin = m.new_zeros(())
+                self.last_match_stats = {
+                    "used_teacher_ratio": (counts > 0).float().mean(dim=1).mean().detach(),
+                    "max_teacher_share": (counts.max(dim=1).values / index.shape[1]).mean().detach(),
+                    "match_margin": margin.detach(),
+                }
+        else:
+            self.last_match_stats = None
 
         s_proj = self.proj(s_feat)
         if s_proj.shape[-2:] != t_feat.shape[-2:]:
