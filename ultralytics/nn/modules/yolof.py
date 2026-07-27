@@ -100,38 +100,34 @@ class DeconvNet(nn.Module):
 
 
 class DictionaryModule(nn.Module):
-    """Backbone dictionary module (CrisReport Fig. 2): student n10 ↔ teacher x^e (e.g. x6/x10).
+    """Early-stage backbone dictionary module (student n10 ↔ teacher x6 / x10).
 
-    Matches every student channel (query) to teacher channels (keys), reorganizes the
-    teacher feature as per-channel pseudo-GT, then projects the student for
-    the proposal weighted-align loss (Fig. 2):
+    Matches every student backbone channel (query) to teacher early-feature channels
+    (keys) via a correlation matrix of pooled channel tokens, then reorganizes the
+    teacher feature so it can serve as a per-channel pseudo ground truth:
 
-        value V = flatten(avgpool(BN(Conv(x^e))))   (B, Ct, d)
-        query Q = flatten(avgpool(BN(Conv(n))))     (B, Cs, d)
-        M = Q V^T (B, Cs, Ct), equivalent to Q^T V under column-token notation
-        hard (proposal): index = argmax(M, dim=Ct); x_org = gather(x^e, index)
-
-    Attention restriction uses the same two independent projection branches:
-
-        A = softmax(M, dim=2)
-        J_AT = -mean(sum(-A * log(A + 1e-10), dim=1))
-
-    Matcher profiles (``dict_match_profile``):
-      - ``legacy``: random frozen Conv, train-mode BN, normalized coarse tokens
-        (2×2 for the historical x6@40 path).
-      - ``proposal``: identity Conv, frozen BN, raw-dot H/4 × W/4 tokens.
+        key   K = flatten(avgpool(BN(Conv(x_t))))   (B, Ct, d)
+        query Q = flatten(avgpool(BN(Conv(n_s))))   (B, Cs, d)
+        M = Q K^T (B, Cs, Ct)
 
     Matching modes (``dict_match``):
-      - ``hard`` (proposal default): ``torch.max`` / argmax gather.
-      - ``soft`` (ablation): softmax gather + commitment loss.
+      - ``soft`` (default): M → softmax → soft channel gather (differentiable cross-attention;
+        key/query encoders and the student backbone receive gradients — closer to the
+        proposal's mutual-information / cross-attention intent).
+      - ``hard``: index = argmax(M); non-differentiable gather (legacy). Encoders act as
+        fixed projections; freeze their params after init when hard is selected upstream.
+
+    The student feature is projected (DeconvNet) to the same channel/spatial size as
+    the reorganized teacher feature for weighted align + attention restriction losses.
 
     Args:
-        c_t, c_s: teacher / student channels.
-        t_size, s_size: spatial size (H==W) at build time.
-        grid: pooled token side length selected by the matching profile.
-        match: ``hard`` or ``soft``.
-        temperature: softmax temperature for soft matching.
-        match_profile: ``legacy`` performance profile or ``proposal`` strict profile.
+        c_t (int): teacher feature channels.
+        c_s (int): student feature channels.
+        t_size (int): teacher feature spatial size (H == W) at trace time.
+        s_size (int): student feature spatial size (H == W) at trace time.
+        grid (int): pooled token grid; token dim d = grid * grid.
+        match (str): ``soft`` or ``hard``.
+        temperature (float): softmax temperature for soft matching.
     """
 
     def __init__(
@@ -141,16 +137,16 @@ class DictionaryModule(nn.Module):
         t_size: int,
         s_size: int,
         grid: int = 4,
-        match: str = "hard",
+        match: str = "soft",
         temperature: float = 0.07,
-        match_profile: str = "proposal",
     ):
         super().__init__()
-        # Proposal: Conv + BN, then average-pool (no stride-conv downsample).
+        # Teacher key path: Conv+BN then pool to ~1/16 spatial size (proposal early-feature encoder).
         self.key_enc = nn.Sequential(
             nn.Conv2d(c_t, c_t, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(c_t),
         )
+        # Student query path: same encoder family without downsampling conv stride.
         self.query_enc = nn.Sequential(
             nn.Conv2d(c_s, c_s, kernel_size=3, stride=1, padding=1, bias=False),
             nn.BatchNorm2d(c_s),
@@ -159,144 +155,44 @@ class DictionaryModule(nn.Module):
         self.proj = DeconvNet(c_s, c_s, s_size, t_size)
         self.match = str(match).lower()
         self.temperature = float(temperature)
-        profile_aliases = {
-            "historical": "legacy",
-            "performance": "legacy",
-            "current": "proposal",
-            "strict": "proposal",
-        }
-        self.match_profile = profile_aliases.get(str(match_profile).lower(), str(match_profile).lower())
-        if self.match_profile not in {"legacy", "proposal"}:
-            raise ValueError(f"Unknown dictionary match_profile={match_profile!r}; expected legacy or proposal")
-        self._freeze_encoder_bn = False
-        self.last_match_stats: dict[str, torch.Tensor] | None = None
-        if self.match == "hard" and self.match_profile == "proposal":
-            # Hard argmax has no derivative with respect to Q/K, so randomly initialized
-            # encoders would remain random forever. Start from an identity channel transform;
-            # BatchNorm still calibrates the two feature distributions as stated in Fig. 2.
-            self._init_identity_encoders()
 
-    def _init_identity_encoders(self) -> None:
-        """Initialize proposal Conv+BN encoders as channel-wise identity transforms."""
-        for encoder in (self.key_enc, self.query_enc):
-            conv, bn = encoder
-            with torch.no_grad():
-                conv.weight.zero_()
-                channels = min(conv.in_channels, conv.out_channels)
-                idx = torch.arange(channels, device=conv.weight.device)
-                conv.weight[idx, idx, 1, 1] = 1.0
-                bn.weight.fill_(1.0)
-                bn.bias.zero_()
-                bn.running_mean.zero_()
-                bn.running_var.fill_(1.0)
-
-    def freeze_encoders(self, freeze_bn: bool = True) -> None:
-        """Freeze hard-match encoder parameters with selectable BN behavior.
-
-        Historical N runs kept frozen random Conv+BN encoders in train mode so
-        matching used current-batch BN statistics. Proposal mode freezes BN as
-        well for a stable identity transform.
-        """
+    def freeze_encoders(self) -> None:
+        """Freeze key/query encoders (use after init when ``match=hard``)."""
         for p in self.key_enc.parameters():
             p.requires_grad = False
         for p in self.query_enc.parameters():
             p.requires_grad = False
-        self._freeze_encoder_bn = bool(freeze_bn)
-        if self._freeze_encoder_bn:
-            self.key_enc.eval()
-            self.query_enc.eval()
-        else:
-            self.key_enc.train(self.training)
-            self.query_enc.train(self.training)
+        self.key_enc.eval()
+        self.query_enc.eval()
 
-    def unfreeze_encoders(self) -> None:
-        """Enable Q/K encoder training for differentiable matching objectives."""
-        self._freeze_encoder_bn = False
-        for p in self.key_enc.parameters():
-            p.requires_grad = True
-        for p in self.query_enc.parameters():
-            p.requires_grad = True
-        self.key_enc.train(self.training)
-        self.query_enc.train(self.training)
-
-    def train(self, mode: bool = True):
-        """Keep frozen encoder BN layers in eval mode when the parent trains."""
-        super().train(mode)
-        if self._freeze_encoder_bn and not any(p.requires_grad for p in self.key_enc.parameters()):
-            self.key_enc.eval()
-        if self._freeze_encoder_bn and not any(p.requires_grad for p in self.query_enc.parameters()):
-            self.query_enc.eval()
-        return self
-
-    @staticmethod
-    def attention_restriction_loss(logits: torch.Tensor) -> torch.Tensor:
-        """Return the mentor-specified negative attention entropy.
-
-        ``logits`` has shape ``(B, n1, n2)``. Rows are normalized over
-        ``dim=2`` and the entropy terms are summed over ``dim=1`` exactly as
-        specified. Minimizing this negative entropy encourages less-peaked
-        channel correspondence.
-        """
-        attention = F.softmax(logits.float(), dim=2)
-        return -torch.mean(torch.sum(-attention * torch.log(attention + 1e-10), dim=1))
-
-    def forward(
-        self,
-        t_feat: torch.Tensor,
-        s_feat: torch.Tensor,
-        compute_attention_loss: bool = False,
-        collect_match_diagnostics: bool = False,
-    ):
-        """Return (s_proj, t_reorg, commit_loss, attention_restriction_loss).
+    def forward(self, t_feat: torch.Tensor, s_feat: torch.Tensor):
+        """Return (s_proj, t_reorg, commit_loss).
 
         ``t_reorg`` is the dictionary-reorganized teacher feature (B, Cs, Ht, Wt).
-        ``commit_loss`` is 0 for hard matching (proposal); soft match only otherwise.
-        ``attention_restriction_loss`` is 0 when its configured gain is inactive.
+        ``commit_loss`` pulls query tokens toward their soft-matched keys so encoders
+        learn under stopgrad(teacher) distillation (0 for hard matching).
         """
         _, _, h, w = t_feat.shape
-        # Proposal: M = Q K^T without token L2-normalization.
         k = self.pool(self.key_enc(t_feat)).flatten(2)  # (B, Ct, d)
         q = self.pool(self.query_enc(s_feat)).flatten(2)  # (B, Cs, d)
-        if self.match_profile == "legacy":
-            # Historical N/F runs used cosine-like pooled channel tokens. Key
-            # normalization is especially important because raw-dot argmax
-            # otherwise favors high-norm teacher channels.
-            k = F.normalize(k, dim=2)
-            q = F.normalize(q, dim=2)
+        # Normalize tokens so correlation is cosine-like (stable soft matching).
+        k = F.normalize(k, dim=2)
+        q = F.normalize(q, dim=2)
         m = q @ k.transpose(1, 2)  # (B, Cs, Ct)
         commit = t_feat.new_zeros(())
-        attention_loss = self.attention_restriction_loss(m) if compute_attention_loss else t_feat.new_zeros(())
 
         if self.match == "hard":
-            # Proposal: index = torch.max(M, dim=1)[1]  (argmax over teacher channels).
             index = m.argmax(dim=2)  # (B, Cs)
             t_reorg = torch.gather(t_feat, 1, index[:, :, None, None].expand(-1, -1, h, w))
         else:
+            # Soft cross-attention gather: each student channel is a mixture of teacher channels.
             w_soft = F.softmax(m / max(self.temperature, 1e-6), dim=2)  # (B, Cs, Ct)
             t_reorg = torch.einsum("bsc,bchw->bshw", w_soft, t_feat)
-            k_n = F.normalize(k, dim=2)
-            q_n = F.normalize(q, dim=2)
-            k_hat = torch.einsum("bsc,bcd->bsd", w_soft.detach(), k_n.detach())
-            commit = (1.0 - F.cosine_similarity(q_n, k_hat, dim=2)).mean()
-
-        if collect_match_diagnostics:
-            with torch.no_grad():
-                index = m.argmax(dim=2)
-                counts = F.one_hot(index, num_classes=m.shape[2]).sum(dim=1).float()
-                if m.shape[2] > 1:
-                    top2 = m.topk(2, dim=2).values
-                    margin = (top2[:, :, 0] - top2[:, :, 1]).mean()
-                else:
-                    margin = m.new_zeros(())
-                self.last_match_stats = {
-                    "used_teacher_ratio": (counts > 0).float().mean(dim=1).mean().detach(),
-                    "max_teacher_share": (counts.max(dim=1).values / index.shape[1]).mean().detach(),
-                    "match_margin": margin.detach(),
-                }
-        else:
-            self.last_match_stats = None
+            # Commitment: queries should agree with the teacher keys they attend to.
+            k_hat = torch.einsum("bsc,bcd->bsd", w_soft.detach(), k.detach())
+            commit = (1.0 - F.cosine_similarity(q, k_hat, dim=2)).mean()
 
         s_proj = self.proj(s_feat)
-        if s_proj.shape[-2:] != t_feat.shape[-2:]:
+        if s_proj.shape[-2:] != t_feat.shape[-2:]:  # multi-scale / rect batches
             s_proj = F.interpolate(s_proj, size=t_feat.shape[-2:], mode="bilinear", align_corners=False)
-        return s_proj, t_reorg, commit, attention_loss
+        return s_proj, t_reorg, commit

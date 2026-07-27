@@ -3,11 +3,9 @@
 Baselines (kept lean):
   yolo26n       - YOLO26n FPN upper bound
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
-  early         - CrisReport early dictionary (n10↔x6, proposal saliency + attention restriction)
-  early-dldx    - same recipe but dict_weight=saliency_dLdx (ablation)
+  early         - CrisReport early dictionary (n10↔x6, attention weight)
+  early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
   early-tune1/2 - editable copies for hyperparameter sweeps
-  spatial-repro - exact historical .10/.30 dLdx + spatial-AT recipe
-  spatial-warmup / spatial-warmup-m95 - improved spatial-AT candidates
 
 Hyperparameters below match the previous script bit-for-bit for these recipes
 (pretrained / batch / teacher_weights / KD gains). Sweep entries (early-B..T3,
@@ -62,7 +60,7 @@ COMMON: dict[str, Any] = {
 DEFAULT_BATCH = 112  # solo / KD when VRAM allows (matches n_kd_n_batch112)
 DEFAULT_KD_BATCH = 112  # proven KD recipe; drop with --batch if saliency OOM
 
-# Shared online KD — CrisReport Fig.2 early dictionary distillation (late disabled).
+# Shared online KD — aligned to Log/n_kd_n_batch112 (best mAP50≈0.728).
 _KD_COMMON: dict[str, Any] = {
     "online_distill": True,
     "teacher_freeze_epoch": 200,
@@ -71,7 +69,6 @@ _KD_COMMON: dict[str, Any] = {
     "teacher_task_loss": 1.0,
     "feature_norm": "channel",
     "feature_loss": 0.08,
-    # Supplementary proposal: enable FPN→YOLOF prediction alignment after 20 epochs.
     "align": True,
     "align_start_epoch": 20,
     "align_loss": 0.12,
@@ -84,19 +81,12 @@ _KD_COMMON: dict[str, Any] = {
     "distill_iou_thres": 0.5,
     "dict_student_layer": 10,
     "dict_start_epoch": 0,
-    "dict_weight": "saliency",
+    "dict_weight": "attention",
     "dict_match": "hard",
-    # Performance profile reproduces the historical N/F channel matcher.
-    "dict_match_profile": "legacy",
     "dict_match_temp": 0.07,
-    # Stabilize teacher/student feature scale; saliency still exclusively controls space.
     "dict_feature_norm": "channel",
     "dict_saliency_ema": 0.9,
-    # Historical spatial-energy AT. Entropy remains available via dict_attn_mode="entropy".
-    "dict_attn_mode": "spatial",
     "dict_attn_start_epoch": 0,
-    "dict_attn_warmup_epochs": 0,
-    "dict_grad_log_interval": 0,
     "dict_commit_loss": 0.0,
     "pretrained": "yolo26n.pt",
     "teacher_weights": "yolo26n.pt",
@@ -104,7 +94,7 @@ _KD_COMMON: dict[str, Any] = {
 
 
 def _kd_early(**overrides: Any) -> dict[str, Any]:
-    """KD early recipe: student n10 ↔ teacher x6 only (late disabled)."""
+    """KD early recipe: student n10 ↔ teacher x6. Overrides must not silently drop shared keys."""
     cfg: dict[str, Any] = {
         "trainer": "kd",
         "model": "yolo26n-DCN.yaml",
@@ -136,71 +126,37 @@ BASELINES: dict[str, dict[str, Any]] = {
         "pretrained": "yolo26n.pt",
         "description": "YOLO26n-DCN (YOLOF head) without distillation",
     },
+    # Former kd-early / early-3 attention recipe (hyperparams unchanged).
     "early": _kd_early(
-        name="baseline-kd-proposal",
-        description="CrisReport early dict: n10↔x6, Eq.5 weighted align + restored spatial-energy AT",
+        name="baseline-kd-early",
+        description="CrisReport early dictionary: n10↔x6, hard match, attention weight, pretrained student",
     ),
+    # Former early-S1a (hyperparams unchanged).
     "early-dldx": _kd_early(
         name="baseline-early-S1a-dLdx",
-        description="early recipe but dict_weight=saliency_dLdx (mean|g| ablation)",
+        description="early + saliency_dLdx (mean_c|∂J_task/∂x^e|); blur/clip off",
         dict_weight="saliency_dLdx",
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
+    # --- Sweep slots: start from known recipes; edit align / attn / weight as needed ---
+    # Former early-S1a clone (0.08 / 0.25 / dLdx).
     "early-tune1": _kd_early(
         name="baseline-early-tune1",
-        description="TUNABLE: align=0.08, spatial AT=0.25, proposal saliency",
-        dict_weight="saliency",
+        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as early-dldx)",
+        dict_weight="saliency_dLdx",
         dict_align_loss=0.08,
         dict_attn_loss=0.25,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
+    # Former early-SA3 (0.10 / 0.25 / dLdx) — historical best gate λ pair.
     "early-tune2": _kd_early(
         name="baseline-early-tune2",
-        description="TUNABLE: align=0.10, spatial AT=0.25, proposal saliency",
-        dict_weight="saliency",
+        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as align=0.10, attn=0.25, dLdx)",
+        dict_weight="saliency_dLdx",
         dict_align_loss=0.10,
         dict_attn_loss=0.25,
-        dict_saliency_blur=0.0,
-        dict_saliency_clip=0.0,
-    ),
-    "spatial-repro": _kd_early(
-        name="baseline-spatial-repro-a010-at030",
-        description="Exact N-style recipe: dLdx, align=0.10, spatial AT=0.30, no warmup",
-        dict_weight="saliency_dLdx",
-        dict_align_loss=0.10,
-        dict_attn_loss=0.30,
-        dict_attn_mode="spatial",
-        dict_match_profile="legacy",
-        dict_attn_warmup_epochs=0,
-        dict_grad_log_interval=0,
-        dict_saliency_blur=0.0,
-        dict_saliency_clip=0.0,
-    ),
-    "spatial-warmup": _kd_early(
-        name="baseline-spatial-warmup-a010-at030",
-        description="Improved spatial AT: dLdx, align=0.10, AT=0.30 with 10-epoch warmup",
-        dict_weight="saliency_dLdx",
-        dict_align_loss=0.10,
-        dict_attn_loss=0.30,
-        dict_attn_mode="spatial",
-        dict_match_profile="legacy",
-        dict_attn_warmup_epochs=10,
-        dict_grad_log_interval=100,
-        dict_saliency_blur=0.0,
-        dict_saliency_clip=0.0,
-    ),
-    "spatial-warmup-m95": _kd_early(
-        name="baseline-spatial-warmup-a012-at030",
-        description="Improved strict-IoU candidate: dLdx, align=0.12, spatial AT=0.30 with warmup",
-        dict_weight="saliency_dLdx",
-        dict_align_loss=0.12,
-        dict_attn_loss=0.30,
-        dict_attn_mode="spatial",
-        dict_match_profile="legacy",
-        dict_attn_warmup_epochs=10,
-        dict_grad_log_interval=100,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
