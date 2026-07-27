@@ -808,6 +808,20 @@ class YOLOFDistillationModel(DetectionModel):
             pass
         return weight * m.to(device=weight.device, dtype=weight.dtype)
 
+    @staticmethod
+    def _minmax_normalize_weight(weight: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        """Min-max normalize each image/channel over space, with a safe constant-map fallback.
+
+        A constant weight map has no spatial ranking to preserve. Returning ones in that
+        degenerate case keeps dictionary alignment equivalent to uniform MSE instead of
+        silently removing its gradient.
+        """
+        w_min = weight.amin(dim=(2, 3), keepdim=True)
+        w_max = weight.amax(dim=(2, 3), keepdim=True)
+        span = w_max - w_min
+        normalized = (weight - w_min) / span.clamp_min(eps)
+        return torch.where(span > eps, normalized, torch.ones_like(normalized))
+
     def _letterbox_mask_enabled(self) -> bool:
         """Default on: zero saliency/attention weights on YOLO letterbox gray pads."""
         raw = getattr(self.args, "dict_letterbox_mask", True)
@@ -963,7 +977,10 @@ class YOLOFDistillationModel(DetectionModel):
                     weight = F.interpolate(weight, size=pred.shape[-2:], mode="bilinear", align_corners=False)
                 # Zero letterbox gray pads (also covers attention-A weights).
                 weight = self._apply_content_mask(weight, getattr(self, "_content_mask", None))
-                weight = (weight / weight.mean(dim=(2, 3), keepdim=True).clamp_min(1e-12)).to(pred.dtype).detach()
+                weight = self._minmax_normalize_weight(weight).to(pred.dtype).detach()
+                # The constant-map fallback is uniform; reapply the mask so padding
+                # remains excluded even when the incoming map is identically zero.
+                weight = self._apply_content_mask(weight, getattr(self, "_content_mask", None))
                 d_align = d_align + (weight * (pred - target) ** 2).mean()
             else:
                 d_align = d_align + F.mse_loss(pred, target)
