@@ -139,6 +139,9 @@ class DictionaryModule(nn.Module):
         grid: int = 4,
         match: str = "soft",
         temperature: float = 0.07,
+        match_norm: str = "l2",
+        match_init: str = "default",
+        infomax_marginal_weight: float = 1.0,
     ):
         super().__init__()
         # Teacher key path: Conv+BN then pool to ~1/16 spatial size (proposal early-feature encoder).
@@ -153,8 +156,36 @@ class DictionaryModule(nn.Module):
         )
         self.pool = nn.AdaptiveAvgPool2d(grid)
         self.proj = DeconvNet(c_s, c_s, s_size, t_size)
-        self.match = str(match).lower()
+        match_aliases = {"st": "straight_through", "ste": "straight_through", "hard_st": "straight_through"}
+        self.match = match_aliases.get(str(match).lower(), str(match).lower())
+        if self.match not in {"hard", "soft", "straight_through"}:
+            raise ValueError(f"Unknown dictionary match={match!r}; expected hard, soft, or straight_through")
         self.temperature = float(temperature)
+        self.match_norm = str(match_norm).lower()
+        if self.match_norm not in {"l2", "none"}:
+            raise ValueError(f"Unknown dictionary match_norm={match_norm!r}; expected l2 or none")
+        self.match_init = str(match_init).lower()
+        self.infomax_marginal_weight = float(infomax_marginal_weight)
+        self.last_match_stats = None
+        self._previous_dominant_assignment = None
+        if self.match_init == "identity":
+            self._init_identity_encoders()
+        elif self.match_init not in {"default", "random", "kaiming"}:
+            raise ValueError(f"Unknown dictionary match_init={match_init!r}; expected default or identity")
+
+    def _init_identity_encoders(self) -> None:
+        """Start Q/K projections as channel-wise identities to avoid arbitrary initial permutations."""
+        for encoder in (self.key_enc, self.query_enc):
+            conv, bn = encoder
+            with torch.no_grad():
+                conv.weight.zero_()
+                channels = min(conv.in_channels, conv.out_channels)
+                idx = torch.arange(channels, device=conv.weight.device)
+                conv.weight[idx, idx, 1, 1] = 1.0
+                bn.weight.fill_(1.0)
+                bn.bias.zero_()
+                bn.running_mean.zero_()
+                bn.running_var.fill_(1.0)
 
     def freeze_encoders(self) -> None:
         """Freeze key/query encoders (use after init when ``match=hard``)."""
@@ -165,34 +196,103 @@ class DictionaryModule(nn.Module):
         self.key_enc.eval()
         self.query_enc.eval()
 
-    def forward(self, t_feat: torch.Tensor, s_feat: torch.Tensor):
-        """Return (s_proj, t_reorg, commit_loss).
+    @property
+    def differentiable_assignment(self) -> bool:
+        """Whether weighted align can update Q/K and the student query path."""
+        return self.match in {"soft", "straight_through"}
+
+    @staticmethod
+    def infomax_loss(assignment: torch.Tensor, marginal_weight: float = 1.0):
+        """Return H(T|S)-lambda*H(T), conditional entropy, and marginal entropy."""
+        eps = torch.finfo(assignment.dtype).eps
+        conditional_entropy = -(assignment * assignment.clamp_min(eps).log()).sum(dim=2).mean()
+        teacher_marginal = assignment.mean(dim=1)  # (B, Ct), 1/Cs sum_s A_st
+        marginal_entropy = -(
+            teacher_marginal * teacher_marginal.clamp_min(eps).log()
+        ).sum(dim=1).mean()
+        return (
+            conditional_entropy - float(marginal_weight) * marginal_entropy,
+            conditional_entropy,
+            marginal_entropy,
+        )
+
+    def forward(self, t_feat: torch.Tensor, s_feat: torch.Tensor, collect_diagnostics: bool = False):
+        """Return (s_proj, t_reorg, commit_loss, infomax_loss).
 
         ``t_reorg`` is the dictionary-reorganized teacher feature (B, Cs, Ht, Wt).
         ``commit_loss`` pulls query tokens toward their soft-matched keys so encoders
         learn under stopgrad(teacher) distillation (0 for hard matching).
+        ``infomax_loss`` is H(T|S)-lambda*H(T), computed from the soft assignment.
+
+        Straight-through matching has an exactly hard forward assignment while its
+        backward pass follows the soft assignment, so weighted align also trains Q/K.
         """
         _, _, h, w = t_feat.shape
         k = self.pool(self.key_enc(t_feat)).flatten(2)  # (B, Ct, d)
         q = self.pool(self.query_enc(s_feat)).flatten(2)  # (B, Cs, d)
-        # Normalize tokens so correlation is cosine-like (stable soft matching).
-        k = F.normalize(k, dim=2)
-        q = F.normalize(q, dim=2)
+        if self.match_norm == "l2":
+            k = F.normalize(k, dim=2)
+            q = F.normalize(q, dim=2)
         m = q @ k.transpose(1, 2)  # (B, Cs, Ct)
         commit = t_feat.new_zeros(())
+        infomax = t_feat.new_zeros(())
+        assignment_soft = F.softmax(m.float() / max(self.temperature, 1e-6), dim=2)
+        assignment_index = assignment_soft.argmax(dim=2)
 
         if self.match == "hard":
-            index = m.argmax(dim=2)  # (B, Cs)
-            t_reorg = torch.gather(t_feat, 1, index[:, :, None, None].expand(-1, -1, h, w))
+            t_reorg = torch.gather(
+                t_feat, 1, assignment_index[:, :, None, None].expand(-1, -1, h, w)
+            )
         else:
-            # Soft cross-attention gather: each student channel is a mixture of teacher channels.
-            w_soft = F.softmax(m / max(self.temperature, 1e-6), dim=2)  # (B, Cs, Ct)
-            t_reorg = torch.einsum("bsc,bchw->bshw", w_soft, t_feat)
+            assignment = assignment_soft
+            if self.match == "straight_through":
+                assignment_hard = F.one_hot(assignment_index, num_classes=m.shape[2]).to(assignment.dtype)
+                assignment = assignment_hard + assignment - assignment.detach()
+            t_reorg = torch.einsum("bsc,bchw->bshw", assignment.to(t_feat.dtype), t_feat)
             # Commitment: queries should agree with the teacher keys they attend to.
-            k_hat = torch.einsum("bsc,bcd->bsd", w_soft.detach(), k.detach())
-            commit = (1.0 - F.cosine_similarity(q, k_hat, dim=2)).mean()
+            k_n = F.normalize(k, dim=2)
+            q_n = F.normalize(q, dim=2)
+            k_hat = torch.einsum("bsc,bcd->bsd", assignment_soft.detach(), k_n.detach())
+            commit = (1.0 - F.cosine_similarity(q_n, k_hat, dim=2)).mean()
+
+            infomax, conditional_entropy, marginal_entropy = self.infomax_loss(
+                assignment_soft, self.infomax_marginal_weight
+            )
+
+        if collect_diagnostics:
+            with torch.no_grad():
+                counts = F.one_hot(assignment_index, num_classes=m.shape[2]).sum(dim=(0, 1)).float()
+                top2 = assignment_soft.topk(min(2, assignment_soft.shape[2]), dim=2).values
+                margin = (
+                    (top2[:, :, 0] - top2[:, :, 1]).mean()
+                    if top2.shape[2] > 1
+                    else assignment_soft.new_zeros(())
+                )
+                dominant = assignment_index.mode(dim=0).values
+                churn = assignment_soft.new_zeros(())
+                if (
+                    self._previous_dominant_assignment is not None
+                    and self._previous_dominant_assignment.shape == dominant.shape
+                ):
+                    churn = (dominant != self._previous_dominant_assignment.to(dominant.device)).float().mean()
+                self._previous_dominant_assignment = dominant.detach().cpu()
+                _, conditional_entropy, marginal_entropy = self.infomax_loss(
+                    assignment_soft, self.infomax_marginal_weight
+                )
+                self.last_match_stats = {
+                    "used_teacher_ratio": (counts > 0).float().mean().detach(),
+                    "max_teacher_share": (counts.max() / counts.sum().clamp_min(1.0)).detach(),
+                    "match_margin": margin.detach(),
+                    "assignment_churn": churn.detach(),
+                    "conditional_entropy": conditional_entropy.detach(),
+                    "marginal_entropy": marginal_entropy.detach(),
+                    "effective_teacher_channels": marginal_entropy.exp().detach(),
+                    "infomax_loss": infomax.detach(),
+                }
+        else:
+            self.last_match_stats = None
 
         s_proj = self.proj(s_feat)
         if s_proj.shape[-2:] != t_feat.shape[-2:]:  # multi-scale / rect batches
             s_proj = F.interpolate(s_proj, size=t_feat.shape[-2:], mode="bilinear", align_corners=False)
-        return s_proj, t_reorg, commit
+        return s_proj, t_reorg, commit, infomax

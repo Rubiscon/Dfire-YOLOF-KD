@@ -80,16 +80,31 @@ python scripts/train_baselines.py --baseline yolo26n
 python scripts/train_baselines.py --baseline dcn-solo
 
 # 3. Early-stage KD (dictionary n10↔x6 + neck + response)
-python scripts/train_baselines.py --baseline kd-early
+python scripts/train_baselines.py --baseline early-dldx
 
-# 4. Full KD stack (same early dict + neck + response)
-python scripts/train_baselines.py --baseline kd-p0
+# 4. Straight-through InfoMax matching experiment
+python scripts/train_baselines.py --baseline infomax
 
 # Run all three in sequence
 python scripts/train_baselines.py --baseline all
 ```
 
 Outputs: `runs/detect/dfire-baselines/<run-name>/`.
+
+### InfoMax matching branch
+
+The `infomax` baseline keeps the stable N losses (dLdx saliency and spatial-energy
+attention) and changes only dictionary assignment:
+
+- `A_soft = softmax(M / tau)` with L2-normalized Q/K tokens.
+- Forward assignment is hard argmax; backward uses `A_soft` (straight-through).
+- `L_InfoMax = H(T|S) - lambda H(T)` encourages confident student-channel matches
+  without collapsing all queries onto a few teacher channels.
+- Weighted align keeps the assignment graph, grounding Q/K in teacher-feature
+  reconstruction rather than allowing a semantically arbitrary balanced permutation.
+
+`dict_match_stats.csv` records occupancy, maximum teacher share, margin, dominant
+assignment churn, conditional/marginal entropy, effective teacher channels, and InfoMax loss.
 
 ### Test-split evaluation
 
@@ -227,16 +242,28 @@ python scripts/train_baselines.py --baseline yolo26n
 python scripts/train_baselines.py --baseline dcn-solo
 
 # 3. Early-stage KD（dictionary n10↔x6 + neck + response）
-python scripts/train_baselines.py --baseline kd-early
+python scripts/train_baselines.py --baseline early-dldx
 
-# 4. 完整 KD（与 kd-early 相同 early dict + neck + response）
-python scripts/train_baselines.py --baseline kd-p0
+# 4. Straight-through InfoMax matching 实验
+python scripts/train_baselines.py --baseline infomax
 
 # 依次运行全部
 python scripts/train_baselines.py --baseline all
 ```
 
 输出目录：`runs/detect/dfire-baselines/<run-name>/`。
+
+### InfoMax matching 分支
+
+`infomax` 保留稳定 N 的 dLdx saliency 与旧 spatial-energy AT，仅替换 dictionary assignment：
+
+- 对 L2 归一化后的 Q/K 使用 `A_soft=softmax(M/tau)`；
+- 前向保持 proposal 的 hard argmax，反向通过 `A_soft`（straight-through）；
+- 最小化 `H(T|S)-lambda H(T)`，兼顾明确匹配与教师通道均衡使用；
+- weighted align 不 detach assignment，使 Q/K 同时受到语义重建约束，避免只学到任意的均衡排列。
+
+训练时 `dict_match_stats.csv` 记录 occupancy、最大通道占比、margin、assignment churn、
+条件熵、边际熵、有效教师通道数及 InfoMax loss。
 
 ### 测试集评测
 

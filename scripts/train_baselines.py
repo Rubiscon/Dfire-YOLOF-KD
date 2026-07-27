@@ -5,6 +5,7 @@ Baselines (kept lean):
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
   early         - CrisReport early dictionary (n10↔x6, attention weight)
   early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
+  infomax       - dLdx/old-AT base + straight-through InfoMax channel matching
   early-tune1/2 - editable copies for hyperparameter sweeps
 
 Hyperparameters below match the previous script bit-for-bit for these recipes
@@ -16,6 +17,7 @@ Usage:
   python scripts/train_baselines.py --baseline dcn-solo
   python scripts/train_baselines.py --baseline early
   python scripts/train_baselines.py --baseline early-dldx
+  python scripts/train_baselines.py --baseline infomax
   python scripts/train_baselines.py --baseline early-tune1,early-tune2
   python scripts/train_baselines.py --baseline all
   python scripts/train_baselines.py --baseline early --test-only
@@ -136,6 +138,25 @@ BASELINES: dict[str, dict[str, Any]] = {
         name="baseline-early-S1a-dLdx",
         description="early + saliency_dLdx (mean_c|∂J_task/∂x^e|); blur/clip off",
         dict_weight="saliency_dLdx",
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+    "infomax": _kd_early(
+        name="baseline-early-infomax-st",
+        description=(
+            "N dLdx + spatial AT with proposal-style Q/K, straight-through hard assignment, "
+            "and H(T|S)-H(T) regularization"
+        ),
+        dict_weight="saliency_dLdx",
+        dict_match="straight_through",
+        dict_match_temp=0.10,
+        dict_match_norm="l2",
+        dict_match_init="identity",
+        dict_match_grid_divisor=4,
+        dict_infomax_loss=0.01,
+        dict_infomax_marginal_weight=1.0,
+        dict_match_log_interval=100,
+        dict_commit_loss=0.0,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
