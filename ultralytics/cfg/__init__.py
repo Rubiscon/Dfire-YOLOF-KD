@@ -562,6 +562,7 @@ def check_dict_alignment(
             "dict_entropy_temp",
             "dict_entropy_grid_divisor",
             "dict_entropy_floor",
+            "dict_weight_norm",
             "dict_letterbox_mask",
             "teacher_val_interval",
         }

@@ -7,6 +7,7 @@ Baselines (kept lean):
   early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
   infomax       - dLdx/old-AT base + straight-through InfoMax channel matching
   entropy-align - hard dictionary + positive spatial-entropy weighted align
+  entropy-align-minmax / entropy-inverse / dldx-entropy-gate - opt-in entropy candidates
   early-tune1/2 - editable copies for hyperparameter sweeps
 
 Hyperparameters below match the previous script bit-for-bit for these recipes
@@ -173,6 +174,42 @@ BASELINES: dict[str, dict[str, Any]] = {
         dict_entropy_temp=0.10,
         dict_entropy_grid_divisor=4,
         dict_entropy_floor=0.10,
+        dict_weight_norm="mean",
+        dict_match_log_interval=100,
+    ),
+    "entropy-align-minmax": _kd_early(
+        name="candidate-early-entropy-align-minmax",
+        description="OPT-IN: positive spatial entropy with content-aware MinMax weight normalization",
+        dict_weight="entropy",
+        dict_weight_norm="minmax",
+        dict_match="hard",
+        dict_entropy_temp=0.10,
+        dict_entropy_grid_divisor=4,
+        dict_entropy_floor=0.10,
+        dict_match_log_interval=100,
+    ),
+    "entropy-inverse": _kd_early(
+        name="candidate-early-entropy-inverse",
+        description="OPT-IN: emphasize low-entropy/high-confidence spatial matches",
+        dict_weight="entropy_inverse",
+        dict_weight_norm="mean",
+        dict_match="hard",
+        dict_entropy_temp=0.10,
+        dict_entropy_grid_divisor=4,
+        dict_entropy_floor=0.10,
+        dict_match_log_interval=100,
+    ),
+    "dldx-entropy-gate": _kd_early(
+        name="candidate-early-dldx-entropy-gate",
+        description="OPT-IN: dLdx task saliency as primary weight, modulated by positive spatial entropy",
+        dict_weight="dldx_entropy_gate",
+        dict_weight_norm="mean",
+        dict_match="hard",
+        dict_entropy_temp=0.10,
+        dict_entropy_grid_divisor=4,
+        dict_entropy_floor=0.10,
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
         dict_match_log_interval=100,
     ),
     # --- Sweep slots: start from known recipes; edit align / attn / weight as needed ---

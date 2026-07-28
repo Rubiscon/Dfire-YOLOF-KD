@@ -89,10 +89,10 @@ def test_match_diagnostics_cover_collapse_and_stability_signals():
         "max_teacher_share",
         "match_margin",
         "assignment_churn",
-        "conditional_entropy",
-        "marginal_entropy",
-        "effective_teacher_channels",
-        "infomax_loss",
+        "channel_conditional_entropy",
+        "channel_marginal_entropy",
+        "channel_effective_teacher_channels",
+        "channel_infomax_loss",
     }
     assert set(first) == expected
     assert all(torch.isfinite(value) for value in second.values())
@@ -112,10 +112,10 @@ def test_match_diagnostics_csv_writer():
         "max_teacher_share": 0.1,
         "match_margin": 0.04,
         "assignment_churn": 0.2,
-        "conditional_entropy": 1.5,
-        "marginal_entropy": 4.0,
-        "effective_teacher_channels": 54.6,
-        "infomax_loss": -2.5,
+        "channel_conditional_entropy": 1.5,
+        "channel_marginal_entropy": 4.0,
+        "channel_effective_teacher_channels": 54.6,
+        "channel_infomax_loss": -2.5,
     }
     with TemporaryDirectory() as tmp:
         writer.save_dir = Path(tmp)
@@ -124,7 +124,7 @@ def test_match_diagnostics_csv_writer():
         writer._append_dict_match_diagnostics_callback(trainer)
         lines = (Path(tmp) / "dict_match_stats.csv").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 2
-    assert lines[0].endswith("effective_teacher_channels,infomax_loss")
+    assert lines[0].endswith("channel_effective_teacher_channels,channel_infomax_loss")
     assert lines[1].startswith("100,2,")
 
 

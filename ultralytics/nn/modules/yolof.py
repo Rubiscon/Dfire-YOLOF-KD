@@ -223,7 +223,9 @@ class DictionaryModule(nn.Module):
         grid_size: tuple[int, int],
         temperature: float = 0.1,
         floor: float = 0.1,
-    ) -> torch.Tensor:
+        inverse: bool = False,
+        return_entropy: bool = False,
+    ):
         """Build a positive spatial weight from cross-feature attention entropy.
 
         The independently projected student and teacher features are pooled into
@@ -236,7 +238,9 @@ class DictionaryModule(nn.Module):
         matrix. This is the positive-entropy correction of the mentor's
         double-negative expression. Dividing by ``log(Nv)`` keeps the map in
         [0, 1] across grid sizes; ``floor`` prevents confident rows from turning
-        off align supervision entirely.
+        off align supervision entirely. ``inverse=True`` is an opt-in confidence
+        weighting ablation. The returned map (and optional normalized row-entropy
+        map) is always detached so align cannot optimize its own spatial weights.
         """
         if query_feat.ndim != 4 or value_feat.ndim != 4:
             raise ValueError("Entropy weighting expects BCHW query/value features")
@@ -262,8 +266,11 @@ class DictionaryModule(nn.Module):
         else:
             entropy = torch.ones_like(entropy)
         entropy = entropy.clamp(0.0, 1.0)
-        weight = floor + (1.0 - floor) * entropy
-        return weight.reshape(query_feat.shape[0], 1, gh, gw)
+        weight_signal = 1.0 - entropy if inverse else entropy
+        weight = floor + (1.0 - floor) * weight_signal
+        weight = weight.reshape(query_feat.shape[0], 1, gh, gw).detach()
+        entropy = entropy.reshape(query_feat.shape[0], 1, gh, gw).detach()
+        return (weight, entropy) if return_entropy else weight
 
     def forward(self, t_feat: torch.Tensor, s_feat: torch.Tensor, collect_diagnostics: bool = False):
         """Return (s_proj, t_reorg, commit_loss, infomax_loss).
@@ -334,10 +341,10 @@ class DictionaryModule(nn.Module):
                     "max_teacher_share": (counts.max() / counts.sum().clamp_min(1.0)).detach(),
                     "match_margin": margin.detach(),
                     "assignment_churn": churn.detach(),
-                    "conditional_entropy": conditional_entropy.detach(),
-                    "marginal_entropy": marginal_entropy.detach(),
-                    "effective_teacher_channels": marginal_entropy.exp().detach(),
-                    "infomax_loss": infomax.detach(),
+                    "channel_conditional_entropy": conditional_entropy.detach(),
+                    "channel_marginal_entropy": marginal_entropy.detach(),
+                    "channel_effective_teacher_channels": marginal_entropy.exp().detach(),
+                    "channel_infomax_loss": infomax.detach(),
                 }
         else:
             self.last_match_stats = None

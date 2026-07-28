@@ -106,8 +106,10 @@ attention) and changes only dictionary assignment:
 - Weighted align and AT use a detached reorganized-teacher target. Q/K are trained
   only by commitment and InfoMax, so assignment cannot reduce align by moving its target.
 
-`dict_match_stats.csv` records occupancy, maximum teacher share, margin, dominant
-assignment churn, conditional/marginal entropy, effective teacher channels, and InfoMax loss.
+`dict_match_stats.csv` is channel-assignment diagnostics only. Its entropy columns are
+explicitly named `channel_conditional_entropy` and `channel_marginal_entropy` (plus
+`channel_effective_teacher_channels` and `channel_infomax_loss`) so they cannot be
+confused with the spatial row entropy used by align.
 
 ### Positive spatial-entropy align
 
@@ -123,8 +125,18 @@ AT loss, replacing the align spatial weight with positive cross-feature entropy:
 - The entropy map is detached before weighting, so align optimizes the student projection
   rather than learning to hide high-error positions.
 
-Relevant options are `dict_entropy_temp`, `dict_entropy_grid_divisor`, and
-`dict_entropy_floor`. Existing recipes are unchanged unless `dict_weight=entropy`.
+`dict_weight_stats.csv` independently records the actual normalized spatial row entropy
+(mean/std/min/max), floor-hit ratio, the final align weight statistics, entropy grid, and
+the entropy's per-pixel correlation with the align residual. It is emitted at
+`dict_match_log_interval` for entropy-based modes.
+
+Relevant options are `dict_entropy_temp`, `dict_entropy_grid_divisor`,
+`dict_entropy_floor`, and `dict_weight_norm=mean|minmax`. The baseline explicitly keeps
+`mean`; `minmax` is opt-in and removes the absolute affine scale introduced by the floor.
+`dict_weight=entropy_inverse` emphasizes low-entropy/high-confidence locations, while
+`dict_weight=dldx_entropy_gate` keeps task-gradient saliency as the primary weight and
+uses positive entropy only as a gate. Both are opt-in candidates; existing recipes and
+the `entropy-align` training formula are unchanged.
 
 ### Test-split evaluation
 
@@ -286,8 +298,10 @@ python scripts/train_baselines.py --baseline all
 - weighted align 与 AT 均 detach 重组后的教师 target；Q/K 只由 commitment 和 InfoMax
   训练，避免 assignment 通过移动 target 来虚假降低 align。
 
-训练时 `dict_match_stats.csv` 记录 occupancy、最大通道占比、margin、assignment churn、
-条件熵、边际熵、有效教师通道数及 InfoMax loss。
+训练时 `dict_match_stats.csv` 仅记录通道匹配诊断；熵字段明确命名为
+`channel_conditional_entropy`、`channel_marginal_entropy`，并包含
+`channel_effective_teacher_channels` 与 `channel_infomax_loss`，避免与 align 使用的
+空间逐行熵混淆。
 
 ### 正空间熵 align
 
@@ -300,8 +314,15 @@ python scripts/train_baselines.py --baseline all
 - 用 `H/log(Nv)` 归一化至 `[0,1]`，并设置正下限，避免低熵位置完全关闭 align；
 - 熵图在加权前 detach，避免模型通过压低高误差位置权重来投机。
 
-相关参数为 `dict_entropy_temp`、`dict_entropy_grid_divisor` 与
-`dict_entropy_floor`。只有设置 `dict_weight=entropy` 才会启用，原有配方不变。
+独立的 `dict_weight_stats.csv` 按 `dict_match_log_interval` 记录真实空间逐行熵的
+mean/std/min/max、floor 命中比例、最终 align 权重统计、entropy grid，以及它与
+逐像素 align residual 的相关系数。
+
+相关参数为 `dict_entropy_temp`、`dict_entropy_grid_divisor`、
+`dict_entropy_floor` 与 `dict_weight_norm=mean|minmax`。baseline 显式保持 `mean`；
+`minmax` 为 opt-in，且会消去 floor 的 affine 绝对尺度。`entropy_inverse` 强调
+低熵/高置信位置；`dldx_entropy_gate` 以任务梯度 saliency 为主权重、正熵仅作调制。
+两者均为显式候选，不改变现有 `entropy-align` 的默认训练公式。
 
 ### 测试集评测
 

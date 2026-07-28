@@ -189,6 +189,7 @@ class YOLOFDistillationModel(DetectionModel):
         self._saliency_ema: Dict[int, torch.Tensor] = {}
         self._dict_match_steps = 0
         self.last_dict_match_stats: Dict[str, float] | None = None
+        self.last_dict_weight_stats: Dict[str, float | str] | None = None
 
     def _teacher_joint_training(self) -> bool:
         """True while the teacher receives GT task loss (online joint phase).
@@ -439,7 +440,7 @@ class YOLOFDistillationModel(DetectionModel):
         """
         args = getattr(self, "args", None)
         if args is None:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
         beta_d = float(getattr(args, "dict_align_loss", 0.0) or 0.0)
         beta_a = float(getattr(args, "dict_attn_loss", 0.0) or 0.0)
         beta_c = float(getattr(args, "dict_commit_loss", 0.0) or 0.0)
@@ -617,6 +618,7 @@ class YOLOFDistillationModel(DetectionModel):
             "saliency_dlda",
             "saliency_dlda_gate",
             "saliency_dlda_absf",
+            "dldx_entropy_gate",
         }
     )
 
@@ -643,6 +645,10 @@ class YOLOFDistillationModel(DetectionModel):
             return "saliency"  # legacy Grad-CAM ablation
         if raw in {"entropy", "entropy_spatial", "spatial_entropy", "entropy_align"}:
             return "entropy"
+        if raw in {"entropy_inverse", "inverse_entropy", "spatial_entropy_inverse"}:
+            return "entropy_inverse"
+        if raw in {"dldx_entropy_gate", "saliency_dldx_entropy_gate", "entropy_gate"}:
+            return "dldx_entropy_gate"
         return raw
 
     def _dict_weight_needs_task_grad(self) -> bool:
@@ -860,7 +866,7 @@ class YOLOFDistillationModel(DetectionModel):
                 continue
             f_f = f.float()
             g_f = g.float()
-            if mode == "saliency_dldx":
+            if mode in {"saliency_dldx", "dldx_entropy_gate"}:
                 cam = self._build_xe_saliency(g_f)
             elif mode in {"saliency_dlda", "saliency_dlda_gate", "saliency_dlda_absf"}:
                 cam = self._build_dlda_saliency(f_f, g_f, mode)
@@ -899,6 +905,80 @@ class YOLOFDistillationModel(DetectionModel):
             return "channel"
         return str(raw).lower()
 
+    def _dict_weight_norm_mode(self) -> str:
+        """Spatial weight normalization; ``mean`` preserves the established training formula."""
+        mode = str(getattr(self.args, "dict_weight_norm", "mean") or "mean").lower()
+        if mode not in {"mean", "minmax"}:
+            raise ValueError(f"Unknown dict_weight_norm={mode!r}; expected mean or minmax")
+        return mode
+
+    @staticmethod
+    def _content_values(x: torch.Tensor, content_mask: torch.Tensor | None) -> torch.Tensor:
+        """Flatten content pixels only, resizing a letterbox mask when supplied."""
+        if content_mask is None:
+            return x.flatten()
+        mask = content_mask
+        if mask.shape[-2:] != x.shape[-2:]:
+            mask = F.interpolate(mask.float(), size=x.shape[-2:], mode="nearest")
+        if mask.shape[0] == 1 and x.shape[0] > 1:
+            mask = mask.expand(x.shape[0], -1, -1, -1)
+        elif mask.shape[0] != x.shape[0]:
+            mask = mask[: x.shape[0]]
+        values = x[mask.to(device=x.device) > 0.5]
+        return values if values.numel() else x.flatten()
+
+    @classmethod
+    def _normalize_dict_weight(
+        cls,
+        weight: torch.Tensor,
+        mode: str,
+        content_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Normalize a masked spatial weight map per image.
+
+        The default ``mean`` branch is intentionally identical to the previous
+        formula, including averaging zeroed letterbox pixels. ``minmax`` is an
+        opt-in ablation whose extrema use content pixels only; constant maps fall
+        back to one on content and remain zero on padding.
+        """
+        if mode == "mean":
+            return weight / weight.mean(dim=(2, 3), keepdim=True).clamp_min(1e-12)
+
+        out = torch.zeros_like(weight)
+        mask = None
+        if content_mask is not None:
+            mask = content_mask
+            if mask.shape[-2:] != weight.shape[-2:]:
+                mask = F.interpolate(mask.float(), size=weight.shape[-2:], mode="nearest")
+            if mask.shape[0] == 1 and weight.shape[0] > 1:
+                mask = mask.expand(weight.shape[0], -1, -1, -1)
+            elif mask.shape[0] != weight.shape[0]:
+                mask = mask[: weight.shape[0]]
+            mask = mask.to(device=weight.device) > 0.5
+        for bi in range(weight.shape[0]):
+            valid = mask[bi] if mask is not None else torch.ones_like(weight[bi], dtype=torch.bool)
+            values = weight[bi][valid]
+            if not values.numel():
+                continue
+            lo, hi = values.min(), values.max()
+            if float((hi - lo).detach()) > 1e-12:
+                out[bi][valid] = (values - lo) / (hi - lo)
+            else:
+                out[bi][valid] = 1.0
+        return out
+
+    @staticmethod
+    def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Finite Pearson correlation, returning zero for constant/empty inputs."""
+        if x.numel() < 2 or y.numel() != x.numel():
+            return x.new_zeros(())
+        x = x.float() - x.float().mean()
+        y = y.float() - y.float().mean()
+        denom = x.square().sum().sqrt() * y.square().sum().sqrt()
+        if float(denom.detach()) <= 1e-12:
+            return denom.new_zeros(())
+        return (x * y).sum() / denom
+
     def _dictionary_losses(
         self, teacher_taps: Dict[int, torch.Tensor], saliency: Dict[int, torch.Tensor] | None = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -913,6 +993,8 @@ class YOLOFDistillationModel(DetectionModel):
         ``dict_weight=attention`` uses A=mean_c(F²) directly (no task gradient; ablation).
         ``dict_weight=entropy`` uses positive row entropy from spatial cross-attention
         between the independently projected student and reorganized teacher features.
+        ``entropy_inverse`` and ``dldx_entropy_gate`` are explicit ablations; neither
+        changes the baseline entropy formula or its detached mean-normalized weights.
 
         Attention restriction: AT-style squared L2 on unit-normalized spatial attention
         maps — ``||A_s - A_t||_2^2`` via ``sum(dim=1).mean()``. Do **not** use elementwise
@@ -936,6 +1018,7 @@ class YOLOFDistillationModel(DetectionModel):
 
         mode = self._dict_weight_mode(self.args)
         norm = self._dict_norm_mode()
+        weight_norm = self._dict_weight_norm_mode()
         # Grad-CAM / analytic |∂L/∂A| family share the same cache + EMA path.
         use_grad_map = mode in self._SALIENCY_GRAD_MODES
         if saliency is None:
@@ -949,6 +1032,7 @@ class YOLOFDistillationModel(DetectionModel):
         diagnostic_interval = int(getattr(self.args, "dict_match_log_interval", 0) or 0)
         collect_diagnostics = diagnostic_interval > 0 and self._dict_match_steps % diagnostic_interval == 0
         match_stats = []
+        weight_stats = []
         n = 0
         for j, li in enumerate(self._dict_teacher_layers):
             t_feat = teacher_taps.get(li)
@@ -979,6 +1063,9 @@ class YOLOFDistillationModel(DetectionModel):
                 target = self._channel_standardize(target)
 
             weight = None
+            entropy_map = None
+            entropy_weight = None
+            entropy_grid = None
             if use_grad_map:
                 weight = saliency.get(li) if saliency else None
                 if weight is None and saliency:
@@ -989,19 +1076,29 @@ class YOLOFDistillationModel(DetectionModel):
                         weight = ema.expand(pred.shape[0], -1, -1, -1)
             elif mode == "attention":
                 weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
-            elif mode == "entropy":
+            if mode in {"entropy", "entropy_inverse", "dldx_entropy_gate"}:
                 divisor = max(int(getattr(self.args, "dict_entropy_grid_divisor", 4)), 1)
-                grid_size = (
+                entropy_grid = (
                     max(int(entropy_query.shape[-2]) // divisor, 1),
                     max(int(entropy_query.shape[-1]) // divisor, 1),
                 )
-                weight = module.spatial_entropy_weight(
+                entropy_weight, entropy_map = module.spatial_entropy_weight(
                     entropy_query,
                     entropy_value,
-                    grid_size=grid_size,
+                    grid_size=entropy_grid,
                     temperature=float(getattr(self.args, "dict_entropy_temp", 0.1)),
                     floor=float(getattr(self.args, "dict_entropy_floor", 0.1)),
+                    inverse=mode == "entropy_inverse",
+                    return_entropy=True,
                 )
+                if mode == "dldx_entropy_gate":
+                    if weight is not None:
+                        gate = entropy_weight
+                        if gate.shape[-2:] != weight.shape[-2:]:
+                            gate = F.interpolate(gate, size=weight.shape[-2:], mode="bilinear", align_corners=False)
+                        weight = weight * gate
+                else:
+                    weight = entropy_weight
             # mode == "none" / unknown → uniform MSE
 
             if weight is not None:
@@ -1009,11 +1106,48 @@ class YOLOFDistillationModel(DetectionModel):
                 if weight.shape[-2:] != pred.shape[-2:]:
                     weight = F.interpolate(weight, size=pred.shape[-2:], mode="bilinear", align_corners=False)
                 # Zero letterbox gray pads (also covers attention-A weights).
-                weight = self._apply_content_mask(weight, getattr(self, "_content_mask", None))
-                weight = (weight / weight.mean(dim=(2, 3), keepdim=True).clamp_min(1e-12)).to(pred.dtype).detach()
+                content_mask = getattr(self, "_content_mask", None)
+                weight = self._apply_content_mask(weight, content_mask)
+                weight = self._normalize_dict_weight(weight, weight_norm, content_mask).to(pred.dtype).detach()
+                residual = (pred - target).float().pow(2).mean(dim=1, keepdim=True)
                 d_align = d_align + (weight * (pred - target) ** 2).mean()
             else:
+                residual = (pred - target).float().pow(2).mean(dim=1, keepdim=True)
                 d_align = d_align + F.mse_loss(pred, target)
+
+            if collect_diagnostics and entropy_map is not None and entropy_weight is not None:
+                content_mask = getattr(self, "_content_mask", None)
+                entropy_values = self._content_values(entropy_map.float(), content_mask)
+                floor_values = self._content_values(entropy_weight.float(), content_mask)
+                entropy_pixels = entropy_map.float()
+                if entropy_pixels.shape[-2:] != residual.shape[-2:]:
+                    entropy_pixels = F.interpolate(
+                        entropy_pixels, size=residual.shape[-2:], mode="bilinear", align_corners=False
+                    )
+                corr = self._pearson_corr(
+                    self._content_values(entropy_pixels, content_mask),
+                    self._content_values(residual.detach(), content_mask),
+                )
+                actual_weight = weight.float() if weight is not None else torch.ones_like(residual)
+                weight_values = self._content_values(actual_weight, content_mask)
+                floor = float(getattr(self.args, "dict_entropy_floor", 0.1))
+                weight_stats.append(
+                    {
+                        "spatial_entropy_mean": entropy_values.mean(),
+                        "spatial_entropy_std": entropy_values.std(unbiased=False),
+                        "spatial_entropy_min": entropy_values.min(),
+                        "spatial_entropy_max": entropy_values.max(),
+                        "spatial_entropy_floor_hit_ratio": (floor_values <= floor + 1e-6).float().mean(),
+                        "spatial_entropy_residual_corr": corr,
+                        "spatial_weight_mean": weight_values.mean(),
+                        "spatial_weight_std": weight_values.std(unbiased=False),
+                        "spatial_weight_min": weight_values.min(),
+                        "spatial_weight_max": weight_values.max(),
+                        "spatial_weight_nonzero_ratio": (weight_values > 0).float().mean(),
+                        "grid_h": entropy_values.new_tensor(float(entropy_grid[0])),
+                        "grid_w": entropy_values.new_tensor(float(entropy_grid[1])),
+                    }
+                )
 
             att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
             att_t = F.normalize(self._spatial_attention(target).flatten(1), dim=1)
@@ -1032,6 +1166,20 @@ class YOLOFDistillationModel(DetectionModel):
                     for key in keys
                 },
             }
+        if collect_diagnostics:
+            self.last_dict_weight_stats = None
+            if weight_stats:
+                keys = weight_stats[0]
+                self.last_dict_weight_stats = {
+                    "step": float(self._dict_match_steps),
+                    "epoch": float(self.current_epoch + 1),
+                    "weight_mode": mode,
+                    "weight_norm": weight_norm,
+                    **{
+                        key: float(torch.stack([stats[key].float() for stats in weight_stats]).mean())
+                        for key in keys
+                    },
+                }
         return d_align / n, d_attn / n, d_commit / n, d_infomax / n
 
     def _ensure_align_assigner(self):
@@ -1422,6 +1570,7 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         self.add_callback("on_train_epoch_start", self._update_current_epoch)
         self.add_callback("on_train_batch_end", self._append_dict_match_diagnostics_callback)
         self._last_dict_match_step_written = -1
+        self._last_dict_weight_step_written = -1
 
     _GRAD_CLIP_MAX_NORM = 10.0  # match BaseTrainer.optimizer_step
 
@@ -1505,49 +1654,100 @@ class YOLOFDistillationTrainer(DetectionTrainer):
             "max_teacher_share",
             "match_margin",
             "assignment_churn",
-            "conditional_entropy",
-            "marginal_entropy",
-            "effective_teacher_channels",
-            "infomax_loss",
+            "channel_conditional_entropy",
+            "channel_marginal_entropy",
+            "channel_effective_teacher_channels",
+            "channel_infomax_loss",
+        )
+
+    @staticmethod
+    def _dict_weight_diagnostic_fields() -> Tuple[str, ...]:
+        return (
+            "step",
+            "epoch",
+            "weight_mode",
+            "weight_norm",
+            "spatial_entropy_mean",
+            "spatial_entropy_std",
+            "spatial_entropy_min",
+            "spatial_entropy_max",
+            "spatial_entropy_floor_hit_ratio",
+            "spatial_weight_mean",
+            "spatial_weight_std",
+            "spatial_weight_min",
+            "spatial_weight_max",
+            "spatial_weight_nonzero_ratio",
+            "grid_h",
+            "grid_w",
+            "spatial_entropy_residual_corr",
         )
 
     def _seed_dict_match_diagnostics_callback(self, trainer):
         """Continue diagnostic step numbers when resuming an existing run."""
         if RANK not in {-1, 0}:
             return
-        path = self.save_dir / "dict_match_stats.csv"
-        if not path.exists():
-            return
-        lines = path.read_text(encoding="utf-8").splitlines()
-        if len(lines) < 2:
-            return
-        try:
-            last_step = int(float(lines[-1].split(",", 1)[0]))
-        except (TypeError, ValueError):
-            return
-        self._last_dict_match_step_written = last_step
         model = unwrap_model(trainer.model)
-        model._dict_match_steps = max(int(getattr(model, "_dict_match_steps", 0)), last_step)
+        path = self.save_dir / "dict_match_stats.csv"
+        if path.exists():
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if len(lines) >= 2:
+                try:
+                    last_step = int(float(lines[-1].split(",", 1)[0]))
+                    self._last_dict_match_step_written = last_step
+                    model._dict_match_steps = max(int(getattr(model, "_dict_match_steps", 0)), last_step)
+                except (TypeError, ValueError):
+                    pass
+        weight_path = self.save_dir / "dict_weight_stats.csv"
+        if weight_path.exists():
+            weight_lines = weight_path.read_text(encoding="utf-8").splitlines()
+            if len(weight_lines) >= 2:
+                try:
+                    last_weight_step = int(float(weight_lines[-1].split(",", 1)[0]))
+                    self._last_dict_weight_step_written = last_weight_step
+                    model._dict_match_steps = max(
+                        int(getattr(model, "_dict_match_steps", 0)), last_weight_step
+                    )
+                except (TypeError, ValueError):
+                    pass
 
     def _append_dict_match_diagnostics_callback(self, trainer):
-        """Append occupancy, margin, churn, and entropy diagnostics at the configured interval."""
+        """Append channel-match and spatial-weight diagnostics to independent CSV schemas."""
         if RANK not in {-1, 0}:
             return
         model = unwrap_model(trainer.model)
         stats = getattr(model, "last_dict_match_stats", None)
-        if not stats:
+        if stats:
+            step = int(stats["step"])
+            if step > self._last_dict_match_step_written:
+                fields = self._dict_match_diagnostic_fields()
+                path = self.save_dir / "dict_match_stats.csv"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if not path.exists():
+                    path.write_text(",".join(fields) + "\n", encoding="utf-8")
+                with path.open("a", encoding="utf-8") as f:
+                    f.write(",".join(f"{float(stats[name]):.8g}" for name in fields) + "\n")
+                self._last_dict_match_step_written = step
+
+        weight_stats = getattr(model, "last_dict_weight_stats", None)
+        if not weight_stats:
             return
-        step = int(stats["step"])
-        if step <= self._last_dict_match_step_written:
+        step = int(weight_stats["step"])
+        if step <= self._last_dict_weight_step_written:
             return
-        fields = self._dict_match_diagnostic_fields()
-        path = self.save_dir / "dict_match_stats.csv"
+        fields = self._dict_weight_diagnostic_fields()
+        path = self.save_dir / "dict_weight_stats.csv"
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_text(",".join(fields) + "\n", encoding="utf-8")
         with path.open("a", encoding="utf-8") as f:
-            f.write(",".join(f"{float(stats[name]):.8g}" for name in fields) + "\n")
-        self._last_dict_match_step_written = step
+            values = [
+                str(weight_stats[name])
+                if name in {"weight_mode", "weight_norm"}
+                else f"{float(weight_stats[name]):.8g}"
+                for name in fields
+            ]
+            f.write(",".join(values) + "\n")
+        self._last_dict_weight_step_written = step
 
     def validate(self):
         """Run student val, then evaluate the teacher alone for monitoring."""
