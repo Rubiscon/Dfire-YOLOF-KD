@@ -198,7 +198,7 @@ class DictionaryModule(nn.Module):
 
     @property
     def differentiable_assignment(self) -> bool:
-        """Whether weighted align can update Q/K and the student query path."""
+        """Whether assignment-specific losses can update Q/K and the student query path."""
         return self.match in {"soft", "straight_through"}
 
     @staticmethod
@@ -225,7 +225,8 @@ class DictionaryModule(nn.Module):
         ``infomax_loss`` is H(T|S)-lambda*H(T), computed from the soft assignment.
 
         Straight-through matching has an exactly hard forward assignment while its
-        backward pass follows the soft assignment, so weighted align also trains Q/K.
+        backward pass follows the soft assignment. Callers detach ``t_reorg`` for
+        align/AT; commit and InfoMax are the intended Q/K training signals.
         """
         _, _, h, w = t_feat.shape
         k = self.pool(self.key_enc(t_feat)).flatten(2)  # (B, Ct, d)

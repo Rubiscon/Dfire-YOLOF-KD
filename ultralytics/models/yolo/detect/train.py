@@ -917,7 +917,9 @@ class YOLOFDistillationModel(DetectionModel):
 
         Commit: soft-matching encoder loss (queries → matched teacher keys); 0 for hard match.
         InfoMax: H(T|S)-lambda*H(T). Straight-through matching keeps the proposal's
-        hard argmax forward target, while weighted align and InfoMax train Q/K.
+        hard argmax forward target. Align and AT use a detached teacher target, so
+        Q/K are trained only by commit and InfoMax rather than moving the target
+        toward the current student prediction.
         """
         device = next(self.parameters()).device
         zero = torch.tensor(0.0, device=device)
@@ -949,14 +951,14 @@ class YOLOFDistillationModel(DetectionModel):
             if t_feat is None or j >= len(self.dictionary_modules):
                 continue
             # Detach teacher activations so dict KD does not update the teacher backbone.
-            # Teacher values are stopgrad'd at input. For soft/ST assignment, retain the
-            # assignment graph so align provides semantic grounding beyond occupancy balance.
+            # Also detach the reorganized target for both align and AT: Q/K must not lower
+            # distillation losses by moving the teacher target toward the student prediction.
+            # Soft/ST Q/K remain trainable through commit and InfoMax below.
             module = self.dictionary_modules[j]
             s_proj, t_reorg, commit, infomax = module(
                 t_feat.detach(), s_feat, collect_diagnostics=collect_diagnostics
             )
-            target = t_reorg if module.differentiable_assignment else t_reorg.detach()
-            target_for_at = t_reorg.detach()
+            target = t_reorg.detach()
             pred = s_proj
             d_commit = d_commit + commit
             d_infomax = d_infomax + infomax
@@ -995,7 +997,7 @@ class YOLOFDistillationModel(DetectionModel):
                 d_align = d_align + F.mse_loss(pred, target)
 
             att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
-            att_t = F.normalize(self._spatial_attention(target_for_at).flatten(1), dim=1)
+            att_t = F.normalize(self._spatial_attention(target).flatten(1), dim=1)
             # AT / Zagoruyko: squared Euclidean distance between unit vectors (scale ~0.2–1).
             d_attn = d_attn + (att_s - att_t).pow(2).sum(dim=1).mean()
             n += 1
