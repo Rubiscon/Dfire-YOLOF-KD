@@ -187,6 +187,9 @@ class YOLOFDistillationModel(DetectionModel):
         self._cached_saliency: Dict[int, torch.Tensor] = {}
         # Running EMA of Grad-CAM saliency (layer → (1,1,H,W)); used after teacher freeze.
         self._saliency_ema: Dict[int, torch.Tensor] = {}
+        self._teacher_weight_source = "live"
+        self._collect_dict_stats = False
+        self.last_dict_weight_stats: Dict[str, Any] = {}
 
     def _teacher_joint_training(self) -> bool:
         """True while the teacher receives GT task loss (online joint phase).
@@ -274,6 +277,7 @@ class YOLOFDistillationModel(DetectionModel):
         self.teacher.eval()
         self.teacher.requires_grad_(False)
         self._teacher_frozen = True
+        self._teacher_weight_source = "ema" if copied_ema else "live"
 
         if RANK in {-1, 0}:
             if live_map and ema_map:
@@ -809,18 +813,87 @@ class YOLOFDistillationModel(DetectionModel):
         return weight * m.to(device=weight.device, dtype=weight.dtype)
 
     @staticmethod
-    def _minmax_normalize_weight(weight: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-        """Min-max normalize each image/channel over space, with a safe constant-map fallback.
+    def _minmax_normalize_weight(
+        weight: torch.Tensor, content_mask: torch.Tensor | None = None, eps: float = 1e-12
+    ) -> torch.Tensor:
+        """Min-max normalize content pixels per image/channel and keep padding at zero.
 
         A constant weight map has no spatial ranking to preserve. Returning ones in that
-        degenerate case keeps dictionary alignment equivalent to uniform MSE instead of
-        silently removing its gradient.
+        image's valid region keeps dictionary alignment equivalent to content-only uniform
+        MSE instead of silently removing its gradient. An all-padding map returns zeros.
         """
-        w_min = weight.amin(dim=(2, 3), keepdim=True)
-        w_max = weight.amax(dim=(2, 3), keepdim=True)
+        if content_mask is None:
+            valid = torch.ones_like(weight, dtype=torch.bool)
+        else:
+            valid = content_mask
+            if valid.shape[-2:] != weight.shape[-2:]:
+                valid = F.interpolate(valid.float(), size=weight.shape[-2:], mode="nearest")
+            if valid.shape[0] == 1 and weight.shape[0] > 1:
+                valid = valid.expand(weight.shape[0], -1, -1, -1)
+            elif valid.shape[0] != weight.shape[0]:
+                valid = valid[: weight.shape[0]]
+            if valid.shape[1] == 1 and weight.shape[1] > 1:
+                valid = valid.expand(-1, weight.shape[1], -1, -1)
+            valid = valid.to(device=weight.device, dtype=torch.bool)
+
+        has_content = valid.any(dim=(2, 3), keepdim=True)
+        w_min = weight.masked_fill(~valid, torch.inf).amin(dim=(2, 3), keepdim=True)
+        w_max = weight.masked_fill(~valid, -torch.inf).amax(dim=(2, 3), keepdim=True)
+        w_min = torch.where(has_content, w_min, torch.zeros_like(w_min))
+        w_max = torch.where(has_content, w_max, torch.zeros_like(w_max))
         span = w_max - w_min
         normalized = (weight - w_min) / span.clamp_min(eps)
-        return torch.where(span > eps, normalized, torch.ones_like(normalized))
+        normalized = torch.where(span > eps, normalized, torch.ones_like(normalized))
+        return torch.where(valid & has_content, normalized, torch.zeros_like(normalized))
+
+    @staticmethod
+    def _dict_weight_summary(
+        raw_weight: torch.Tensor,
+        normalized_weight: torch.Tensor,
+        content_mask: torch.Tensor | None,
+        eps: float = 1e-12,
+    ) -> Dict[str, float]:
+        """Detached content-only statistics for the low-frequency dictionary diagnostic."""
+        if content_mask is None:
+            valid = torch.ones_like(normalized_weight, dtype=torch.bool)
+        else:
+            valid = content_mask
+            if valid.shape[-2:] != normalized_weight.shape[-2:]:
+                valid = F.interpolate(valid.float(), size=normalized_weight.shape[-2:], mode="nearest")
+            if valid.shape[0] == 1 and normalized_weight.shape[0] > 1:
+                valid = valid.expand(normalized_weight.shape[0], -1, -1, -1)
+            elif valid.shape[0] != normalized_weight.shape[0]:
+                valid = valid[: normalized_weight.shape[0]]
+            if valid.shape[1] == 1 and normalized_weight.shape[1] > 1:
+                valid = valid.expand(-1, normalized_weight.shape[1], -1, -1)
+            valid = valid.to(device=normalized_weight.device, dtype=torch.bool)
+
+        with torch.no_grad():
+            values = normalized_weight.detach()[valid]
+            if values.numel():
+                v_min = values.min()
+                v_max = values.max()
+                mean = values.mean()
+                std = values.std(unbiased=False)
+                nonzero = (values.abs() > eps).float().mean()
+            else:
+                v_min = v_max = mean = std = nonzero = normalized_weight.new_tensor(0.0)
+
+            raw_min = raw_weight.detach().masked_fill(~valid, torch.inf).amin(dim=(2, 3))
+            raw_max = raw_weight.detach().masked_fill(~valid, -torch.inf).amax(dim=(2, 3))
+            has_content = valid.any(dim=(2, 3))
+            constant = has_content & ((raw_max - raw_min) <= eps)
+            fallback_ratio = constant.float().sum() / has_content.float().sum().clamp_min(1.0)
+            return {
+                "weight_min": float(v_min),
+                "weight_max": float(v_max),
+                "weight_span": float(v_max - v_min),
+                "weight_mean": float(mean),
+                "weight_std": float(std),
+                "weight_nonzero_ratio": float(nonzero),
+                "constant_fallback_ratio": float(fallback_ratio),
+                "content_mask_ratio": float(valid.float().mean()),
+            }
 
     def _letterbox_mask_enabled(self) -> bool:
         """Default on: zero saliency/attention weights on YOLO letterbox gray pads."""
@@ -938,6 +1011,10 @@ class YOLOFDistillationModel(DetectionModel):
         d_align = zero.clone()
         d_attn = zero.clone()
         d_commit = zero.clone()
+        uniform_align = zero.clone()
+        weight_summaries: List[Dict[str, float]] = []
+        weight_sources = set()
+        collect_stats = bool(self._collect_dict_stats)
         n = 0
         for j, li in enumerate(self._dict_teacher_layers):
             t_feat = teacher_taps.get(li)
@@ -959,31 +1036,43 @@ class YOLOFDistillationModel(DetectionModel):
                 target = self._channel_standardize(target)
 
             weight = None
+            weight_source = "uniform"
             if use_grad_map:
                 weight = saliency.get(li) if saliency else None
                 if weight is None and saliency:
                     weight = saliency.get(id(t_feat))
+                if weight is not None:
+                    weight_source = "live"
                 if weight is None:
                     ema = self._saliency_ema.get(li)
                     if ema is not None:
                         weight = ema.expand(pred.shape[0], -1, -1, -1)
+                        weight_source = "ema"
             elif mode == "attention":
                 weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
+                weight_source = "attention"
             # mode == "none" / unknown → uniform MSE
 
+            residual = (pred - target) ** 2
+            if collect_stats:
+                uniform_align = uniform_align + residual.mean()
             if weight is not None:
                 weight = weight.float()
                 if weight.shape[-2:] != pred.shape[-2:]:
                     weight = F.interpolate(weight, size=pred.shape[-2:], mode="bilinear", align_corners=False)
-                # Zero letterbox gray pads (also covers attention-A weights).
-                weight = self._apply_content_mask(weight, getattr(self, "_content_mask", None))
-                weight = self._minmax_normalize_weight(weight).to(pred.dtype).detach()
-                # The constant-map fallback is uniform; reapply the mask so padding
-                # remains excluded even when the incoming map is identically zero.
-                weight = self._apply_content_mask(weight, getattr(self, "_content_mask", None))
-                d_align = d_align + (weight * (pred - target) ** 2).mean()
+                raw_weight = weight
+                content_mask = getattr(self, "_content_mask", None)
+                weight = self._minmax_normalize_weight(raw_weight, content_mask).to(pred.dtype).detach()
+                d_align = d_align + (weight * residual).mean()
+                if collect_stats:
+                    weight_summaries.append(self._dict_weight_summary(raw_weight, weight, content_mask))
             else:
-                d_align = d_align + F.mse_loss(pred, target)
+                d_align = d_align + residual.mean()
+                if collect_stats:
+                    uniform = torch.ones_like(residual[:, :1])
+                    weight_summaries.append(self._dict_weight_summary(uniform, uniform, None))
+            if collect_stats:
+                weight_sources.add(weight_source)
 
             att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
             att_t = F.normalize(self._spatial_attention(target).flatten(1), dim=1)
@@ -992,7 +1081,29 @@ class YOLOFDistillationModel(DetectionModel):
             n += 1
 
         n = max(n, 1)
-        return d_align / n, d_attn / n, d_commit / n
+        d_align = d_align / n
+        d_attn = d_attn / n
+        d_commit = d_commit / n
+        if collect_stats and weight_summaries:
+            summary = {
+                key: sum(item[key] for item in weight_summaries) / len(weight_summaries)
+                for key in weight_summaries[0]
+            }
+            uniform_align = uniform_align / n
+            summary.update(
+                {
+                    "weight_source": "+".join(sorted(weight_sources)),
+                    "teacher_source": self._teacher_weight_source,
+                    "dict_weight_mode": mode,
+                    "dict_weight_norm": "minmax",
+                    "weighted_uniform_mse_ratio": float(
+                        (d_align.detach() / uniform_align.detach().clamp_min(1e-12)).cpu()
+                    ),
+                }
+            )
+            self.last_dict_weight_stats = summary
+            self._collect_dict_stats = False
+        return d_align, d_attn, d_commit
 
     def _ensure_align_assigner(self):
         """Lazy-init TAL assigner for align (defaults match task-loss TAL topk=10)."""
@@ -1321,6 +1432,17 @@ class YOLOFDistillationModel(DetectionModel):
         gamma = getattr(self.args, "align_loss", 0.5)
         delta = getattr(self.args, "teacher_task_loss", 1.0) if teacher_joint else 0.0
         beta_d, beta_a, beta_c = self._dict_gains()
+        if self.last_dict_weight_stats and "raw_align_loss" not in self.last_dict_weight_stats:
+            self.last_dict_weight_stats.update(
+                {
+                    "raw_align_loss": float(dict_align_loss.detach()),
+                    "raw_attn_loss": float(dict_attn_loss.detach()),
+                    "raw_commit_loss": float(dict_commit_loss.detach()),
+                    "weighted_align_loss": float((beta_d * dict_align_loss).detach()),
+                    "weighted_attn_loss": float((beta_a * dict_attn_loss).detach()),
+                    "weighted_commit_loss": float((beta_c * dict_commit_loss).detach()),
+                }
+            )
         # Task losses come back as (per-component loss * batch_size); the distillation losses are plain
         # per-batch means. Scale the distill terms by batch size (and sum the task vectors) so every
         # term shares the same per-sample footing and the nominal weights truly control relative
@@ -1360,6 +1482,29 @@ class YOLOFDistillationModel(DetectionModel):
 class YOLOFDistillationTrainer(DetectionTrainer):
     """Trainer for YOLOF distillation (offline frozen teacher or online joint + optional late freeze)."""
 
+    _DICT_WEIGHT_LOG_FIELDS = (
+        "epoch",
+        "weight_source",
+        "teacher_source",
+        "dict_weight_mode",
+        "dict_weight_norm",
+        "weight_min",
+        "weight_max",
+        "weight_span",
+        "weight_mean",
+        "weight_std",
+        "weight_nonzero_ratio",
+        "constant_fallback_ratio",
+        "content_mask_ratio",
+        "weighted_uniform_mse_ratio",
+        "raw_align_loss",
+        "weighted_align_loss",
+        "raw_attn_loss",
+        "weighted_attn_loss",
+        "raw_commit_loss",
+        "weighted_commit_loss",
+    )
+
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
         super().__init__(cfg, overrides, _callbacks)
         self.loss_names = (
@@ -1376,7 +1521,9 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         )
         self.add_callback("on_train_start", self._freeze_teacher_callback)
         self.add_callback("on_train_start", self._log_split_grad_clip_callback)
+        self.add_callback("on_train_start", self._prepare_dict_weight_log)
         self.add_callback("on_train_epoch_start", self._update_current_epoch)
+        self.add_callback("on_train_epoch_end", self._log_dict_weight_stats)
 
     _GRAD_CLIP_MAX_NORM = 10.0  # match BaseTrainer.optimizer_step
 
@@ -1446,10 +1593,61 @@ class YOLOFDistillationTrainer(DetectionTrainer):
     def _update_current_epoch(self, trainer):
         model = unwrap_model(trainer.model)
         model.current_epoch = trainer.epoch
+        interval = int(getattr(trainer.args, "dict_weight_log_interval", 0) or 0)
+        model._collect_dict_stats = interval > 0 and (trainer.epoch + 1) % interval == 0
+        if model._collect_dict_stats:
+            model.last_dict_weight_stats = {}
         if hasattr(model, "_apply_teacher_freeze_if_needed"):
             model._apply_teacher_freeze_if_needed(trainer)
         if hasattr(model, "_set_teacher_criterion_epoch"):
             model._set_teacher_criterion_epoch(trainer.epoch)
+
+    def _prepare_dict_weight_log(self, trainer):
+        """Reset diagnostics for a fresh run, or preserve and rotate an incompatible resume schema."""
+        if RANK not in {-1, 0}:
+            return
+        path = trainer.save_dir / "dict_weight_stats.csv"
+        if path.exists() and not bool(getattr(trainer.args, "resume", False)):
+            path.unlink()
+            return
+        if not path.exists():
+            return
+        expected = ",".join(self._DICT_WEIGHT_LOG_FIELDS)
+        with path.open(encoding="utf-8") as f:
+            header = f.readline().rstrip("\r\n")
+        if header == expected:
+            return
+        backup = path.with_name(f"{path.stem}.schema-mismatch{path.suffix}")
+        index = 1
+        while backup.exists():
+            backup = path.with_name(f"{path.stem}.schema-mismatch-{index}{path.suffix}")
+            index += 1
+        path.replace(backup)
+        LOGGER.warning(
+            f"{colorstr('KD:')} Existing dictionary diagnostic schema is incompatible; "
+            f"preserved it as {backup.name} and started a new {path.name}"
+        )
+
+    def _log_dict_weight_stats(self, trainer):
+        """Append one detached dictionary diagnostic row at the configured epoch interval."""
+        if RANK not in {-1, 0}:
+            return
+        model = unwrap_model(trainer.model)
+        stats = getattr(model, "last_dict_weight_stats", None)
+        if not stats:
+            return
+        path = trainer.save_dir / "dict_weight_stats.csv"
+        fields = YOLOFDistillationTrainer._DICT_WEIGHT_LOG_FIELDS
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(",".join(fields) + "\n", encoding="utf-8")
+        values = []
+        for field in fields:
+            value = trainer.epoch + 1 if field == "epoch" else stats.get(field, "")
+            values.append(f"{value:.8g}" if isinstance(value, float) else str(value))
+        with path.open("a", encoding="utf-8") as f:
+            f.write(",".join(values) + "\n")
+        model.last_dict_weight_stats = {}
 
     def validate(self):
         """Run student val, then evaluate the teacher alone for monitoring."""

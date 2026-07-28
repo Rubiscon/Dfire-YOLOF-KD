@@ -554,6 +554,7 @@ def check_dict_alignment(
             "dict_saliency_blur",
             "dict_saliency_clip",
             "dict_letterbox_mask",
+            "dict_weight_log_interval",
             "teacher_val_interval",
         }
     if mismatched := [k for k in custom_keys if k not in base_keys and k not in allowed_custom_keys]:
