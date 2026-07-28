@@ -31,8 +31,8 @@ def test_infomax_prefers_balanced_deterministic_assignments():
     assert loss_balanced < loss_uniform
 
 
-def test_straight_through_forward_is_hard_and_backward_trains_assignment():
-    """ST keeps proposal argmax values while align gradients reach Q/K."""
+def test_straight_through_forward_is_hard_and_assignment_losses_train_qk():
+    """ST stays hard forward; detached align cannot move Q/K, but commit/InfoMax can."""
     torch.manual_seed(7)
     t = torch.randn(2, 8, 12, 12)
     s = torch.randn(2, 6, 6, 6, requires_grad=True)
@@ -56,9 +56,17 @@ def test_straight_through_forward_is_hard_and_backward_trains_assignment():
         expected = torch.gather(t, 1, index[:, :, None, None].expand(-1, -1, 12, 12))
     assert torch.allclose(t_reorg, expected, rtol=1e-6, atol=1e-7)
 
-    loss = F.mse_loss(s_proj, t_reorg) + 0.01 * infomax + 0.01 * commit
-    loss.backward()
+    align = F.mse_loss(s_proj, t_reorg.detach())
+    align.backward()
     assert s.grad is not None and float(s.grad.abs().sum()) > 0
+    for encoder in (module.key_enc, module.query_enc):
+        grads = [p.grad for p in encoder.parameters() if p.requires_grad]
+        assert grads and all(g is None or float(g.abs().sum()) == 0.0 for g in grads)
+
+    module.zero_grad(set_to_none=True)
+    s.grad = None
+    _, _, commit, infomax = module(t, s)
+    (infomax + commit).backward()
     for encoder in (module.key_enc, module.query_enc):
         grads = [p.grad for p in encoder.parameters() if p.requires_grad]
         assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
@@ -122,7 +130,7 @@ def test_match_diagnostics_csv_writer():
 
 if __name__ == "__main__":
     test_infomax_prefers_balanced_deterministic_assignments()
-    test_straight_through_forward_is_hard_and_backward_trains_assignment()
+    test_straight_through_forward_is_hard_and_assignment_losses_train_qk()
     test_match_diagnostics_cover_collapse_and_stability_signals()
     test_match_diagnostics_csv_writer()
     print("InfoMax matching tests passed")
