@@ -33,6 +33,22 @@ from ultralytics.utils.torch_utils import torch_distributed_zero_first, unwrap_m
 
 # Student blocks whose residual output is cached as `last_feature` for feature distillation.
 DISTILL_BLOCKS = (DilatedResBlock, DilatedDeformBlock, DilatedDCNBlock)
+YOLOF_DISTILLATION_LOSS_NAMES = (
+    "box_loss",
+    "cls_loss",
+    "dfl_loss",
+    "align_loss",
+    "feature_loss",
+    "dict_loss",
+    "dattn_loss",
+    "commit_loss",
+    "infomax_loss",
+    "commit_weighted",
+    "infomax_weighted",
+    "t_box_loss",
+    "t_cls_loss",
+    "t_dfl_loss",
+)
 
 
 class DetectionTrainer(BaseTrainer):
@@ -436,10 +452,13 @@ class YOLOFDistillationModel(DetectionModel):
 
         ``dict_attn_start_epoch`` is 1-indexed (same as ``teacher_freeze_epoch``): attention
         restriction is delayed so early epochs focus on saliency-weighted feature alignment.
+        ``dict_infomax_start_epoch`` is likewise 1-indexed when positive; zero preserves the
+        legacy behavior of enabling InfoMax immediately. A positive warmup linearly reaches
+        the configured gain over that many active epochs.
         """
         args = getattr(self, "args", None)
         if args is None:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
         beta_d = float(getattr(args, "dict_align_loss", 0.0) or 0.0)
         beta_a = float(getattr(args, "dict_attn_loss", 0.0) or 0.0)
         beta_c = float(getattr(args, "dict_commit_loss", 0.0) or 0.0)
@@ -447,6 +466,15 @@ class YOLOFDistillationModel(DetectionModel):
         attn_start = int(getattr(args, "dict_attn_start_epoch", 0) or 0)
         if attn_start > 0 and (self.current_epoch + 1) < attn_start:
             beta_a = 0.0
+        infomax_start = int(getattr(args, "dict_infomax_start_epoch", 0) or 0)
+        infomax_warmup = max(int(getattr(args, "dict_infomax_warmup_epochs", 0) or 0), 0)
+        epoch = self.current_epoch + 1
+        if infomax_start > 0 and epoch < infomax_start:
+            beta_i = 0.0
+        elif infomax_warmup > 0:
+            first_active_epoch = max(infomax_start, 1)
+            warmup_step = epoch - first_active_epoch + 1
+            beta_i *= min(max(warmup_step / infomax_warmup, 0.0), 1.0)
         return beta_d, beta_a, beta_c, beta_i
 
     def build_distillation_modules(self, imgsz: int | None = None):
@@ -1262,7 +1290,11 @@ class YOLOFDistillationModel(DetectionModel):
         # Validation uses rect batches with varying sizes; only student task loss is needed for val metrics.
         if not self.training:
             student_task_loss, student_loss_items = super().loss(batch, preds)
-            pad = torch.zeros(7, device=student_loss_items.device, dtype=student_loss_items.dtype)
+            pad = torch.zeros(
+                len(YOLOF_DISTILLATION_LOSS_NAMES) - len(student_loss_items),
+                device=student_loss_items.device,
+                dtype=student_loss_items.dtype,
+            )
             return student_task_loss, torch.cat([student_loss_items, pad])
 
         preds = self._training_preds(batch["img"], preds)
@@ -1372,6 +1404,10 @@ class YOLOFDistillationModel(DetectionModel):
                 feature_loss.detach(),
                 dict_align_loss.detach(),
                 dict_attn_loss.detach(),
+                dict_commit_loss.detach(),
+                dict_infomax_loss.detach(),
+                (beta_c * dict_commit_loss).detach(),
+                (beta_i * dict_infomax_loss).detach(),
                 teacher_loss_items[0],
                 teacher_loss_items[1],
                 teacher_loss_items[2],
@@ -1385,18 +1421,7 @@ class YOLOFDistillationTrainer(DetectionTrainer):
 
     def __init__(self, cfg=DEFAULT_CFG, overrides: dict[str, Any] | None = None, _callbacks: dict | None = None):
         super().__init__(cfg, overrides, _callbacks)
-        self.loss_names = (
-            "box_loss",
-            "cls_loss",
-            "dfl_loss",
-            "align_loss",
-            "feature_loss",
-            "dict_loss",
-            "dattn_loss",
-            "t_box_loss",
-            "t_cls_loss",
-            "t_dfl_loss",
-        )
+        self.loss_names = YOLOF_DISTILLATION_LOSS_NAMES
         self.add_callback("on_train_start", self._freeze_teacher_callback)
         self.add_callback("on_train_start", self._log_split_grad_clip_callback)
         self.add_callback("on_train_start", self._seed_dict_match_diagnostics_callback)
@@ -1483,23 +1508,42 @@ class YOLOFDistillationTrainer(DetectionTrainer):
             "step",
             "epoch",
             "used_teacher_ratio",
+            "hard_occupancy",
             "max_teacher_share",
             "match_margin",
-            "assignment_churn",
+            "mean_top1_probability",
+            "cross_batch_assignment_churn",
             "conditional_entropy",
+            "normalized_conditional_entropy",
             "marginal_entropy",
+            "normalized_marginal_entropy",
             "effective_teacher_channels",
             "infomax_loss",
         )
+
+    def _dict_match_diagnostics_path(self):
+        """Use a versioned file when resuming a run that has the legacy diagnostic schema."""
+        primary = self.save_dir / "dict_match_stats.csv"
+        if primary.exists():
+            header = primary.read_text(encoding="utf-8").splitlines()[:1]
+            expected = ",".join(self._dict_match_diagnostic_fields())
+            if header and header[0] != expected:
+                return self.save_dir / "dict_match_stats_v2.csv"
+        return primary
 
     def _seed_dict_match_diagnostics_callback(self, trainer):
         """Continue diagnostic step numbers when resuming an existing run."""
         if RANK not in {-1, 0}:
             return
-        path = self.save_dir / "dict_match_stats.csv"
-        if not path.exists():
+        path = self._dict_match_diagnostics_path()
+        seed_path = path
+        if not seed_path.exists() and path.name != "dict_match_stats.csv":
+            legacy_path = self.save_dir / "dict_match_stats.csv"
+            if legacy_path.exists():
+                seed_path = legacy_path
+        if not seed_path.exists():
             return
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = seed_path.read_text(encoding="utf-8").splitlines()
         if len(lines) < 2:
             return
         try:
@@ -1511,7 +1555,7 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         model._dict_match_steps = max(int(getattr(model, "_dict_match_steps", 0)), last_step)
 
     def _append_dict_match_diagnostics_callback(self, trainer):
-        """Append occupancy, margin, churn, and entropy diagnostics at the configured interval."""
+        """Append occupancy, margin, cross-batch churn, and entropy diagnostics at the configured interval."""
         if RANK not in {-1, 0}:
             return
         model = unwrap_model(trainer.model)
@@ -1522,7 +1566,7 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         if step <= self._last_dict_match_step_written:
             return
         fields = self._dict_match_diagnostic_fields()
-        path = self.save_dir / "dict_match_stats.csv"
+        path = self._dict_match_diagnostics_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_text(",".join(fields) + "\n", encoding="utf-8")

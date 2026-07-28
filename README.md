@@ -85,6 +85,9 @@ python scripts/train_baselines.py --baseline early-dldx
 # 4. Straight-through InfoMax matching experiment
 python scripts/train_baselines.py --baseline infomax
 
+# Explicit opt-in candidate: start after epoch 20, then warm up for 10 epochs
+python scripts/train_baselines.py --baseline infomax-delayed
+
 # Run all three in sequence
 python scripts/train_baselines.py --baseline all
 ```
@@ -100,11 +103,20 @@ attention) and changes only dictionary assignment:
 - Forward assignment is hard argmax; backward uses `A_soft` (straight-through).
 - `L_InfoMax = H(T|S) - lambda H(T)` encourages confident student-channel matches
   without collapsing all queries onto a few teacher channels.
-- Weighted align keeps the assignment graph, grounding Q/K in teacher-feature
-  reconstruction rather than allowing a semantically arbitrary balanced permutation.
+- The reorganized teacher target is detached for weighted align and AT. These losses
+  train the student/projector but not Q/K; with baseline `dict_commit_loss=0`, Q/K are
+  updated only by InfoMax.
 
-`dict_match_stats.csv` records occupancy, maximum teacher share, margin, dominant
-assignment churn, conditional/marginal entropy, effective teacher channels, and InfoMax loss.
+The existing `infomax` recipe keeps legacy timing (`dict_infomax_start_epoch=0`,
+`dict_infomax_warmup_epochs=0`): full InfoMax gain from the first epoch. The
+`infomax-delayed` candidate is opt-in (`start_epoch=21`, 1-indexed; 10-epoch linear
+warmup), and is excluded from `--baseline all`.
+
+Epoch loss output records raw commit/InfoMax losses and their effective gain-weighted
+values. `dict_match_stats.csv` additionally records hard occupancy, mean top-1
+probability, normalized conditional/marginal entropy, effective teacher channels,
+and `cross_batch_assignment_churn` (a change between sampled batches, not repeated
+evaluation of the same examples).
 
 ### Test-split evaluation
 
@@ -247,6 +259,9 @@ python scripts/train_baselines.py --baseline early-dldx
 # 4. Straight-through InfoMax matching 实验
 python scripts/train_baselines.py --baseline infomax
 
+# 显式 opt-in 候选：第 20 轮后启动，并 warmup 10 轮
+python scripts/train_baselines.py --baseline infomax-delayed
+
 # 依次运行全部
 python scripts/train_baselines.py --baseline all
 ```
@@ -260,10 +275,18 @@ python scripts/train_baselines.py --baseline all
 - 对 L2 归一化后的 Q/K 使用 `A_soft=softmax(M/tau)`；
 - 前向保持 proposal 的 hard argmax，反向通过 `A_soft`（straight-through）；
 - 最小化 `H(T|S)-lambda H(T)`，兼顾明确匹配与教师通道均衡使用；
-- weighted align 不 detach assignment，使 Q/K 同时受到语义重建约束，避免只学到任意的均衡排列。
+- weighted align 与 AT 使用 detach 后的重组教师目标，因此只训练学生/投影层，不训练 Q/K；
+  baseline 的 `dict_commit_loss=0` 时，Q/K 仅由 InfoMax 更新。
 
-训练时 `dict_match_stats.csv` 记录 occupancy、最大通道占比、margin、assignment churn、
-条件熵、边际熵、有效教师通道数及 InfoMax loss。
+原 `infomax` 配方保持旧时序：`dict_infomax_start_epoch=0`、
+`dict_infomax_warmup_epochs=0`，从首轮使用完整 gain。`infomax-delayed` 是显式
+opt-in 候选（1-indexed 的 `start_epoch=21`，随后线性 warmup 10 轮），且不会被
+`--baseline all` 选中。
+
+epoch loss 输出记录 raw commit/InfoMax 及其有效 gain 加权值。`dict_match_stats.csv`
+还记录 hard occupancy、mean top-1 probability、归一化条件熵/边际熵、有效教师通道数；
+`cross_batch_assignment_churn` 表示不同采样 batch 之间的变化，不代表同一批样本重复
+计算时的映射不稳定。
 
 ### 测试集评测
 

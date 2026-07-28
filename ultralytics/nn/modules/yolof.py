@@ -119,6 +119,8 @@ class DictionaryModule(nn.Module):
 
     The student feature is projected (DeconvNet) to the same channel/spatial size as
     the reorganized teacher feature for weighted align + attention restriction losses.
+    Callers detach that reorganized target, so align/AT train the student projector but
+    not the Q/K encoders. With the baseline ``commit=0``, Q/K are updated only by InfoMax.
 
     Args:
         c_t (int): teacher feature channels.
@@ -126,7 +128,7 @@ class DictionaryModule(nn.Module):
         t_size (int): teacher feature spatial size (H == W) at trace time.
         s_size (int): student feature spatial size (H == W) at trace time.
         grid (int): pooled token grid; token dim d = grid * grid.
-        match (str): ``soft`` or ``hard``.
+        match (str): ``soft``, ``hard``, or ``straight_through``.
         temperature (float): softmax temperature for soft matching.
     """
 
@@ -264,6 +266,7 @@ class DictionaryModule(nn.Module):
             with torch.no_grad():
                 counts = F.one_hot(assignment_index, num_classes=m.shape[2]).sum(dim=(0, 1)).float()
                 top2 = assignment_soft.topk(min(2, assignment_soft.shape[2]), dim=2).values
+                mean_top1_probability = top2[:, :, 0].mean()
                 margin = (
                     (top2[:, :, 0] - top2[:, :, 1]).mean()
                     if top2.shape[2] > 1
@@ -280,13 +283,20 @@ class DictionaryModule(nn.Module):
                 _, conditional_entropy, marginal_entropy = self.infomax_loss(
                     assignment_soft, self.infomax_marginal_weight
                 )
+                max_entropy = assignment_soft.new_tensor(math.log(max(assignment_soft.shape[2], 1)))
+                entropy_denominator = max_entropy.clamp_min(torch.finfo(assignment_soft.dtype).eps)
+                hard_occupancy = (counts > 0).float().mean()
                 self.last_match_stats = {
-                    "used_teacher_ratio": (counts > 0).float().mean().detach(),
+                    "used_teacher_ratio": hard_occupancy.detach(),
+                    "hard_occupancy": hard_occupancy.detach(),
                     "max_teacher_share": (counts.max() / counts.sum().clamp_min(1.0)).detach(),
                     "match_margin": margin.detach(),
-                    "assignment_churn": churn.detach(),
+                    "mean_top1_probability": mean_top1_probability.detach(),
+                    "cross_batch_assignment_churn": churn.detach(),
                     "conditional_entropy": conditional_entropy.detach(),
+                    "normalized_conditional_entropy": (conditional_entropy / entropy_denominator).detach(),
                     "marginal_entropy": marginal_entropy.detach(),
+                    "normalized_marginal_entropy": (marginal_entropy / entropy_denominator).detach(),
                     "effective_teacher_channels": marginal_entropy.exp().detach(),
                     "infomax_loss": infomax.detach(),
                 }

@@ -6,6 +6,7 @@ Baselines (kept lean):
   early         - CrisReport early dictionary (n10↔x6, attention weight)
   early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
   infomax       - dLdx/old-AT base + straight-through InfoMax channel matching
+  infomax-delayed - explicit opt-in candidate; InfoMax starts after epoch 20 with warmup
   early-tune1/2 - editable copies for hyperparameter sweeps
 
 Hyperparameters below match the previous script bit-for-bit for these recipes
@@ -18,6 +19,7 @@ Usage:
   python scripts/train_baselines.py --baseline early
   python scripts/train_baselines.py --baseline early-dldx
   python scripts/train_baselines.py --baseline infomax
+  python scripts/train_baselines.py --baseline infomax-delayed
   python scripts/train_baselines.py --baseline early-tune1,early-tune2
   python scripts/train_baselines.py --baseline all
   python scripts/train_baselines.py --baseline early --test-only
@@ -90,6 +92,9 @@ _KD_COMMON: dict[str, Any] = {
     "dict_saliency_ema": 0.9,
     "dict_attn_start_epoch": 0,
     "dict_commit_loss": 0.0,
+    # Legacy-compatible InfoMax timing: immediate, full configured gain.
+    "dict_infomax_start_epoch": 0,
+    "dict_infomax_warmup_epochs": 0,
     "pretrained": "yolo26n.pt",
     "teacher_weights": "yolo26n.pt",
 }
@@ -160,6 +165,27 @@ BASELINES: dict[str, dict[str, Any]] = {
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
     ),
+    "infomax-delayed": _kd_early(
+        name="candidate-early-infomax-st",
+        description=(
+            "EXPERIMENTAL opt-in: infomax baseline with InfoMax enabled after epoch 20 "
+            "and linearly warmed up for 10 epochs"
+        ),
+        dict_weight="saliency_dLdx",
+        dict_match="straight_through",
+        dict_match_temp=0.10,
+        dict_match_norm="l2",
+        dict_match_init="identity",
+        dict_match_grid_divisor=4,
+        dict_infomax_loss=0.01,
+        dict_infomax_marginal_weight=1.0,
+        dict_infomax_start_epoch=21,
+        dict_infomax_warmup_epochs=10,
+        dict_match_log_interval=100,
+        dict_commit_loss=0.0,
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
     # --- Sweep slots: start from known recipes; edit align / attn / weight as needed ---
     # Former early-S1a clone (0.08 / 0.25 / dLdx).
     "early-tune1": _kd_early(
@@ -183,6 +209,8 @@ BASELINES: dict[str, dict[str, Any]] = {
     ),
 }
 
+_EXPERIMENTAL_BASELINES = frozenset({"infomax-delayed"})
+
 # Old CLI names → current keys (resume/docs convenience).
 _ALIASES: dict[str, str] = {
     "kd-early": "early",
@@ -201,7 +229,7 @@ def resolve_baseline_keys(spec: str) -> list[str]:
     if not spec:
         raise ValueError("Empty --baseline")
     if spec == "all":
-        return list(BASELINES)
+        return [key for key in BASELINES if key not in _EXPERIMENTAL_BASELINES]
     keys = [_canonical(k.strip()) for k in spec.split(",") if k.strip()]
     unknown = [k for k in keys if k not in BASELINES]
     if unknown:
@@ -222,6 +250,11 @@ def build_overrides(baseline_key: str, args: argparse.Namespace) -> dict[str, An
     cfg.update(BASELINES[baseline_key])
     cfg.pop("trainer", None)
     cfg.pop("description", None)
+    if baseline_key in _EXPERIMENTAL_BASELINES:
+        cfg["name"] = (
+            f"{cfg['name']}-start{int(cfg['dict_infomax_start_epoch'])}"
+            f"-warmup{int(cfg['dict_infomax_warmup_epochs'])}"
+        )
 
     if args.epochs is not None:
         cfg["epochs"] = args.epochs

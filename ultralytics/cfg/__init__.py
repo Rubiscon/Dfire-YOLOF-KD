@@ -555,6 +555,8 @@ def check_dict_alignment(
             "dict_match_log_interval",
             "dict_infomax_loss",
             "dict_infomax_marginal_weight",
+            "dict_infomax_start_epoch",
+            "dict_infomax_warmup_epochs",
             "dict_feature_norm",
             "dict_saliency_ema",
             "dict_saliency_blur",
