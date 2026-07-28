@@ -641,6 +641,8 @@ class YOLOFDistillationModel(DetectionModel):
             return "saliency_dlda"
         if raw in {"gradcam", "saliency_gradcam"}:
             return "saliency"  # legacy Grad-CAM ablation
+        if raw in {"entropy", "entropy_spatial", "spatial_entropy", "entropy_align"}:
+            return "entropy"
         return raw
 
     def _dict_weight_needs_task_grad(self) -> bool:
@@ -909,6 +911,8 @@ class YOLOFDistillationModel(DetectionModel):
           2) EMA of that map (after freeze / when live map missing)
           3) uniform MSE
         ``dict_weight=attention`` uses A=mean_c(F²) directly (no task gradient; ablation).
+        ``dict_weight=entropy`` uses positive row entropy from spatial cross-attention
+        between the independently projected student and reorganized teacher features.
 
         Attention restriction: AT-style squared L2 on unit-normalized spatial attention
         maps — ``||A_s - A_t||_2^2`` via ``sum(dim=1).mean()``. Do **not** use elementwise
@@ -960,6 +964,8 @@ class YOLOFDistillationModel(DetectionModel):
             )
             target = t_reorg.detach()
             pred = s_proj
+            entropy_query = s_proj.detach()
+            entropy_value = t_reorg.detach()
             d_commit = d_commit + commit
             d_infomax = d_infomax + infomax
             if collect_diagnostics and module.last_match_stats:
@@ -983,6 +989,19 @@ class YOLOFDistillationModel(DetectionModel):
                         weight = ema.expand(pred.shape[0], -1, -1, -1)
             elif mode == "attention":
                 weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
+            elif mode == "entropy":
+                divisor = max(int(getattr(self.args, "dict_entropy_grid_divisor", 4)), 1)
+                grid_size = (
+                    max(int(entropy_query.shape[-2]) // divisor, 1),
+                    max(int(entropy_query.shape[-1]) // divisor, 1),
+                )
+                weight = module.spatial_entropy_weight(
+                    entropy_query,
+                    entropy_value,
+                    grid_size=grid_size,
+                    temperature=float(getattr(self.args, "dict_entropy_temp", 0.1)),
+                    floor=float(getattr(self.args, "dict_entropy_floor", 0.1)),
+                )
             # mode == "none" / unknown → uniform MSE
 
             if weight is not None:

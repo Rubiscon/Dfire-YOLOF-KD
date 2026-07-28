@@ -6,6 +6,7 @@ Baselines (kept lean):
   early         - CrisReport early dictionary (n10↔x6, attention weight)
   early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
   infomax       - dLdx/old-AT base + straight-through InfoMax channel matching
+  entropy-align - hard dictionary + positive spatial-entropy weighted align
   early-tune1/2 - editable copies for hyperparameter sweeps
 
 Hyperparameters below match the previous script bit-for-bit for these recipes
@@ -18,6 +19,7 @@ Usage:
   python scripts/train_baselines.py --baseline early
   python scripts/train_baselines.py --baseline early-dldx
   python scripts/train_baselines.py --baseline infomax
+  python scripts/train_baselines.py --baseline entropy-align
   python scripts/train_baselines.py --baseline early-tune1,early-tune2
   python scripts/train_baselines.py --baseline all
   python scripts/train_baselines.py --baseline early --test-only
@@ -159,6 +161,19 @@ BASELINES: dict[str, dict[str, Any]] = {
         dict_commit_loss=0.0,
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
+    ),
+    "entropy-align": _kd_early(
+        name="baseline-early-entropy-align",
+        description=(
+            "Hard dictionary + old spatial AT; align is weighted by positive row entropy "
+            "of pooled student/teacher spatial cross-attention"
+        ),
+        dict_weight="entropy",
+        dict_match="hard",
+        dict_entropy_temp=0.10,
+        dict_entropy_grid_divisor=4,
+        dict_entropy_floor=0.10,
+        dict_match_log_interval=100,
     ),
     # --- Sweep slots: start from known recipes; edit align / attn / weight as needed ---
     # Former early-S1a clone (0.08 / 0.25 / dLdx).

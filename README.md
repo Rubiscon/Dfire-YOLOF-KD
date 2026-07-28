@@ -85,7 +85,10 @@ python scripts/train_baselines.py --baseline early-dldx
 # 4. Straight-through InfoMax matching experiment
 python scripts/train_baselines.py --baseline infomax
 
-# Run all three in sequence
+# 5. Positive spatial-entropy weighted align
+python scripts/train_baselines.py --baseline entropy-align
+
+# Run all baselines in sequence
 python scripts/train_baselines.py --baseline all
 ```
 
@@ -100,11 +103,28 @@ attention) and changes only dictionary assignment:
 - Forward assignment is hard argmax; backward uses `A_soft` (straight-through).
 - `L_InfoMax = H(T|S) - lambda H(T)` encourages confident student-channel matches
   without collapsing all queries onto a few teacher channels.
-- Weighted align keeps the assignment graph, grounding Q/K in teacher-feature
-  reconstruction rather than allowing a semantically arbitrary balanced permutation.
+- Weighted align and AT use a detached reorganized-teacher target. Q/K are trained
+  only by commitment and InfoMax, so assignment cannot reduce align by moving its target.
 
 `dict_match_stats.csv` records occupancy, maximum teacher share, margin, dominant
 assignment churn, conditional/marginal entropy, effective teacher channels, and InfoMax loss.
+
+### Positive spatial-entropy align
+
+The `entropy-align` baseline keeps hard dictionary matching and the proven spatial-energy
+AT loss, replacing the align spatial weight with positive cross-feature entropy:
+
+- Pool the independently projected student query and reorganized teacher value features.
+- `A = softmax(Q V^T / tau, dim=2)`, with shape `(B, Nq, Nv)`.
+- `H_i = -sum_j A_ij log(A_ij)` is positive row entropy. The mentor's written
+  double-negative expression would instead produce negative entropy.
+- `H/log(Nv)` gives a resolution-independent `[0, 1]` map; a configurable positive
+  floor prevents low-entropy positions from disabling align supervision.
+- The entropy map is detached before weighting, so align optimizes the student projection
+  rather than learning to hide high-error positions.
+
+Relevant options are `dict_entropy_temp`, `dict_entropy_grid_divisor`, and
+`dict_entropy_floor`. Existing recipes are unchanged unless `dict_weight=entropy`.
 
 ### Test-split evaluation
 
@@ -247,6 +267,9 @@ python scripts/train_baselines.py --baseline early-dldx
 # 4. Straight-through InfoMax matching 实验
 python scripts/train_baselines.py --baseline infomax
 
+# 5. 正空间熵加权 align
+python scripts/train_baselines.py --baseline entropy-align
+
 # 依次运行全部
 python scripts/train_baselines.py --baseline all
 ```
@@ -260,10 +283,25 @@ python scripts/train_baselines.py --baseline all
 - 对 L2 归一化后的 Q/K 使用 `A_soft=softmax(M/tau)`；
 - 前向保持 proposal 的 hard argmax，反向通过 `A_soft`（straight-through）；
 - 最小化 `H(T|S)-lambda H(T)`，兼顾明确匹配与教师通道均衡使用；
-- weighted align 不 detach assignment，使 Q/K 同时受到语义重建约束，避免只学到任意的均衡排列。
+- weighted align 与 AT 均 detach 重组后的教师 target；Q/K 只由 commitment 和 InfoMax
+  训练，避免 assignment 通过移动 target 来虚假降低 align。
 
 训练时 `dict_match_stats.csv` 记录 occupancy、最大通道占比、margin、assignment churn、
 条件熵、边际熵、有效教师通道数及 InfoMax loss。
+
+### 正空间熵 align
+
+`entropy-align` 保留 hard dictionary matching 与已验证的 spatial-energy AT，只将 align
+空间权重替换为跨特征正熵：
+
+- 对独立投影后的学生 query 与重组教师 value 特征池化；
+- `A=softmax(Q V^T/tau, dim=2)`，其形状为 `(B,Nq,Nv)`；
+- `H_i=-sum_j A_ij log(A_ij)` 是正的逐行熵。导师文字中的双重负号会得到负熵；
+- 用 `H/log(Nv)` 归一化至 `[0,1]`，并设置正下限，避免低熵位置完全关闭 align；
+- 熵图在加权前 detach，避免模型通过压低高误差位置权重来投机。
+
+相关参数为 `dict_entropy_temp`、`dict_entropy_grid_divisor` 与
+`dict_entropy_floor`。只有设置 `dict_weight=entropy` 才会启用，原有配方不变。
 
 ### 测试集评测
 

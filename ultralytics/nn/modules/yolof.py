@@ -216,6 +216,55 @@ class DictionaryModule(nn.Module):
             marginal_entropy,
         )
 
+    @staticmethod
+    def spatial_entropy_weight(
+        query_feat: torch.Tensor,
+        value_feat: torch.Tensor,
+        grid_size: tuple[int, int],
+        temperature: float = 0.1,
+        floor: float = 0.1,
+    ) -> torch.Tensor:
+        """Build a positive spatial weight from cross-feature attention entropy.
+
+        The independently projected student and teacher features are pooled into
+        spatial tokens ``Q`` and ``V``. With ``Nq`` query and ``Nv`` value tokens:
+
+            A = softmax(Q V^T / temperature, dim=2),  A: (B, Nq, Nv)
+            H_i = -sum_j A_ij log(A_ij),              H: (B, Nq)
+
+        ``dim=2`` is the row-normalization and row-entropy axis for the batched
+        matrix. This is the positive-entropy correction of the mentor's
+        double-negative expression. Dividing by ``log(Nv)`` keeps the map in
+        [0, 1] across grid sizes; ``floor`` prevents confident rows from turning
+        off align supervision entirely.
+        """
+        if query_feat.ndim != 4 or value_feat.ndim != 4:
+            raise ValueError("Entropy weighting expects BCHW query/value features")
+        if query_feat.shape[0] != value_feat.shape[0] or query_feat.shape[1] != value_feat.shape[1]:
+            raise ValueError(
+                f"Entropy query/value must share batch and channel dimensions, got "
+                f"{tuple(query_feat.shape)} and {tuple(value_feat.shape)}"
+            )
+        temperature = max(float(temperature), 1e-6)
+        floor = min(max(float(floor), 0.0), 1.0)
+        gh, gw = max(int(grid_size[0]), 1), max(int(grid_size[1]), 1)
+
+        q = F.adaptive_avg_pool2d(query_feat.float(), (gh, gw)).flatten(2).transpose(1, 2)
+        v = F.adaptive_avg_pool2d(value_feat.float(), (gh, gw)).flatten(2).transpose(1, 2)
+        q = F.normalize(q, dim=2)
+        v = F.normalize(v, dim=2)
+        attention = F.softmax((q @ v.transpose(1, 2)) / temperature, dim=2)
+        entropy = -(attention * attention.clamp_min(1e-10).log()).sum(dim=2)
+
+        num_values = attention.shape[2]
+        if num_values > 1:
+            entropy = entropy / math.log(num_values)
+        else:
+            entropy = torch.ones_like(entropy)
+        entropy = entropy.clamp(0.0, 1.0)
+        weight = floor + (1.0 - floor) * entropy
+        return weight.reshape(query_feat.shape[0], 1, gh, gw)
+
     def forward(self, t_feat: torch.Tensor, s_feat: torch.Tensor, collect_diagnostics: bool = False):
         """Return (s_proj, t_reorg, commit_loss, infomax_loss).
 

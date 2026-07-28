@@ -559,6 +559,9 @@ def check_dict_alignment(
             "dict_saliency_ema",
             "dict_saliency_blur",
             "dict_saliency_clip",
+            "dict_entropy_temp",
+            "dict_entropy_grid_divisor",
+            "dict_entropy_floor",
             "dict_letterbox_mask",
             "teacher_val_interval",
         }
