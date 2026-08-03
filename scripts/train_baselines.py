@@ -4,18 +4,19 @@ Baselines (kept lean):
   yolo26n       - YOLO26n FPN upper bound
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
   early         - CrisReport early dictionary (n10↔x6, attention weight)
-  early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
+  early-dldx    - saliency_dLdx + mean norm + mass-normalized align (0.12/0.25)
   early-tune1/2 - editable copies for hyperparameter sweeps
 
-Hyperparameters below match the previous script bit-for-bit for these recipes
-(pretrained / batch / teacher_weights / KD gains). Sweep entries (early-B..T3,
-kd-p0, …) were removed; use early-tune* instead.
+Opt-in (not in --baseline all):
+  early-dldx-minmax / early-dldx-resgate / early-dldx-030
 
 Usage:
   python scripts/train_baselines.py --baseline yolo26n
   python scripts/train_baselines.py --baseline dcn-solo
   python scripts/train_baselines.py --baseline early
   python scripts/train_baselines.py --baseline early-dldx
+  python scripts/train_baselines.py --baseline early-dldx-minmax
+  python scripts/train_baselines.py --baseline early-dldx-resgate
   python scripts/train_baselines.py --baseline early-tune1,early-tune2
   python scripts/train_baselines.py --baseline all
   python scripts/train_baselines.py --baseline early --test-only
@@ -131,34 +132,80 @@ BASELINES: dict[str, dict[str, Any]] = {
         name="baseline-kd-early",
         description="CrisReport early dictionary: n10↔x6, hard match, attention weight, pretrained student",
     ),
-    # Former early-S1a (hyperparams unchanged).
+    # Default dLdx: mass-normalized align + N-line mean weights @ proven 0.12/0.25.
     "early-dldx": _kd_early(
-        name="baseline-early-S1a-dLdx",
-        description="early + saliency_dLdx (mean_c|∂J_task/∂x^e|); blur/clip off",
+        name="baseline-early-dLdx",
+        description="saliency_dLdx + mean weight norm + mass-normalized align; βd=0.12 βAT=0.25",
         dict_weight="saliency_dLdx",
+        dict_align_loss=0.12,
+        dict_attn_loss=0.25,
+        dict_weight_norm="mean",
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
+        dict_saliency_residual_gate=False,
+        dict_weight_log_interval=1,
+    ),
+    # Controlled minmax ablation at the same β (not in --baseline all).
+    "early-dldx-minmax": _kd_early(
+        name="candidate-early-dLdx-minmax",
+        description="OPT-IN A/B: same as early-dldx but dict_weight_norm=minmax",
+        dict_weight="saliency_dLdx",
+        dict_align_loss=0.12,
+        dict_attn_loss=0.25,
+        dict_weight_norm="minmax",
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+        dict_saliency_residual_gate=False,
+        dict_weight_log_interval=1,
+    ),
+    # Opt-in residual-gated saliency (S * stopgrad(R)) at default β.
+    "early-dldx-resgate": _kd_early(
+        name="candidate-early-dLdx-resgate",
+        description="OPT-IN: saliency_dLdx_residual gate; mean norm; βd=0.12 βAT=0.25",
+        dict_weight="saliency_dLdx_residual",
+        dict_align_loss=0.12,
+        dict_attn_loss=0.25,
+        dict_weight_norm="mean",
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+        dict_saliency_residual_gate=True,
+        dict_weight_log_interval=1,
+    ),
+    # Optional mAP50-95 chase matching historical 0.12-0.30_N.
+    "early-dldx-030": _kd_early(
+        name="candidate-early-dLdx-030",
+        description="OPT-IN: early-dldx with βAT=0.30 (historical N-line mAP50-95 peak)",
+        dict_weight="saliency_dLdx",
+        dict_align_loss=0.12,
+        dict_attn_loss=0.30,
+        dict_weight_norm="mean",
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+        dict_saliency_residual_gate=False,
+        dict_weight_log_interval=1,
     ),
     # --- Sweep slots: start from known recipes; edit align / attn / weight as needed ---
-    # Former early-S1a clone (0.08 / 0.25 / dLdx).
     "early-tune1": _kd_early(
         name="baseline-early-tune1",
-        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as early-dldx)",
+        description="TUNABLE: starts as early-dldx (0.12/0.25/mean)",
         dict_weight="saliency_dLdx",
-        dict_align_loss=0.08,
+        dict_align_loss=0.12,
         dict_attn_loss=0.25,
+        dict_weight_norm="mean",
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
+        dict_saliency_residual_gate=False,
     ),
-    # Former early-SA3 (0.10 / 0.25 / dLdx) — historical best gate λ pair.
     "early-tune2": _kd_early(
         name="baseline-early-tune2",
-        description="TUNABLE: edit dict_align_loss / dict_attn_loss / dict_weight (starts as align=0.10, attn=0.25, dLdx)",
+        description="TUNABLE: starts as 0.10/0.25 dLdx mean (historical SA3 λ pair)",
         dict_weight="saliency_dLdx",
         dict_align_loss=0.10,
         dict_attn_loss=0.25,
+        dict_weight_norm="mean",
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
+        dict_saliency_residual_gate=False,
     ),
 }
 
@@ -168,6 +215,9 @@ _ALIASES: dict[str, str] = {
     "early-S1a": "early-dldx",
     "early-SA3": "early-tune2",
 }
+
+# Ablation / chase recipes — available by name but excluded from ``--baseline all``.
+_OPTIN_BASELINES = frozenset({"early-dldx-minmax", "early-dldx-resgate", "early-dldx-030"})
 
 
 def _canonical(key: str) -> str:
@@ -180,7 +230,7 @@ def resolve_baseline_keys(spec: str) -> list[str]:
     if not spec:
         raise ValueError("Empty --baseline")
     if spec == "all":
-        return list(BASELINES)
+        return [k for k in BASELINES if k not in _OPTIN_BASELINES]
     keys = [_canonical(k.strip()) for k in spec.split(",") if k.strip()]
     unknown = [k for k in keys if k not in BASELINES]
     if unknown:
@@ -266,6 +316,33 @@ def train_baseline(baseline_key: str, args: argparse.Namespace) -> Path:
     return best
 
 
+# Ladder validation protocol (late-window ep150–200, ≥2 seeds). See plan A1/A2/B1.
+DLDX_VALIDATION_LADDER: list[tuple[str, str]] = [
+    ("L1", "early-dldx"),  # mass-norm + mean @0.12/0.25
+    ("L2", "early-dldx-minmax"),  # same β, minmax ablation
+    ("L3", "early-dldx-resgate"),  # only after L1 beats historical M/D_dldx late window
+]
+
+
+def print_dldx_validation_ladder() -> None:
+    """Print staged A/B commands for mass-norm / mean / residual-gate validation."""
+    print("dLdx validation ladder (compare late mAP ep150–200; do not chase single best 0.736):")
+    print("  L0 baseline (already logged): D_dldx_0.12-0.25 / 0.12-0.25_M1  [minmax + naive .mean()]")
+    for stage, key in DLDX_VALIDATION_LADDER:
+        cfg = BASELINES[key]
+        print(
+            f"  {stage}: python scripts/train_baselines.py --baseline {key}"
+            f"  # {cfg.get('description', '')}"
+        )
+        print(
+            f"       expected knobs: weight={cfg.get('dict_weight')} "
+            f"norm={cfg.get('dict_weight_norm')} "
+            f"βd={cfg.get('dict_align_loss')} βAT={cfg.get('dict_attn_loss')}"
+        )
+    print("  Optional mAP50-95 chase: --baseline early-dldx-030")
+    print("Success L1: late95≥0.4085 and late50≥0.731; L1 late95 > L2; then try L3.")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="D-Fire unified baseline training (train/val/test split)")
     parser.add_argument(
@@ -298,11 +375,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="run test-split val() immediately after each training run",
     )
+    parser.add_argument(
+        "--list-ladder",
+        action="store_true",
+        help="print the dLdx mass-norm / mean / residual-gate validation ladder and exit",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.list_ladder:
+        print_dldx_validation_ladder()
+        return
     try:
         keys = resolve_baseline_keys(args.baseline)
     except ValueError as exc:

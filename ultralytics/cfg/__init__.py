@@ -553,7 +553,9 @@ def check_dict_alignment(
             "dict_saliency_ema",
             "dict_saliency_blur",
             "dict_saliency_clip",
+            "dict_saliency_residual_gate",
             "dict_letterbox_mask",
+            "dict_weight_norm",
             "dict_weight_log_interval",
             "teacher_val_interval",
         }

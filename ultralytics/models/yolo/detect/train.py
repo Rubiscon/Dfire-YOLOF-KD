@@ -605,6 +605,7 @@ class YOLOFDistillationModel(DetectionModel):
     _SALIENCY_GRAD_MODES = frozenset(
         {
             "saliency_dldx",
+            "saliency_dldx_residual",
             "saliency",
             "saliency_dlda",
             "saliency_dlda_gate",
@@ -621,8 +622,11 @@ class YOLOFDistillationModel(DetectionModel):
 
         Longer ``dLdA_*`` / ``dLdx`` suffixes are matched before bare ``dLdA`` so
         ``saliency_dLdA_gate`` is not collapsed to ``saliency_dlda``.
+        ``saliency_dLdx_residual`` is checked before bare ``dldx`` aliases.
         """
         raw = str(getattr(args, "dict_weight", "saliency_dLdx") or "saliency_dLdx").lower().replace("-", "_")
+        if raw in {"dldx_residual", "saliency_dldx_residual", "xe_residual"} or raw.endswith("dldx_residual"):
+            return "saliency_dldx_residual"
         if raw in {"dldx", "saliency_dldx", "xe", "saliency_xe"} or raw.endswith("dldx"):
             return "saliency_dldx"
         if raw in {"dlda_gate", "saliency_dlda_gate", "gate"} or raw.endswith("dlda_gate"):
@@ -638,6 +642,23 @@ class YOLOFDistillationModel(DetectionModel):
     def _dict_weight_needs_task_grad(self) -> bool:
         """True if weighted align needs ∂J/∂x^e from a teacher task-loss graph."""
         return self._dict_weight_mode(self.args) in self._SALIENCY_GRAD_MODES
+
+    def _dict_weight_norm_mode(self) -> str:
+        """Spatial weight normalization; ``mean`` preserves the proven N-line formula."""
+        mode = str(getattr(self.args, "dict_weight_norm", "mean") or "mean").lower()
+        if mode not in {"mean", "minmax"}:
+            raise ValueError(f"Unknown dict_weight_norm={mode!r}; expected mean or minmax")
+        return mode
+
+    def _dict_saliency_residual_gate(self) -> bool:
+        """Opt-in gate: multiply saliency by stopgrad spatial residual before norm."""
+        mode = self._dict_weight_mode(self.args)
+        if mode == "saliency_dldx_residual":
+            return True
+        raw = getattr(self.args, "dict_saliency_residual_gate", False)
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"1", "true", "on", "yes"}
+        return bool(raw)
 
     @staticmethod
     def _build_xe_saliency(g: torch.Tensor) -> torch.Tensor:
@@ -836,15 +857,92 @@ class YOLOFDistillationModel(DetectionModel):
                 valid = valid.expand(-1, weight.shape[1], -1, -1)
             valid = valid.to(device=weight.device, dtype=torch.bool)
 
+        # float32 extrema: fp16 amin/amax over large maps is fine, but keep arithmetic
+        # consistent with mean-norm / mass-norm hardening under AMP.
+        w32 = weight.float()
         has_content = valid.any(dim=(2, 3), keepdim=True)
-        w_min = weight.masked_fill(~valid, torch.inf).amin(dim=(2, 3), keepdim=True)
-        w_max = weight.masked_fill(~valid, -torch.inf).amax(dim=(2, 3), keepdim=True)
+        w_min = w32.masked_fill(~valid, torch.inf).amin(dim=(2, 3), keepdim=True)
+        w_max = w32.masked_fill(~valid, -torch.inf).amax(dim=(2, 3), keepdim=True)
         w_min = torch.where(has_content, w_min, torch.zeros_like(w_min))
         w_max = torch.where(has_content, w_max, torch.zeros_like(w_max))
         span = w_max - w_min
-        normalized = (weight - w_min) / span.clamp_min(eps)
+        normalized = (w32 - w_min) / span.clamp_min(eps)
         normalized = torch.where(span > eps, normalized, torch.ones_like(normalized))
-        return torch.where(valid & has_content, normalized, torch.zeros_like(normalized))
+        out = torch.where(valid & has_content, normalized, torch.zeros_like(normalized))
+        return out.to(dtype=weight.dtype)
+
+    @staticmethod
+    def _content_values(x: torch.Tensor, content_mask: torch.Tensor | None) -> torch.Tensor:
+        """Flatten content pixels only, resizing a letterbox mask when supplied."""
+        if content_mask is None:
+            return x.flatten()
+        mask = content_mask
+        if mask.shape[-2:] != x.shape[-2:]:
+            mask = F.interpolate(mask.float(), size=x.shape[-2:], mode="nearest")
+        if mask.shape[0] == 1 and x.shape[0] > 1:
+            mask = mask.expand(x.shape[0], -1, -1, -1)
+        elif mask.shape[0] != x.shape[0]:
+            mask = mask[: x.shape[0]]
+        return x[mask.to(device=x.device) > 0.5]
+
+    def _normalize_dict_weight(
+        self,
+        weight: torch.Tensor,
+        mode: str,
+        content_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Normalize a masked spatial weight map per image.
+
+        ``mean`` matches the N-line formula (mask pads to zero, then divide by the
+        full-map mean so zero pads dilute the denominator and boost content). ``minmax``
+        is the content-aware ablation kept for controlled comparisons.
+
+        Mean reduction runs in float32: under AMP, ``mean``/``sum`` over large ``B·H·W``
+        (e.g. batch 112, 80×80) overflows float16 and collapses weights to NaN/Inf.
+        """
+        if mode == "mean":
+            weight = self._apply_content_mask(weight, content_mask)
+            w32 = weight.float()
+            return (w32 / w32.mean(dim=(2, 3), keepdim=True).clamp_min(1e-12)).to(dtype=weight.dtype)
+        return self._minmax_normalize_weight(weight, content_mask)
+
+    @staticmethod
+    def _mass_normalized_weighted_mse(weight: torch.Tensor, residual: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        """Reduce weighted MSE as sum(w·r̄) / sum(w) without channel/AMP scale bugs.
+
+        ``residual`` is (B,C,H,W); ``weight`` is (B,1,H,W). Channel-mean first keeps the
+        same scale as historical ``(w * r).mean()`` when ``mean(w)≈1``. Using
+        ``sum(w*r)/sum(w)`` without that mean multiplies the loss by ``C``
+        (observed: dict_loss ~1.6 → ~400 for C=256).
+
+        All reductions run in float32: ``weight.sum()`` in float16 overflows for typical
+        KD shapes (batch 112, ≥40×40 feature maps) and yields Inf/NaN dict loss.
+        """
+        if weight.ndim != 4 or weight.shape[1] != 1:
+            raise ValueError(f"Expected weight (B,1,H,W), got {tuple(weight.shape)}")
+        if residual.ndim != 4 or residual.shape[0] != weight.shape[0] or residual.shape[-2:] != weight.shape[-2:]:
+            raise ValueError(
+                f"residual shape {tuple(residual.shape)} incompatible with weight {tuple(weight.shape)}"
+            )
+        w32 = weight.float()
+        spatial = residual.float().mean(dim=1, keepdim=True)
+        den = w32.sum().clamp_min(eps)
+        if float(den) <= eps:
+            return residual.new_zeros(())
+        out = (w32 * spatial).sum() / den
+        return out.to(dtype=residual.dtype)
+
+    @staticmethod
+    def _pearson_corr(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-12) -> float:
+        """Pearson correlation of two flat tensors; 0 if either side has no variance."""
+        if a.numel() == 0 or b.numel() == 0 or a.numel() != b.numel():
+            return 0.0
+        a = a.flatten().float()
+        b = b.flatten().float()
+        a = a - a.mean()
+        b = b - b.mean()
+        denom = (a.norm() * b.norm()).clamp_min(eps)
+        return float((a * b).sum() / denom)
 
     @staticmethod
     def _dict_weight_summary(
@@ -884,6 +982,14 @@ class YOLOFDistillationModel(DetectionModel):
             has_content = valid.any(dim=(2, 3))
             constant = has_content & ((raw_max - raw_min) <= eps)
             fallback_ratio = constant.float().sum() / has_content.float().sum().clamp_min(1.0)
+            # float32 mass: content-only sum in fp16 overflows for batch112 × large maps.
+            weight_mass = (
+                float(normalized_weight.detach().float()[valid].sum()) if values.numel() else 0.0
+            )
+            spatial = float(normalized_weight.shape[0] * normalized_weight.shape[2] * normalized_weight.shape[3])
+            # Under mass-norm reduction this is NOT a multiplier on βd; it only reports how
+            # sparse the normalized map is relative to a dense mean(w)=1 field (useful for
+            # minmax A/B). Mean-norm maps stay ≈1.0 by construction.
             return {
                 "weight_min": float(v_min),
                 "weight_max": float(v_max),
@@ -893,6 +999,8 @@ class YOLOFDistillationModel(DetectionModel):
                 "weight_nonzero_ratio": float(nonzero),
                 "constant_fallback_ratio": float(fallback_ratio),
                 "content_mask_ratio": float(valid.float().mean()),
+                "weight_mass": weight_mass,
+                "effective_beta_scale": weight_mass / max(spatial, 1.0),
             }
 
     def _letterbox_mask_enabled(self) -> bool:
@@ -908,8 +1016,9 @@ class YOLOFDistillationModel(DetectionModel):
         """Spatial weight maps for dictionary align from teacher task gradients.
 
         Modes (``dict_weight``):
-          - ``saliency_dLdx`` (preferred, advisor/proposal intent):
+          - ``saliency_dLdx`` / ``saliency_dLdx_residual`` (preferred):
                 g = ∂J_task/∂x^e on teacher tap,  S = mean_c(|g|)
+                (residual gating is applied later in ``_dictionary_losses``)
           - ``saliency`` / Grad-CAM (ablation):
                 α_c = GAP(∂J/∂x^e_c),  S = ReLU(Σ_c α_c x^e_c)
           - ``saliency_dLdA`` / ``_gate`` / ``_absF`` (ablation):
@@ -933,7 +1042,7 @@ class YOLOFDistillationModel(DetectionModel):
                 continue
             f_f = f.float()
             g_f = g.float()
-            if mode == "saliency_dldx":
+            if mode in {"saliency_dldx", "saliency_dldx_residual"}:
                 cam = self._build_xe_saliency(g_f)
             elif mode in {"saliency_dlda", "saliency_dlda_gate", "saliency_dlda_absf"}:
                 cam = self._build_dlda_saliency(f_f, g_f, mode)
@@ -979,11 +1088,17 @@ class YOLOFDistillationModel(DetectionModel):
 
         Weighted align: task-saliency-weighted MSE between projected student tap and
         dictionary-reorganized teacher feature. Weight priority for task-grad modes
-        (``saliency_dLdx``, ``saliency``, ``saliency_dLdA*``):
+        (``saliency_dLdx``, ``saliency_dLdx_residual``, ``saliency``, ``saliency_dLdA*``):
           1) live map from the joint-phase throwaway pass
           2) EMA of that map (after freeze / when live map missing)
           3) uniform MSE
         ``dict_weight=attention`` uses A=mean_c(F²) directly (no task gradient; ablation).
+
+        Spatial weights are normalized with ``dict_weight_norm`` (default ``mean``, N-line)
+        and reduced as ``sum(w·r̄)/sum(w)`` where ``r̄ = mean_c(r)`` so (1) letterbox
+        zeros / minmax sparsity do not dilute ``dict_align_loss``, and (2) the loss stays
+        O(1) rather than scaling with channel count C. Opt-in residual gating multiplies
+        saliency by stopgrad spatial residual before normalization.
 
         Attention restriction: AT-style squared L2 on unit-normalized spatial attention
         maps — ``||A_s - A_t||_2^2`` via ``sum(dim=1).mean()``. Do **not** use elementwise
@@ -1002,7 +1117,9 @@ class YOLOFDistillationModel(DetectionModel):
             return zero, zero, zero
 
         mode = self._dict_weight_mode(self.args)
-        norm = self._dict_norm_mode()
+        feat_norm = self._dict_norm_mode()
+        weight_norm = self._dict_weight_norm_mode()
+        residual_gate = self._dict_saliency_residual_gate()
         # Grad-CAM / analytic |∂L/∂A| family share the same cache + EMA path.
         use_grad_map = mode in self._SALIENCY_GRAD_MODES
         if saliency is None:
@@ -1014,6 +1131,8 @@ class YOLOFDistillationModel(DetectionModel):
         uniform_align = zero.clone()
         weight_summaries: List[Dict[str, float]] = []
         weight_sources = set()
+        residual_corrs: List[float] = []
+        gate_sparsities: List[float] = []
         collect_stats = bool(self._collect_dict_stats)
         n = 0
         for j, li in enumerate(self._dict_teacher_layers):
@@ -1028,10 +1147,10 @@ class YOLOFDistillationModel(DetectionModel):
             pred = s_proj
             d_commit = d_commit + commit
 
-            if norm == "l2":
+            if feat_norm == "l2":
                 pred = F.normalize(pred, dim=1)
                 target = F.normalize(target, dim=1)
-            elif norm == "channel":
+            elif feat_norm == "channel":
                 pred = self._channel_standardize(pred)
                 target = self._channel_standardize(target)
 
@@ -1054,18 +1173,40 @@ class YOLOFDistillationModel(DetectionModel):
             # mode == "none" / unknown → uniform MSE
 
             residual = (pred - target) ** 2
+            spatial_residual = residual.detach().float().mean(dim=1, keepdim=True)
             if collect_stats:
                 uniform_align = uniform_align + residual.mean()
             if weight is not None:
                 weight = weight.float()
                 if weight.shape[-2:] != pred.shape[-2:]:
                     weight = F.interpolate(weight, size=pred.shape[-2:], mode="bilinear", align_corners=False)
-                raw_weight = weight
                 content_mask = getattr(self, "_content_mask", None)
-                weight = self._minmax_normalize_weight(raw_weight, content_mask).to(pred.dtype).detach()
-                d_align = d_align + (weight * residual).mean()
+                saliency_pre_gate = weight
+                if residual_gate:
+                    if collect_stats:
+                        residual_corrs.append(
+                            self._pearson_corr(
+                                self._content_values(saliency_pre_gate, content_mask),
+                                self._content_values(spatial_residual, content_mask),
+                            )
+                        )
+                    # float32 gate multiply: fp16 saliency * residual can flush/overflow before norm.
+                    weight = (weight.float() * spatial_residual.float()).to(dtype=weight.dtype)
+                raw_weight = weight
+                weight = self._normalize_dict_weight(raw_weight, weight_norm, content_mask).detach()
+                d_align = d_align + self._mass_normalized_weighted_mse(weight, residual)
                 if collect_stats:
-                    weight_summaries.append(self._dict_weight_summary(raw_weight, weight, content_mask))
+                    summary = self._dict_weight_summary(raw_weight, weight, content_mask)
+                    if residual_gate:
+                        gated = (saliency_pre_gate * spatial_residual).detach()
+                        if content_mask is not None:
+                            gated_vals = self._content_values(gated, content_mask)
+                        else:
+                            gated_vals = gated.flatten()
+                        gate_sparsities.append(
+                            float((gated_vals <= 1e-12).float().mean()) if gated_vals.numel() else 0.0
+                        )
+                    weight_summaries.append(summary)
             else:
                 d_align = d_align + residual.mean()
                 if collect_stats:
@@ -1095,7 +1236,14 @@ class YOLOFDistillationModel(DetectionModel):
                     "weight_source": "+".join(sorted(weight_sources)),
                     "teacher_source": self._teacher_weight_source,
                     "dict_weight_mode": mode,
-                    "dict_weight_norm": "minmax",
+                    "dict_weight_norm": weight_norm,
+                    "residual_gate": float(residual_gate),
+                    "saliency_residual_corr": (
+                        sum(residual_corrs) / len(residual_corrs) if residual_corrs else 0.0
+                    ),
+                    "gate_sparsity": (
+                        sum(gate_sparsities) / len(gate_sparsities) if gate_sparsities else 0.0
+                    ),
                     "weighted_uniform_mse_ratio": float(
                         (d_align.detach() / uniform_align.detach().clamp_min(1e-12)).cpu()
                     ),
@@ -1488,6 +1636,7 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         "teacher_source",
         "dict_weight_mode",
         "dict_weight_norm",
+        "residual_gate",
         "weight_min",
         "weight_max",
         "weight_span",
@@ -1496,6 +1645,10 @@ class YOLOFDistillationTrainer(DetectionTrainer):
         "weight_nonzero_ratio",
         "constant_fallback_ratio",
         "content_mask_ratio",
+        "weight_mass",
+        "effective_beta_scale",
+        "saliency_residual_corr",
+        "gate_sparsity",
         "weighted_uniform_mse_ratio",
         "raw_align_loss",
         "weighted_align_loss",
