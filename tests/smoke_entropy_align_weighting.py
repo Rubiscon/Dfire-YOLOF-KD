@@ -43,7 +43,7 @@ args = SimpleNamespace(
     dict_match_norm="l2",
     dict_match_init="identity",
     dict_match_grid_divisor=16,
-    dict_match_log_interval=0,
+    dict_match_log_interval=1,
     dict_feature_norm="channel",
     dict_saliency_ema=0.9,
     dict_saliency_blur=0.0,
@@ -51,6 +51,7 @@ args = SimpleNamespace(
     dict_entropy_temp=0.1,
     dict_entropy_grid_divisor=4,
     dict_entropy_floor=0.1,
+    dict_weight_norm="mean",
     max_det=300,
     box=7.5,
     cls=0.5,
@@ -84,7 +85,11 @@ batch = {
 }
 total, items = model.loss(batch)
 assert torch.isfinite(total).all() and torch.isfinite(items).all()
+assert items.numel() == 10  # keep trainer loss_names/results.csv dimensionality stable
 assert float(items[5]) > 0.0
+assert model.last_dict_weight_stats is not None
+assert model.last_dict_weight_stats["weight_mode"] == "entropy"
+assert model.last_dict_weight_stats["weight_norm"] == "mean"
 total.backward()
 
 proj_grads = [parameter.grad for parameter in module.proj.parameters() if parameter.requires_grad]
