@@ -5,6 +5,7 @@ Baselines (kept lean):
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
   early         - CrisReport early dictionary (n10↔x6, attention weight)
   early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
+  early-dldx-offline - controlled related-work run with a shared frozen teacher
   infomax       - dLdx/old-AT base + straight-through InfoMax channel matching
   entropy-align - hard dictionary + positive spatial-entropy weighted align
   entropy-align-minmax / entropy-inverse / dldx-entropy-gate - opt-in entropy candidates
@@ -64,6 +65,46 @@ COMMON: dict[str, Any] = {
 
 DEFAULT_BATCH = 112  # solo / KD when VRAM allows (matches n_kd_n_batch112)
 DEFAULT_KD_BATCH = 112  # proven KD recipe; drop with --batch if saliency OOM
+
+# Shared controlled related-work augmentation: centered 640 letterbox plus
+# horizontal flip only. Structural KD and GID wrappers use the same transform.
+_CONTROLLED_AUG: dict[str, Any] = {
+    "mosaic": 0.0,
+    "mixup": 0.0,
+    "cutmix": 0.0,
+    "copy_paste": 0.0,
+    "degrees": 0.0,
+    "translate": 0.0,
+    "scale": 0.0,
+    "shear": 0.0,
+    "perspective": 0.0,
+    "hsv_h": 0.0,
+    "hsv_s": 0.0,
+    "hsv_v": 0.0,
+    "flipud": 0.0,
+    "fliplr": 0.5,
+    "augmentations": [],
+}
+
+_CONTROLLED_OPT: dict[str, Any] = {
+    # A common optimizer is used across all framework ports. Explicit SGD
+    # avoids framework-specific MuSGD/Muon grouping from becoming a confounder.
+    # Physical batch 112 on one GPU; no gradient accumulation.
+    "batch": 112,
+    "optimizer": "SGD",
+    "lr0": 0.01,
+    "lrf": 0.01,
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "nbs": 112,
+    "fixed_accumulate": False,
+    # 100 optimizer updates warmup over ceil(14122/112)=127 steps/epoch.
+    "warmup_epochs": 100.0 / 127.0,
+    "warmup_momentum": 0.9,
+    "warmup_bias_lr": 0.0,
+    "cos_lr": False,
+    "amp": False,
+}
 
 # Shared online KD — aligned to Log/n_kd_n_batch112 (best mAP50≈0.728).
 _KD_COMMON: dict[str, Any] = {
@@ -131,6 +172,19 @@ BASELINES: dict[str, dict[str, Any]] = {
         "pretrained": "yolo26n.pt",
         "description": "YOLO26n-DCN (YOLOF head) without distillation",
     },
+    "dcn-solo-controlled": {
+        "trainer": "detect",
+        "model": "yolo26n-DCN.yaml",
+        "name": "controlled-dcn-solo-letterbox-flip",
+        "batch": DEFAULT_BATCH,
+        "pretrained": None,
+        **_CONTROLLED_AUG,
+        **_CONTROLLED_OPT,
+        "description": (
+            "CONTROLLED RELATED-WORK SOLO: shared initialization and "
+            "letterbox+horizontal-flip augmentation; requires --student-weights"
+        ),
+    },
     # Former kd-early / early-3 attention recipe (hyperparams unchanged).
     "early": _kd_early(
         name="baseline-kd-early",
@@ -140,6 +194,24 @@ BASELINES: dict[str, dict[str, Any]] = {
     "early-dldx": _kd_early(
         name="baseline-early-S1a-dLdx",
         description="early + saliency_dLdx (mean_c|∂J_task/∂x^e|); blur/clip off",
+        dict_weight="saliency_dLdx",
+        dict_saliency_blur=0.0,
+        dict_saliency_clip=0.0,
+    ),
+    "early-dldx-offline": _kd_early(
+        name="controlled-early-S1a-dLdx-offline",
+        description=(
+            "CONTROLLED RELATED-WORK RUN: early-dLdx with a shared frozen D-Fire teacher; "
+            "requires --teacher-weights and --student-weights"
+        ),
+        online_distill=False,
+        teacher_freeze_epoch=0,
+        teacher_freeze_use_ema=False,
+        teacher_task_loss=0.0,
+        teacher_weights=None,
+        pretrained=None,
+        **_CONTROLLED_AUG,
+        **_CONTROLLED_OPT,
         dict_weight="saliency_dLdx",
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
@@ -285,6 +357,40 @@ def build_overrides(baseline_key: str, args: argparse.Namespace) -> dict[str, An
         cfg["device"] = args.device
     if args.workers is not None:
         cfg["workers"] = args.workers
+    if args.teacher_weights:
+        cfg["teacher_weights"] = args.teacher_weights
+    if args.student_weights:
+        cfg["pretrained"] = args.student_weights
+    if baseline_key in {"early-dldx-offline", "dcn-solo-controlled"}:
+        missing = [
+            flag
+            for flag, value in (
+                (
+                    "--teacher-weights",
+                    cfg.get("teacher_weights")
+                    if baseline_key == "early-dldx-offline"
+                    else True,
+                ),
+                ("--student-weights", cfg.get("pretrained")),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "early-dldx-offline requires explicit controlled checkpoints: "
+                + ", ".join(missing)
+            )
+        student_path = Path(str(cfg["pretrained"]))
+        teacher_path = (
+            Path(str(cfg["teacher_weights"]))
+            if baseline_key == "early-dldx-offline"
+            else None
+        )
+        if (teacher_path is not None and not teacher_path.is_file()) or not student_path.is_file():
+            raise FileNotFoundError(
+                "Controlled checkpoint not found: "
+                f"teacher={teacher_path} student_init={student_path}"
+            )
     if args.name_suffix:
         cfg["name"] = f"{cfg['name']}-{args.name_suffix}"
     if args.resume:
@@ -354,6 +460,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=None, help="override batch size")
     parser.add_argument("--device", default=None, help="cuda device id or 'cpu'")
     parser.add_argument("--workers", type=int, default=None, help="dataloader workers")
+    parser.add_argument(
+        "--teacher-weights",
+        default="",
+        help="shared frozen D-Fire teacher checkpoint for controlled KD runs",
+    )
+    parser.add_argument(
+        "--student-weights",
+        default="",
+        help="canonical YOLO26n initialization checkpoint for controlled student runs",
+    )
     parser.add_argument("--name-suffix", default="", help="append to run name, e.g. 'ep150'")
     parser.add_argument("--resume", action="store_true", help="resume from last.pt in the run directory")
     parser.add_argument(

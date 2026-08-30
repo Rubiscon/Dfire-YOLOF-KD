@@ -457,7 +457,10 @@ class BaseTrainer:
                 ni = i + nb * epoch
                 if ni <= nw:
                     xi = [0, nw]  # x interp
-                    self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
+                    if not self.args.fixed_accumulate:
+                        self.accumulate = max(
+                            1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round())
+                        )
                     for x in self.optimizer.param_groups:
                         # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                         x["lr"] = np.interp(

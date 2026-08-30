@@ -4,10 +4,10 @@
 path: ./datasets/D-Fire/data
 train: train/images
 val: val/images
-test: test/images
+test: tests/images
 
 nc: 2
 
 names:
-  0: class0
-  1: class1
+  0: smoke
+  1: fire

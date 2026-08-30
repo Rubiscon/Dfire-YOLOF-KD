@@ -7,7 +7,7 @@
 #   ├── val/
 #   │   ├── images/
 #   │   └── labels/
-#   └── test/
+#   └── tests/          # some dumps use this name instead of test/
 #       ├── images/
 #       └── labels/
 #
@@ -16,8 +16,8 @@
 path:  ./datasets/D-Fire/data
 train: train/images
 val: val/images
-test: test/images
+test: tests/images
 
 names:
-  0: class0
-  1: class1
+  0: smoke
+  1: fire
