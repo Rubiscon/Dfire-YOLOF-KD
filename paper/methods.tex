@@ -50,11 +50,11 @@ S=\mathrm{mean}_{c}\left|\frac{\partial \mathcal{L}_t}{\partial x^{e}}\right|,\q
 W=\frac{S}{\mathrm{mean}(S)}.
 \end{equation}
 Letterbox pads are zeroed and \(W\) is detached.
-After standardizing each channel over space,
+After standardizing each channel over space, let \(\bar{r}=\mathrm{mean}_{c}\bigl((\hat{s}_{\mathrm{proj}}-\hat{\tilde{x}}^{e})^{\odot 2}\bigr)\).
 \begin{equation}
 \label{eq:ldict}
 \mathcal{L}_{\mathrm{dict}}
-=\mathrm{mean}\bigl(W\odot(\hat{s}_{\mathrm{proj}}-\hat{\tilde{x}}^{e})^{2}\bigr).
+=\frac{\sum_{b,h,w} W_{b,h,w}\,\bar{r}_{b,h,w}}{\sum_{b,h,w} W_{b,h,w}}.
 \end{equation}
 
 \subsection{Receptive-Field Matching}

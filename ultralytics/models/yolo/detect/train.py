@@ -968,6 +968,28 @@ class YOLOFDistillationModel(DetectionModel):
         return out
 
     @staticmethod
+    def _mass_normalized_weighted_mse(weight: torch.Tensor, residual: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+        """Reduce weighted MSE as sum(w·r̄)/sum(w).
+
+        ``residual`` is (B,C,H,W); ``weight`` is (B,1,H,W). Channel-mean first keeps the
+        same scale as ``(w * r).mean()`` when ``mean(w)≈1``. Skipping that mean multiplies
+        the loss by C. Reductions run in float32 so AMP ``weight.sum()`` does not overflow
+        at batch 112 and 40×40 maps.
+        """
+        if weight.ndim != 4 or weight.shape[1] != 1:
+            raise ValueError(f"Expected weight (B,1,H,W), got {tuple(weight.shape)}")
+        if residual.ndim != 4 or residual.shape[0] != weight.shape[0] or residual.shape[-2:] != weight.shape[-2:]:
+            raise ValueError(
+                f"residual shape {tuple(residual.shape)} incompatible with weight {tuple(weight.shape)}"
+            )
+        w32 = weight.float()
+        spatial = residual.float().mean(dim=1, keepdim=True)
+        den = w32.sum().clamp_min(eps)
+        if float(den) <= eps:
+            return residual.new_zeros(())
+        return ((w32 * spatial).sum() / den).to(dtype=residual.dtype)
+
+    @staticmethod
     def _pearson_corr(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Finite Pearson correlation, returning zero for constant/empty inputs."""
         if x.numel() < 2 or y.numel() != x.numel():
@@ -985,7 +1007,8 @@ class YOLOFDistillationModel(DetectionModel):
         """Dictionary losses: weighted align, spatial AT, commit, and assignment InfoMax.
 
         Weighted align: task-saliency-weighted MSE between projected student tap and
-        dictionary-reorganized teacher feature. Weight priority for task-grad modes
+        dictionary-reorganized teacher feature, reduced as ``sum(W·r̄)/sum(W)`` with
+        ``r̄=mean_c(residual²)``. Weight priority for task-grad modes
         (``saliency_dLdx``, ``saliency``, ``saliency_dLdA*``):
           1) live map from the joint-phase throwaway pass
           2) EMA of that map (after freeze / when live map missing)
@@ -1109,8 +1132,9 @@ class YOLOFDistillationModel(DetectionModel):
                 content_mask = getattr(self, "_content_mask", None)
                 weight = self._apply_content_mask(weight, content_mask)
                 weight = self._normalize_dict_weight(weight, weight_norm, content_mask).to(pred.dtype).detach()
-                residual = (pred - target).float().pow(2).mean(dim=1, keepdim=True)
-                d_align = d_align + (weight * (pred - target) ** 2).mean()
+                elem = (pred - target).float().pow(2)
+                residual = elem.mean(dim=1, keepdim=True)
+                d_align = d_align + self._mass_normalized_weighted_mse(weight, elem)
             else:
                 residual = (pred - target).float().pow(2).mean(dim=1, keepdim=True)
                 d_align = d_align + F.mse_loss(pred, target)
