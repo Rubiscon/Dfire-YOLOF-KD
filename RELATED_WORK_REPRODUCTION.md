@@ -26,7 +26,8 @@ YOLO26n-to-YOLOF method with Structural KD, GID, and CanKD.
   objective (`MSE(IN(z_s), IN(z_t)) / 2` per paired map). It is hosted in
   `CanKD-main`, not `KD-main`. Detection configs set `loss_weight=10` per
   level (effective lambda 5 after the internal `/2`). YOLO26n contributes
-  three Detect inputs, not RetinaNet's four FPN maps.
+  three Detect inputs, not RetinaNet's four FPN maps. Controlled CanKD uses
+  `seed=0` and the same student-init hash gate as SKD/GID.
 - The existing proposed-method result keeps its published online-teacher
   protocol. This track demonstrates paper-method reproduction but is not used
   to attribute differences solely to the KD loss.

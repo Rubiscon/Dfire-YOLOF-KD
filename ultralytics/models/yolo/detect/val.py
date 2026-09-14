@@ -69,9 +69,11 @@ class DetectionValidator(BaseValidator):
         Returns:
             (dict[str, Any]): Preprocessed batch.
         """
+        pin = bool(getattr(self.args, "pin_memory", False))
+        non_blocking = pin and self.device.type == "cuda"
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
-                batch[k] = v.to(self.device, non_blocking=self.device.type == "cuda")
+                batch[k] = v.to(self.device, non_blocking=non_blocking)
         batch["img"] = (batch["img"].half() if self.args.half else batch["img"].float()) / 255
         return batch
 
@@ -329,6 +331,10 @@ class DetectionValidator(BaseValidator):
             (torch.utils.data.DataLoader): DataLoader for validation.
         """
         dataset = self.build_dataset(dataset_path, batch=batch_size, mode="val")
+        if hasattr(self.args, "pin_memory"):
+            pin_memory = bool(self.args.pin_memory)
+        else:
+            pin_memory = bool(self.training)
         return build_dataloader(
             dataset,
             batch_size,
@@ -336,7 +342,7 @@ class DetectionValidator(BaseValidator):
             shuffle=False,
             rank=-1,
             drop_last=self.args.compile,
-            pin_memory=self.training,
+            pin_memory=pin_memory,
         )
 
     def plot_val_samples(self, batch: dict[str, Any], ni: int) -> None:

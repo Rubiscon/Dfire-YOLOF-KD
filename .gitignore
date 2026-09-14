@@ -218,6 +218,8 @@ archive/
 experiments/
 local/
 configs/local/
+Log/
+Log1/
 
 # Notebooks (optional; remove this block if team tracks notebooks)
 notebooks/

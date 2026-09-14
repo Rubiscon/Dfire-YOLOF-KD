@@ -56,24 +56,40 @@ def build_dataset(args, data: dict[str, Any], mode: str = "train", stride: int =
     )
 
 
-def build_loader(args, dataset, mode: str = "train", rank: int = -1):
-    """Wrap a dataset in the fork's ``InfiniteDataLoader`` with matching worker counts."""
+def build_loader(args, dataset, mode: str = "train", rank: int = -1,
+                 pin_memory: bool | None = None):
+    """Wrap a dataset in the fork's ``InfiniteDataLoader`` with matching worker counts.
+
+    ``pin_memory`` defaults to ``args.pin_memory`` (controlled protocol: False) so
+    host trainers do not inherit Ultralytics' True default, which has crashed
+    long CanKD runs inside the pin_memory worker thread.
+    """
     from ultralytics.data.build import build_dataloader
 
+    if pin_memory is None:
+        pin_memory = bool(getattr(args, "pin_memory", False))
     return build_dataloader(
         dataset,
         batch=args.batch if mode == "train" else val_batch_size(args),
         workers=args.workers if mode == "train" else args.workers * 2,
         shuffle=mode == "train",
         rank=rank,
+        pin_memory=pin_memory,
     )
 
 
-def preprocess_batch(batch: dict[str, Any], device) -> dict[str, Any]:
-    """Move a collated batch to ``device`` and scale images to ``[0, 1]``."""
+def preprocess_batch(batch: dict[str, Any], device,
+                     non_blocking: bool | None = None) -> dict[str, Any]:
+    """Move a collated batch to ``device`` and scale images to ``[0, 1]``.
+
+    ``non_blocking`` defaults to False. Async H2D copies only help with pinned
+    host memory; with ``pin_memory=False`` they can surface stale CUDA errors.
+    """
+    if non_blocking is None:
+        non_blocking = False
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
-            batch[key] = value.to(device, non_blocking=getattr(device, "type", None) == "cuda")
+            batch[key] = value.to(device, non_blocking=non_blocking)
     batch["img"] = batch["img"].float() / 255
     return batch
 

@@ -1,0 +1,113 @@
+% Methods for IEEEtran two-column (ISCAS / 4-page density).
+% Needs: \usepackage{amsmath,amssymb,graphicx}
+
+\section{Method}
+\label{sec:method}
+
+The student is a YOLO26n backbone with a YOLOF encoder: a \(1\times 1\) projection, three dilated deformable residual blocks (\(d=2,6,8\)), and a single-scale decoder on \(C_5\) (stride~32).
+The teacher is YOLO26n with the standard \(P_3\)--\(P_5\) FPN.
+Fire and thin smoke occupy a few cells on \(C_5\); the teacher still computes \(P_3\) and \(P_4\).
+SRKD is a two-level training scheme that transfers those scales into the dilated encoder---sliced semantic matching on the backbone, receptive-field matching on the encoder---and discards the matching adapters at test time.
+
+Both networks share the YOLO26n backbone and the end-to-end Detect head (\(\mathrm{reg\_max}=1\)).
+We tap the teacher's last backbone \(P_4\) block \(x^{e}\) (stride~16) and the three FPN maps \(N_1,N_2,N_3\).
+On the student we tap the C2PSA output \(n_s\) (stride~32) and the residual outputs \(f_1,f_2,f_3\) of the dilated blocks.
+The teacher is trained online with the same ground-truth detection loss as the student (\(\mathcal{L}_s\), \(\mathcal{L}_t\)); distillation targets are stop-gradient.
+
+% \begin{figure}[!t]
+%   \centering
+%   \includegraphics[width=\columnwidth]{fig_srkd.pdf}
+%   \caption{SRKD.
+%   Teacher: YOLO26n FPN (\(P_3\)--\(P_5\)).
+%   Student: same backbone, YOLOF encoder with dilations \(2,6,8\).
+%   Training only: sliced matching \(n_s\leftrightarrow x^{e}\) weighted by \(|\partial\mathcal{L}_t/\partial x^{e}|\);
+%   spatial energy and three projectors \(f_i\to N_i\);
+%   TAL on teacher NMS.
+%   Inference: student alone.}
+%   \label{fig:srkd}
+% \end{figure}
+
+\subsection{Sliced Semantic Matching}
+\label{sec:sliced}
+
+\(x^{e}\) and \(n_s\) differ in stride and in channel identity.
+A frozen \(3\times 3\) encoder is applied to each map, then adaptive average pooling reduces it to a \(2\times 2\) grid.
+The resulting channel tokens \(Q\in\mathbb{R}^{B\times C_s\times d}\) and \(K\in\mathbb{R}^{B\times C_t\times d}\) (\(d=4\)) are \(\ell_2\)-normalized; their correlation is \(M=QK^{\top}\).
+Each student channel copies the most correlated teacher channel,
+\begin{equation}
+\label{eq:gather}
+\pi(s)=\arg\max_{t}\,M_{s,t},\qquad
+\tilde{x}^{e}_{b,s,:,:}=x^{e}_{b,\pi(s),:,:}.
+\end{equation}
+The assignment is many-to-one.
+A training-only transpose convolution lifts \(n_s\) to the spatial size of \(x^{e}\), giving \(s_{\mathrm{proj}}\).
+\(\tilde{x}^{e}\) is a stop-gradient target.
+
+The residual is weighted by how much each cell of \(x^{e}\) moves the teacher's detection loss \(\mathcal{L}_t\):
+\begin{equation}
+\label{eq:saliency}
+S=\mathrm{mean}_{c}\left|\frac{\partial \mathcal{L}_t}{\partial x^{e}}\right|,\qquad
+W=\frac{S}{\mathrm{mean}(S)}.
+\end{equation}
+Letterbox pads are zeroed and \(W\) is detached.
+After standardizing each channel over space,
+\begin{equation}
+\label{eq:ldict}
+\mathcal{L}_{\mathrm{dict}}
+=\mathrm{mean}\bigl(W\odot(\hat{s}_{\mathrm{proj}}-\hat{\tilde{x}}^{e})^{2}\bigr).
+\end{equation}
+
+\subsection{Receptive-Field Matching}
+\label{sec:rf}
+
+Sliced matching places \(P_4\) channels onto \(C_5\).
+Receptive-field matching then transfers spatial energy and pyramid structure into the dilated encoder.
+
+\textbf{Spatial energy.}
+Let \(A(F)=\mathrm{mean}_{c}(F^{\odot 2})\).
+Flatten \(A\) on the aligned pair \((s_{\mathrm{proj}},\tilde{x}^{e})\), \(\ell_2\)-normalize, and take the squared Euclidean distance of the unit maps \(a_s,a_t\):
+\begin{equation}
+\label{eq:lat}
+\mathcal{L}_{\mathrm{AT}}
+=\frac{1}{B}\sum_{b}\lVert a_s^{(b)}-a_t^{(b)}\rVert_{2}^{2}.
+\end{equation}
+
+\textbf{Pyramid.}
+The three student blocks are ordered by dilation \(d=2,6,8\); the FPN is ordered by stride \(8,16,32\).
+Pairing by depth gives \(f_i\leftrightarrow N_i\).
+A training-only projector \(\psi_i\) maps each \(f_i\) onto \(N_i\) (\(\times 4\), \(\times 2\), and \(1\times 1\) at \(640\)).
+With the same channel standardization as above,
+\begin{equation}
+\label{eq:lfeat}
+\mathcal{L}_{\mathrm{feat}}
+=\frac{1}{3}\sum_{i=1}^{3}
+\mathrm{MSE}\bigl(\widehat{\psi_i(f_i)},\,\widehat{N_i}\bigr).
+\end{equation}
+
+\textbf{Boxes.}
+From epoch~20, teacher detections after NMS (\(\mathrm{conf}=0.25\), \(\mathrm{IoU}=0.5\)) are assigned to the student's one-to-many anchors by the same task-aligned assigner used for ground truth.
+On those anchors the box term is \(1-\mathrm{CIoU}\).
+For a detection of class \(y^{\star}\) with score \(c\), the class target puts \(c\) on \(y^{\star}\) and spreads \(1-c\) over the other classes.
+With student logits \(z\) and temperature \(T=3\),
+\begin{equation}
+\label{eq:lalign}
+\mathcal{L}_{\mathrm{KL}}
+=T^{2}\,\mathrm{KL}\bigl(\mathrm{softmax}(z/T)\,\Vert\,p\bigr),\qquad
+\mathcal{L}_{\mathrm{align}}
+=4\,\mathcal{L}_{\mathrm{KL}}+2\,\mathcal{L}_{\mathrm{CIoU}}.
+\end{equation}
+
+The training objective is
+\begin{equation}
+\label{eq:total}
+\begin{aligned}
+\mathcal{L}
+&=\mathcal{L}_s+\mathcal{L}_t
++0.12\,\mathcal{L}_{\mathrm{dict}}
++0.25\,\mathcal{L}_{\mathrm{AT}} \\
+&\quad
++0.08\,\mathcal{L}_{\mathrm{feat}}
++0.12\,\mathcal{L}_{\mathrm{align}}.
+\end{aligned}
+\end{equation}
+At inference the student is the backbone, the three dilated blocks, and Detect.

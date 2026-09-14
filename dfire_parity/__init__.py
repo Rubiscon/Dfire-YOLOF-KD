@@ -34,7 +34,11 @@ from .protocol import (
     STRIDE,
     VAL_BATCH_MULTIPLIER,
     VAL_RECT,
+    VOC2007_CLASS_NAMES,
+    VOC2007_NUM_CLASSES,
     build_args,
+    identify_dataset,
+    names_for_num_classes,
     steps_per_epoch,
 )
 
@@ -44,7 +48,11 @@ __all__ = [
     "EMA_DECAY",
     "EMA_TAU",
     "GRAD_CLIP_MAX_NORM",
+    "identify_dataset",
+    "names_for_num_classes",
     "NUM_CLASSES",
+    "VOC2007_CLASS_NAMES",
+    "VOC2007_NUM_CLASSES",
     "PARITY_TOLERANCE",
     "REFERENCE_MAP50",
     "STRIDE",

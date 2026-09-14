@@ -1,0 +1,20 @@
+# DFS (E:\CRIS\DFS\fireDetectVOCfinal) — separate from D-Fire.
+# Native VOC classes after dropping _background_: fire / other / smoke.
+# Do not mix with dfire.yaml or the D-Fire teacher checkpoint (nc=2).
+#
+# Populate datasets/DFS/data with:
+#   python scripts/convert_dfs_voc.py
+# Cloud:
+#   python scripts/convert_dfs_voc.py \
+#     --source /root/datasets/DFS/fireDetectVOCfinal \
+#     --output /root/Ultra/datasets/DFS/data
+
+path: ./datasets/DFS/data
+train: train/images
+val: val/images
+test: test/images
+
+names:
+  0: fire
+  1: other
+  2: smoke

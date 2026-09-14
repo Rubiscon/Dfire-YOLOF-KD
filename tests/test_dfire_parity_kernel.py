@@ -38,6 +38,39 @@ def test_controlled_args_match_full_aug_protocol():
     assert args.warmup_bias_lr == 0.0 and args.warmup_momentum == 0.9
 
 
+def test_build_loader_defaults_pin_memory_false(monkeypatch):
+    from dfire_parity import engine as parity_engine
+
+    captured = {}
+
+    def fake_build_dataloader(dataset, batch, workers, shuffle=True, rank=-1,
+                              drop_last=False, pin_memory=True):
+        captured.update(pin_memory=pin_memory)
+        return "loader"
+
+    monkeypatch.setattr(
+        "ultralytics.data.build.build_dataloader", fake_build_dataloader
+    )
+    args = build_args()
+    out = parity_engine.build_loader(args, dataset=object(), mode="train")
+    assert out == "loader"
+    assert captured["pin_memory"] is False
+
+    out = parity_engine.build_loader(
+        args, dataset=object(), mode="train", pin_memory=True
+    )
+    assert captured["pin_memory"] is True
+
+
+def test_preprocess_batch_defaults_blocking_h2d():
+    from dfire_parity.engine import preprocess_batch
+
+    batch = {"img": torch.zeros(1, 3, 4, 4, dtype=torch.uint8), "cls": torch.zeros(1)}
+    out = preprocess_batch(batch, torch.device("cpu"))
+    assert out["img"].dtype == torch.float32
+    assert out["img"].max() <= 1.0
+
+
 def test_weight_decay_is_unscaled_when_batch_equals_nbs():
     assert scaled_weight_decay(build_args()) == pytest.approx(0.0005)
 

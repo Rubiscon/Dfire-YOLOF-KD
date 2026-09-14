@@ -101,10 +101,75 @@ GRAD_CLIP_NORM_TYPE = 2.0
 EMA_DECAY = 0.9999
 EMA_TAU = 2000
 
-# Dataset contract.
+# Dataset contract. CLASS_NAMES / NUM_CLASSES remain the D-Fire defaults so
+# existing D-Fire tests and docs stay valid. VOC2007 is the other allowed
+# host dataset (trainval→train, test→val/test). Do not silently accept DFS.
 NUM_CLASSES = 2
 CLASS_NAMES = {0: "smoke", 1: "fire"}
+VOC2007_NUM_CLASSES = 20
+VOC2007_CLASS_NAMES = {
+    0: "aeroplane",
+    1: "bicycle",
+    2: "bird",
+    3: "boat",
+    4: "bottle",
+    5: "bus",
+    6: "car",
+    7: "cat",
+    8: "chair",
+    9: "cow",
+    10: "diningtable",
+    11: "dog",
+    12: "horse",
+    13: "motorbike",
+    14: "person",
+    15: "pottedplant",
+    16: "sheep",
+    17: "sofa",
+    18: "train",
+    19: "tvmonitor",
+}
 STRIDE = 32
+
+
+def _as_name_map(names: Any) -> dict[int, str]:
+    if isinstance(names, dict):
+        return {int(index): str(name) for index, name in names.items()}
+    return {index: str(name) for index, name in enumerate(names)}
+
+
+def names_for_num_classes(num_classes: int) -> dict[int, str]:
+    """Detect-head names for a supported controlled dataset."""
+    count = int(num_classes)
+    if count == NUM_CLASSES:
+        return dict(CLASS_NAMES)
+    if count == VOC2007_NUM_CLASSES:
+        return dict(VOC2007_CLASS_NAMES)
+    raise ValueError(
+        "Controlled hosts support nc=2 (D-Fire) or nc=20 (VOC2007), got %s" % count
+    )
+
+
+def identify_dataset(names: Any, nc: int | None = None) -> str:
+    """Return 'dfire' or 'voc2007', or raise if the yaml is some other dataset."""
+    mapping = _as_name_map(names)
+    if mapping == CLASS_NAMES:
+        key = "dfire"
+        expected_nc = NUM_CLASSES
+    elif mapping == VOC2007_CLASS_NAMES:
+        key = "voc2007"
+        expected_nc = VOC2007_NUM_CLASSES
+    else:
+        raise ValueError(
+            "Unsupported dataset classes %s. Controlled Ultralytics/GID/SKD/CanKD "
+            "hosts accept D-Fire %s or VOC2007 %s (not DFS)."
+            % (mapping, CLASS_NAMES, VOC2007_CLASS_NAMES)
+        )
+    if nc is not None and int(nc) != expected_nc:
+        raise ValueError(
+            "Dataset %s declares nc=%s but names imply nc=%s" % (key, nc, expected_nc)
+        )
+    return key
 
 # Solo gate for this full-augmentation protocol (YOLOF_batch64 peak ~0.709 under
 # the same aug family). Re-measure after the first Ultra batch-112 amp run if

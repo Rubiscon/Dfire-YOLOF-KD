@@ -1,0 +1,44 @@
+# VOC2007-only detection split for Ultralytics / GID / SKD / CanKD.
+#
+# Train = official trainval (5011). Val and test = official test (4952).
+# Populate with:
+#   python scripts/convert_voc2007.py
+# Cloud:
+#   python scripts/convert_voc2007.py \
+#     --source /root/datasets/VOC2007 \
+#     --output /root/datasets/VOC2007_yolo
+#
+# Prefer the copy written next to the images:
+#   /root/datasets/VOC2007_yolo/voc2007.yaml
+# That file has path: . so it cannot silently pick a different dump.
+#
+# Do not use VOC.yaml (07+12). Do not load a D-Fire nc=2 teacher.
+
+path: /root/datasets/VOC2007_yolo
+train: trainval/images
+val: test/images
+test: test/images
+
+nc: 20
+
+names:
+  0: aeroplane
+  1: bicycle
+  2: bird
+  3: boat
+  4: bottle
+  5: bus
+  6: car
+  7: cat
+  8: chair
+  9: cow
+  10: diningtable
+  11: dog
+  12: horse
+  13: motorbike
+  14: person
+  15: pottedplant
+  16: sheep
+  17: sofa
+  18: train
+  19: tvmonitor
