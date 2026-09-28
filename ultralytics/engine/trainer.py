@@ -337,6 +337,12 @@ class BaseTrainer:
             else []
         )
         always_freeze_names = [".dfl"]  # always freeze these layers
+        # KD submodules (dictionary key/query encoders under hard matching) that asked to
+        # stay frozen. Matching the exact name fragments keeps the rest of those modules,
+        # e.g. the dictionary projection, trainable.
+        always_freeze_names += [
+            f for f in getattr(unwrap_model(self.model), "kd_frozen_name_fragments", ()) if f
+        ]
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         self.freeze_layer_names = freeze_layer_names
         for k, v in self.model.named_parameters():
@@ -345,8 +351,8 @@ class BaseTrainer:
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
-                if ".teacher." in k or k.startswith("teacher."):
-                    continue  # KD teacher stays frozen; do not re-enable for DDP/optimizer setup
+                if ".teacher." in k or k.startswith("teacher.") or getattr(v, "_kd_frozen", False):
+                    continue  # KD teacher / explicitly frozen dictionary encoders stay frozen
                 LOGGER.warning(
                     f"setting 'requires_grad=True' for frozen layer '{k}'. "
                     "See ultralytics.engine.trainer for customization of frozen layers."

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 import random
 import time
 from copy import copy, deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
@@ -153,6 +155,22 @@ class DetectionTrainer(BaseTrainer):
         return super().auto_batch(max_num_obj, dataset_size=n)
 
 
+def _as_bool(value, default: bool) -> bool:
+    """Coerce a config value to bool, accepting the strings YAML/CLI tends to carry."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "off", "no", ""}
+    return bool(value)
+
+
+def _as_optional_bool(value) -> bool | None:
+    """Like :func:`_as_bool` but keeps unset values as ``None`` for tri-state config."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    return _as_bool(value, False)
+
+
 class YOLOFDistillationModel(DetectionModel):
     """DetectionModel with offline FPN teacher -> YOLOF student distillation."""
 
@@ -188,8 +206,12 @@ class YOLOFDistillationModel(DetectionModel):
         # Running EMA of Grad-CAM saliency (layer → (1,1,H,W)); used after teacher freeze.
         self._saliency_ema: Dict[int, torch.Tensor] = {}
         self._dict_match_steps = 0
-        self.last_dict_match_stats: Dict[str, float] | None = None
+        self.last_dict_match_stats: Dict[str, float | str] | None = None
         self.last_dict_weight_stats: Dict[str, float | str] | None = None
+        # Name fragments of dictionary params that must stay frozen (params + BN eval)
+        # for the whole run. Filled by ``build_distillation_modules`` when the encoders
+        # are frozen; read by BaseTrainer so its DDP/optimizer re-enable pass skips them.
+        self.kd_frozen_name_fragments: Tuple[str, ...] = ()
 
     def _teacher_joint_training(self) -> bool:
         """True while the teacher receives GT task loss (online joint phase).
@@ -496,7 +518,48 @@ class YOLOFDistillationModel(DetectionModel):
                     getattr(self.args, "dict_infomax_marginal_weight", 1.0) or 1.0
                 )
                 grid_divisor = max(int(getattr(self.args, "dict_match_grid_divisor", 16) or 16), 1)
-                modules, msgs = [], []
+                # Encoder ablations: drop the teacher-side encoder and/or switch the
+                # student-side conv to a MobileNetV2 depthwise (separable) form.
+                teacher_encoder = _as_bool(getattr(self.args, "dict_teacher_encoder", True), True)
+                student_encoder = str(
+                    getattr(self.args, "dict_student_encoder", "full") or "full"
+                )
+                proj_form = str(getattr(self.args, "dict_proj_form", "deconv") or "deconv")
+                proj_kernel = int(getattr(self.args, "dict_proj_kernel", 3) or 3)
+                fixed_map = None
+                if match == "fixed":
+                    fixed_map = self._load_fixed_match_map(
+                        getattr(self.args, "dict_fixed_map", None),
+                        getattr(self.args, "dict_fixed_map_sha256", None),
+                        expected_channels=int(s_tap.shape[1]),
+                        expected_teachers=int(teacher_taps[self._dict_teacher_layers[0]].shape[1]),
+                    )
+                freeze_encoders = _as_optional_bool(
+                    getattr(self.args, "dict_freeze_encoders", None)
+                )
+                if freeze_encoders is None:
+                    # Legacy behaviour: a non-differentiable assignment gives the encoders
+                    # no gradient, so freeze them into fixed projections unless told
+                    # otherwise. Scoped to hard/index/fixed; batch_corr keeps its historical
+                    # unfrozen behaviour so already-planned arms are unaffected by adding
+                    # this mode.
+                    freeze_encoders = match in {"hard", "index", "fixed"}
+                # Per-side override. The requirement this models is asymmetric: the teacher-side
+                # encoder must stay fixed so the distillation target is stable, while the
+                # student-side encoder may either adapt or stay fixed, and the two choices have to
+                # be testable independently. A side that is not set inherits `dict_freeze_encoders`,
+                # so every existing configuration keeps exactly its previous behaviour.
+                freeze_teacher = _as_optional_bool(
+                    getattr(self.args, "dict_freeze_teacher_encoder", None)
+                )
+                freeze_student = _as_optional_bool(
+                    getattr(self.args, "dict_freeze_student_encoder", None)
+                )
+                if freeze_teacher is None:
+                    freeze_teacher = freeze_encoders
+                if freeze_student is None:
+                    freeze_student = freeze_encoders
+                modules, msgs, frozen_fragments = [], [], []
                 for li in self._dict_teacher_layers:
                     t_feat = teacher_taps.get(li)
                     if t_feat is None:
@@ -504,6 +567,10 @@ class YOLOFDistillationModel(DetectionModel):
                     # N uses divisor=16; proposal-style InfoMax uses divisor=4 (area /16).
                     grid = max(int(t_feat.shape[-1]) // grid_divisor, 1)
                     grid = max(grid, 2)  # min 2x2 tokens for stable channel correlation
+                    # Pinning the projection's initialisation keeps comparisons between
+                    # encoder configurations from also changing proj's random start.
+                    init_seed = getattr(self.args, "dict_init_seed", None)
+                    init_seed = None if init_seed in (None, "") else int(init_seed) + len(modules)
                     mod = DictionaryModule(
                         t_feat.shape[1],
                         s_tap.shape[1],
@@ -515,16 +582,29 @@ class YOLOFDistillationModel(DetectionModel):
                         match_norm=match_norm,
                         match_init=match_init,
                         infomax_marginal_weight=infomax_marginal_weight,
+                        teacher_encoder=teacher_encoder,
+                        student_encoder=student_encoder,
+                        init_seed=init_seed,
+                        proj_form=proj_form,
+                        proj_kernel=proj_kernel,
+                        fixed_map=fixed_map,
                     )
-                    if match == "hard":
-                        # Hard argmax blocks encoder grads; freeze them as fixed random projections.
-                        mod.freeze_encoders()
+                    frozen_sides = mod.freeze_encoders(teacher=freeze_teacher, student=freeze_student)
+                    frozen_fragments += [
+                        f"dictionary_modules.{len(modules)}.{side}." for side in frozen_sides
+                    ]
                     modules.append(mod)
                     msgs.append(
                         f"x{li}{tuple(t_feat.shape[1:])} <- n{self._dict_student_layer}{tuple(s_tap.shape[1:])} "
-                        f"(token grid {grid}x{grid}, match={mod.match}, norm={match_norm}, init={match_init})"
+                        f"(token grid {grid}x{grid}, match={mod.match}, norm={match_norm}, init={match_init}, "
+                        f"teacher_encoder={teacher_encoder}, student_encoder={mod.student_encoder}, "
+                        f"proj={proj_form}, freeze(teacher={freeze_teacher}, student={freeze_student}), "
+                        f"frozen_sides={frozen_sides or '-'})"
                     )
                 self.dictionary_modules = nn.ModuleList(modules).to(device)
+                # Filled from what was actually frozen, per side, so the DDP/optimizer re-enable
+                # pass in BaseTrainer cannot silently un-freeze one of them.
+                self.kd_frozen_name_fragments = tuple(frozen_fragments)
                 LOGGER.info(f"Built {len(modules)} dictionary modules (backbone distillation): {msgs}")
 
         self._student_tap = None
@@ -549,6 +629,59 @@ class YOLOFDistillationModel(DetectionModel):
         head = det_model.model[-1]
         branch = raw["one2one"] if getattr(head, "end2end", False) and "one2one" in raw else raw
         return head._inference(branch)
+
+    @staticmethod
+    def _load_fixed_match_map(
+        path: str | None,
+        expect_sha256: str | None,
+        expected_channels: int,
+        expected_teachers: int,
+    ) -> torch.Tensor:
+        """Load an externally prescribed teacher-index map, verifying its integrity.
+
+        The map is the independent variable of the fixed-assignment experiment, so it must
+        be identifiable: the file's sha256 is checked against the value recorded when the
+        map was built, and its shape and range are validated. Any failure raises rather than
+        silently falling back, because a wrong or truncated map would invalidate the run in
+        a way that is invisible in the metrics.
+        """
+        if not path:
+            raise ValueError("dict_match='fixed' requires --dict-fixed-map <path.npy>")
+        p = Path(str(path))
+        if not p.is_file():
+            raise FileNotFoundError(f"dict_fixed_map not found: {p}")
+        raw = p.read_bytes()
+        actual = hashlib.sha256(raw).hexdigest()
+        if expect_sha256 and actual != str(expect_sha256).strip().lower():
+            raise ValueError(
+                f"dict_fixed_map sha256 mismatch for {p}: expected {expect_sha256}, got {actual}"
+            )
+        arr = np.load(p) if p.suffix == ".npy" else np.loadtxt(p, dtype=np.int64)
+        m = np.asarray(arr).reshape(-1).astype(np.int64)
+        if m.size != int(expected_channels):
+            raise ValueError(
+                f"dict_fixed_map has {m.size} entries but the student tap has {expected_channels} channels"
+            )
+        if m.min() < 0 or m.max() >= int(expected_teachers):
+            raise ValueError(
+                f"dict_fixed_map entries must be in [0, {expected_teachers}); got [{m.min()}, {m.max()}]"
+            )
+        counts = np.bincount(m, minlength=int(expected_teachers)).astype(np.float64)
+        share = counts / counts.sum()
+        nz = share[share > 0]
+        eff = float(np.exp(-(nz * np.log(nz)).sum()))
+        LOGGER.info(
+            "dict_fixed_map %s sha256=%s entries=%d distinct_targets=%d max_share=%.4f "
+            "effective_targets=%.1f range=[%d,%d]"
+            % (p, actual[:16], m.size, int((counts > 0).sum()), float(share.max()), eff,
+               int(m.min()), int(m.max()))
+        )
+        if not expect_sha256:
+            LOGGER.warning(
+                "dict_fixed_map was loaded WITHOUT a recorded sha256; the run is only "
+                "reproducible if the file is unchanged"
+            )
+        return torch.from_numpy(m)
 
     @staticmethod
     def _channel_standardize(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -1038,10 +1171,15 @@ class YOLOFDistillationModel(DetectionModel):
                 LOGGER.warning("KD: student backbone tap unavailable; skipping dictionary distillation")
                 self._dict_warned = True
             return zero, zero, zero, zero
+        if _as_bool(getattr(self.args, "dict_detach_student_tap", False), False):
+            # Freeze the student "feature": the dictionary losses then train only the
+            # dictionary projection, not the student backbone that produced the tap.
+            s_feat = s_feat.detach()
 
         mode = self._dict_weight_mode(self.args)
         norm = self._dict_norm_mode()
         weight_norm = self._dict_weight_norm_mode()
+        attn_consistent = _as_bool(getattr(self.args, "dict_attn_consistent", False), False)
         # Grad-CAM / analytic |∂L/∂A| family share the same cache + EMA path.
         use_grad_map = mode in self._SALIENCY_GRAD_MODES
         if saliency is None:
@@ -1070,6 +1208,9 @@ class YOLOFDistillationModel(DetectionModel):
                 t_feat.detach(), s_feat, collect_diagnostics=collect_diagnostics
             )
             target = t_reorg.detach()
+            # Kept for the AT term under dict_attn_consistent: `target` is rebound to the
+            # feature-normalised version below, and that normalisation is not the identity.
+            target_raw = target
             pred = s_proj
             entropy_query = s_proj.detach()
             entropy_value = t_reorg.detach()
@@ -1174,8 +1315,18 @@ class YOLOFDistillationModel(DetectionModel):
                 )
 
             att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
-            att_t = F.normalize(self._spatial_attention(target).flatten(1), dim=1)
-            # AT / Zagoruyko: squared Euclidean distance between unit vectors (scale ~0.2–1).
+            # AT / Zagoruyko: squared Euclidean distance between unit vectors (scale ~0.2-1).
+            #
+            # att_s is the spatial-energy map of the raw projection output. By default att_t
+            # is taken from `target` AFTER feature normalisation, which is a different
+            # functional: per-channel standardisation divides each channel by its own
+            # spatial std, so the two sides no longer carry the same quantity. Measured on
+            # real features, that mismatch inflates the residual from 0.206 to 0.467
+            # (random encoders) and to 0.678 (identity encoders), while the consistent
+            # raw/raw pairing is insensitive to the encoder change (0.2064 -> 0.2082).
+            # dict_attn_consistent uses the raw target so both sides are energy maps.
+            attn_target = target_raw if attn_consistent else target
+            att_t = F.normalize(self._spatial_attention(attn_target).flatten(1), dim=1)
             d_attn = d_attn + (att_s - att_t).pow(2).sum(dim=1).mean()
             n += 1
 
