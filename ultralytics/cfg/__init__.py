@@ -553,6 +553,7 @@ def check_dict_alignment(
             "dict_match_init",
             "dict_match_grid_divisor",
             "dict_match_log_interval",
+            "dict_match_pool",
             "dict_attn_consistent",
             "dict_init_seed",
             "dict_proj_form",

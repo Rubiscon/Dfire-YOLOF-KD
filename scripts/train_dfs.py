@@ -227,6 +227,24 @@ _DICT_ST_DIAG = {"dict_match_log_interval": 100}
 # One value for the whole clean set, so every arm in it starts from the same projection.
 _DICT_INIT_SEED = 1234
 
+# VOC flavour of the advisor's architecture: the same sliced-matching dictionary as `pindw`
+# (teacher-side encoder removed, channel-local depthwise student encoder, pinned projection)
+# with the VOC recipe, which is applied automatically for `--dataset voc2007` before the
+# variant is layered on.
+#
+# The name is deliberately NOT `pindw`. The two tables are separate namespaces when RESOLVING a
+# variant, but the guard in `_apply_kd_variant` is name-based: any name present in
+# `_VOC_KD_VARIANTS` is rejected for non-VOC datasets with "VOC KD variant X is voc2007-only".
+# Registering `pindw` here therefore broke the D-Fire `pindw` arm outright -- caught by
+# tests/test_train_dfs.py. A distinct name keeps both usable.
+# Defined here rather than inline in `_VOC_KD_VARIANTS` because that table sits above
+# `_DICT_INIT_SEED` and the seed must not be duplicated as a literal.
+_VOC_KD_VARIANTS["vocpindw"] = {
+    "dict_teacher_encoder": False,
+    "dict_student_encoder": "depthwise",
+    "dict_init_seed": _DICT_INIT_SEED,
+}
+
 # Epoch at which the delayed fixed-map arms switch the whole dictionary branch on. 0-indexed,
 # because `_dict_active()` compares it against `self.current_epoch`. Chosen at 40 because the
 # measured deficit of the undelayed fixed-map arm is widest over e21-40.
@@ -598,6 +616,113 @@ _DFIRE_KD_VARIANTS.update(
             "dict_student_encoder": "depthwise",
             "dict_detach_student_tap": True,
         },
+        # --- dictionary branch ONLY, on the advisor's architecture --------------------------
+        # `nodict` (above) switches the dictionary branch off and answers "is it needed at all".
+        # This is its exact counterpart: the two generic terms are switched off instead, so the
+        # ONLY live distillation is the matching-based dictionary pair (`dict_align_loss` +
+        # `dict_attn_loss`). Exactly two keys off `pindw`, which makes the contrast single-variable
+        # in both directions -- against `pindw` (everything on) and against `nodict` (dictionary
+        # off). Note the TAL alignment is still COMPUTED from `align_start_epoch` while
+        # `align=True`, but its weight is zero so it carries no gradient; setting `align=False`
+        # would remove that cost at the price of moving a third key and spoiling the comparison.
+        "pindwonly": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "align_loss": 0.0,
+            "feature_loss": 0.0,
+        },
+        # --- dictionary-ONLY, carrying the dictionary-side changes that measured best ---------
+        # `pindwonly` alone reached +0.0027 val95 over solo (99% of epochs positive) -- a real but
+        # small effect. The question these arms answer is whether the dictionary branch does better
+        # when it also carries the two implementation changes that measured as consistent net wins:
+        #   uniform weighting            (saliency dLdx weighting measured +0.0060/+0.0042/+0.0046/
+        #                                 +0.0025 when replaced by uniform, 91% of epochs)
+        #   finer matching grid (10x10)  (measured +0.0054/+0.0039/+0.0022/+0.0020, 83% of epochs)
+        # The design keeps `pindwonly` as the common reference, so each arm adds exactly one idea
+        # and `pindwonlyures` is the best-case combination:
+        #     pindwonly      saliency + coarse grid      (already measured)
+        #     pindwonlyu     uniform  + coarse grid
+        #     pindwonlyres   saliency + fine grid
+        #     pindwonlyures  uniform  + fine grid
+        #     dictonlyu      recipe encoders + uniform   -> isolates the ARCHITECTURE question with
+        #                    the weighting held uniform, since `dictonlyu` vs `pindwonlyu` then
+        #                    differs only in teacher-encoder removal + depthwise student encoder.
+        "pindwonlyu": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "align_loss": 0.0,
+            "feature_loss": 0.0,
+            "dict_weight": "none",
+        },
+        "pindwonlyres": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "align_loss": 0.0,
+            "feature_loss": 0.0,
+            "dict_match_grid_divisor": 4,
+        },
+        "pindwonlyures": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "align_loss": 0.0,
+            "feature_loss": 0.0,
+            "dict_weight": "none",
+            "dict_match_grid_divisor": 4,
+        },
+        # Recipe encoders (teacher-side present, full-conv student) with the dictionary branch as the
+        # ONLY distillation, weighting held uniform. Deliberately sets no architecture key.
+        "dictonlyu": {
+            **_DICT_ST_DIAG,
+            "align_loss": 0.0,
+            "feature_loss": 0.0,
+            "dict_weight": "none",
+        },
+        # --- the advisor's specification, implemented literally --------------------------------
+        # Stated in full: "in the dictionary module we use ONLY depthwise conv + BN + activation to
+        # map the student's spatial size onto the teacher's, with NO average-pool downsampling; the
+        # teacher side has no network at all; then, as before, compute the attention matrix between
+        # the depthwise-convolved student features and the teacher features."
+        #
+        # Mapped onto this codebase, that is three things:
+        #   dict_teacher_encoder=False        the teacher side carries no network
+        #   dict_student_encoder="depthwise_upsample"
+        #                                     depthwise conv (groups == channels) + BN + ReLU, stacked
+        #                                     so the student's 20x20 is resampled onto the teacher's
+        #                                     40x40 BY THE CONV, not by interpolation
+        #   dict_match_pool="none"            no average pooling anywhere; the attention matrix is
+        #                                     computed on the full maps, so d = 40*40 = 1600
+        #
+        # Note this supersedes an earlier, looser reading in which the student kept its stride-1
+        # depthwise conv and the spatial change was done with a bilinear `F.interpolate`. That matched
+        # "no average pool" but not "map the spatial size with depthwise conv + BN + activation".
+        #
+        # Two bases, because the question is asked of two different things:
+        #   pindwnp      the advisor architecture with all branches on -- the paper candidate
+        #   pindwonlynp  dictionary-only, i.e. the line currently under investigation
+        "pindwnp": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise_upsample",
+            "dict_match_pool": "none",
+        },
+        "pindwonlynp": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise_upsample",
+            "align_loss": 0.0,
+            "feature_loss": 0.0,
+            "dict_match_pool": "none",
+        },
         # --- does an ACCURATE correspondence help? (the fixed-map experiment) -----------
         # The shipped projection is `ConvTranspose2d(Cs, Cs, k=2, s=2)`: every output channel
         # carries its own weights over all student channels, and output pixel (2i+a, 2j+b)
@@ -778,6 +903,7 @@ _DICT_STRUCTURE_KEYS = frozenset(
         "dict_match_log_interval",
         "dict_match_init",
         "dict_match_grid_divisor",
+        "dict_match_pool",
         "dict_attn_consistent",
         "dict_init_seed",
             "dict_proj_form",

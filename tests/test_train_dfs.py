@@ -667,3 +667,314 @@ def test_delay_gate_switches_the_whole_dictionary_branch_off_and_on():
     m.args.dict_align_loss = 0.0
     m.args.dict_attn_loss = 0.0
     assert not active(50)
+
+
+# --- dictionary-branch-only armon top of the advisor's architecture -----------------------------
+def test_pindwonly_is_pindw_with_only_the_two_generic_terms_switched_off():
+    """`pindwonly` must differ from `pindw` in exactly the two generic weights.
+
+    Anything else would break the single-variable reading: `pindw` (all branches on) ->
+    `pindwonly` (dictionary branch only) -> `nodict` (dictionary off) are meant to be three
+    points on one axis, so each step must move only the term it is named for.
+    """
+    from scripts.train_dfs import _DFIRE_KD_VARIANTS as V
+
+    assert "pindwonly" in V
+    moved = sorted(k for k in set(V["pindw"]) | set(V["pindwonly"])
+                   if V["pindw"].get(k) != V["pindwonly"].get(k))
+    assert moved == ["align_loss", "feature_loss"], moved
+    assert V["pindwonly"]["align_loss"] == 0.0
+    assert V["pindwonly"]["feature_loss"] == 0.0
+    # the architecture itself must be untouched, i.e. still the advisor's slicing
+    assert V["pindwonly"]["dict_teacher_encoder"] is False
+    assert V["pindwonly"]["dict_student_encoder"] == "depthwise"
+    assert V["pindwonly"]["dict_init_seed"] == _DICT_INIT_SEED
+
+
+def test_pindwonly_keeps_the_dictionary_gains_and_does_not_touch_align_gating():
+    """The dictionary pair must stay on, and `align` must stay True.
+
+    `align=False` would also stop the TAL alignment from being computed, which is a third moved
+    key and would spoil the comparison. The weight is zero, so the term carries no gradient.
+    """
+    from scripts.train_dfs import _DFIRE_KD_VARIANTS as V
+
+    cfg = _yolo_overrides(build_overrides("dcn-kd", _args(kd_variant="pindwonly")))
+    assert cfg["dict_align_loss"] > 0.0, "dictionary align must stay on -- this arm is 'dict only'"
+    assert cfg["dict_attn_loss"] > 0.0, "dictionary attention must stay on"
+    assert cfg["align"] is True, "align gating must stay at its default (see the docstring)"
+
+
+def test_pindwonly_really_suppresses_the_two_generic_terms_end_to_end():
+    """The trainer multiplies these by their weights, so zero weight means zero contribution."""
+    cfg = _yolo_overrides(build_overrides("dcn-kd", _args(kd_variant="pindwonly")))
+    assert cfg["align_loss"] == 0.0
+    assert cfg["feature_loss"] == 0.0
+
+
+# --- the VOC flavour of the same architecture ---------------------------------------------------
+def test_vocpindw_is_registered_in_the_voc_namespace_not_the_dfire_one():
+    """The two variant tables are separate, so the VOC arm needs its own registration.
+
+    Without this, `--dataset voc2007 --kd-variant pindw` raises "Unknown VOC KD variant".
+    """
+    from scripts.train_dfs import _DFIRE_KD_VARIANTS, _VOC_KD_VARIANTS
+
+    assert "vocpindw" in _VOC_KD_VARIANTS, "the VOC namespace needs its own entry"
+    assert "pindw" in _DFIRE_KD_VARIANTS, "the D-Fire entry must remain"
+    cfg = _yolo_overrides(build_overrides("dcn-kd", _args(dataset="voc2007", kd_variant="vocpindw")))
+    assert cfg["dict_teacher_encoder"] is False
+    assert cfg["dict_student_encoder"] == "depthwise"
+    assert cfg["dict_init_seed"] == _DICT_INIT_SEED
+
+
+def test_vocpindw_keeps_the_voc_recipe():
+    """The VOC run must keep VOC's own weights, not D-Fire's.
+
+    VOC applies _VOC_KD_OVERRIDES for every voc2007 KD run, and the variant only adds the
+    dictionary architecture on top. If the D-Fire recipe leaked in here the arm would not be
+    the VOC arm at all.
+    """
+    from scripts.train_dfs import _VOC_KD_OVERRIDES
+
+    cfg = _yolo_overrides(build_overrides("dcn-kd", _args(dataset="voc2007", kd_variant="vocpindw")))
+    for k, v in _VOC_KD_OVERRIDES.items():
+        assert cfg[k] == v, (k, cfg[k], v)
+    # and explicitly not the D-Fire values
+    assert cfg["align_loss"] != 0.16, "D-Fire hardgain weights must not leak into the VOC arm"
+    assert cfg["feature_loss"] != 0.10
+
+
+def test_voc_rejects_a_dfire_only_variant():
+    """Guard the namespace split from the other direction."""
+    with pytest.raises(Exception):
+        build_overrides("dcn-kd", _args(dataset="voc2007", kd_variant="pindwonly"))
+
+
+# --- dictionary-only arms carrying the dictionary-side changes that measured best ---------------
+DICT_ONLY_NEW = {
+    # arm            -> keys that must differ from `pindwonly`
+    "pindwonlyu":     ["dict_weight"],
+    "pindwonlyres":   ["dict_match_grid_divisor"],
+    "pindwonlyures":  ["dict_match_grid_divisor", "dict_weight"],
+}
+
+
+@pytest.mark.parametrize("arm,moved", sorted(DICT_ONLY_NEW.items()))
+def test_new_dict_only_arms_move_only_the_named_keys(arm, moved):
+    """Each new arm must add exactly the idea it is named for, on top of `pindwonly`.
+
+    `pindwonly` is the common reference for this set, so anything beyond the named keys would make
+    the comparison uninterpretable.
+    """
+    from scripts.train_dfs import _DFIRE_KD_VARIANTS as V
+
+    assert arm in V, arm
+    diff = sorted(k for k in set(V["pindwonly"]) | set(V[arm]) if V["pindwonly"].get(k) != V[arm].get(k))
+    assert diff == sorted(moved), (arm, diff)
+    # and every one of them is still dictionary-ONLY
+    assert V[arm]["align_loss"] == 0.0 and V[arm]["feature_loss"] == 0.0, arm
+    assert V[arm]["dict_teacher_encoder"] is False and V[arm]["dict_student_encoder"] == "depthwise", arm
+
+
+def test_dictonlyu_isolates_the_architecture_question():
+    """`dictonlyu` vs `pindwonlyu` must differ ONLY in architecture (weighting held uniform).
+
+    Three keys move: the two encoder knobs plus the projection seed. The seed only shifts the
+    projection's random start (measured ~0.0007 elsewhere), so this pair is the architecture
+    comparison in dictionary-only mode.
+    """
+    from scripts.train_dfs import _DFIRE_KD_VARIANTS as V
+
+    assert "dictonlyu" in V
+    diff = sorted(k for k in set(V["dictonlyu"]) | set(V["pindwonlyu"])
+                  if V["dictonlyu"].get(k) != V["pindwonlyu"].get(k))
+    assert diff == ["dict_init_seed", "dict_student_encoder", "dict_teacher_encoder"], diff
+    # the recipe architecture must be the default: no architecture keys set
+    assert "dict_teacher_encoder" not in V["dictonlyu"]
+    assert "dict_student_encoder" not in V["dictonlyu"]
+    # dictionary-only and uniform, like its partner
+    assert V["dictonlyu"]["align_loss"] == 0.0 and V["dictonlyu"]["feature_loss"] == 0.0
+    assert V["dictonlyu"]["dict_weight"] == "none"
+
+
+def test_uniform_weighting_really_reaches_the_trainer_for_these_arms():
+    """A key that is filtered out would silently leave saliency weighting on."""
+    for arm in ("pindwonlyu", "pindwonlyures", "dictonlyu"):
+        cfg = _yolo_overrides(build_overrides("dcn-kd", _args(kd_variant=arm)))
+        assert cfg["dict_weight"] == "none", arm
+    cfg = _yolo_overrides(build_overrides("dcn-kd", _args(kd_variant="pindwonlyres")))
+    assert cfg["dict_match_grid_divisor"] == 4
+
+
+# --- removing the average pool before matching (the advisor's instruction) ----------------------
+def _mk_pool_module(pool, **kw):
+    import torch
+    from ultralytics.nn.modules.yolof import DictionaryModule
+
+    torch.manual_seed(0)
+    m = DictionaryModule(128, 256, 40, 20, grid=2, match="hard", temperature=0.07,
+                         match_norm="l2", teacher_encoder=False, student_encoder="depthwise",
+                         init_seed=_DICT_INIT_SEED, match_pool=pool, **kw)
+    m.eval()
+    return m
+
+
+def test_match_pool_default_is_avg_and_leaves_the_shipped_behaviour_alone():
+    """The default must be byte-identical to what every existing arm already ran."""
+    import torch
+
+    t = torch.randn(2, 128, 40, 40)
+    s = torch.randn(2, 256, 20, 20)
+    with torch.no_grad():
+        d_flt = _mk_pool_module("avg")(t, s)[1]
+        # no match_pool argument at all -> must equal the explicit "avg"
+        from ultralytics.nn.modules.yolof import DictionaryModule
+        torch.manual_seed(0)
+        m = DictionaryModule(128, 256, 40, 20, grid=2, match="hard", temperature=0.07,
+                             match_norm="l2", teacher_encoder=False, student_encoder="depthwise",
+                             init_seed=_DICT_INIT_SEED)
+        m.eval()
+        d_dflt = m(t, s)[1]
+    assert torch.equal(d_flt, d_dflt), "default must behave exactly like match_pool='avg'"
+
+
+def test_match_pool_token_counts_are_grid_squared_versus_full_map():
+    """avg -> d = grid*grid; none -> d = t_size*t_size (every pixel contributes)."""
+    import torch
+
+    from ultralytics.nn.modules.yolof import DictionaryModule
+
+    t = torch.randn(2, 128, 40, 40)
+    s = torch.randn(2, 256, 20, 20)
+    for pool, want_d in (("avg", 4), ("none", 1600)):
+        m = _mk_pool_module(pool)
+        ks = m.key_enc(t) if m.key_enc is not None else t
+        qs = m.query_enc(s)
+        if pool == "none":
+            import torch.nn.functional as F
+            if qs.shape[-2:] != ks.shape[-2:]:
+                qs = F.interpolate(qs, size=ks.shape[-2:], mode="bilinear", align_corners=False)
+            k, q = ks.flatten(2), qs.flatten(2)
+        else:
+            k, q = m.pool(ks).flatten(2), m.pool(qs).flatten(2)
+        assert k.shape[-1] == want_d, (pool, k.shape)
+        assert q.shape[-1] == want_d, (pool, q.shape)
+        assert k.shape[1] == 128 and q.shape[1] == 256, (pool, k.shape, q.shape)
+
+
+def test_match_pool_none_still_produces_a_valid_reorganisation():
+    """Removing the pool must not change the OUTPUT shape contract: t_reorg is (B, Cs, Ht, Wt)."""
+    import torch
+
+    t = torch.randn(2, 128, 40, 40)
+    s = torch.randn(2, 256, 20, 20)
+    with torch.no_grad():
+        s_proj, t_reorg, commit, infomax = _mk_pool_module("none")(t, s)
+    assert tuple(t_reorg.shape) == (2, 256, 40, 40), t_reorg.shape
+    assert tuple(s_proj.shape) == (2, 256, 40, 40), s_proj.shape
+    # a hard assignment must select exactly one teacher channel per student channel
+    assert t_reorg.shape[1] == s.shape[1]
+
+
+def test_match_pool_rejects_an_unknown_value():
+    import pytest
+
+    with pytest.raises(ValueError):
+        _mk_pool_module("max")
+
+
+@pytest.mark.parametrize("base,arm,expect_enc", [
+    ("pindw", "pindwnp", "depthwise_upsample"),
+    ("pindwonly", "pindwonlynp", "depthwise_upsample"),
+])
+def test_nopool_arms_move_only_the_pool_and_encoder_keys(base, arm, expect_enc):
+    """The `np` arms change exactly two keys, and BOTH belong to the one requested modification.
+
+    The specification is: "use only depthwise conv + BN + activation to map the student's spatial size
+    onto the teacher's, with no average-pool downsampling". Implemented literally that is
+      * dict_match_pool          "none"                 -- the pooling is gone
+      * dict_student_encoder     "depthwise_upsample"   -- and the conv now does the resampling
+    so two keys move, not one. An earlier implementation changed only the pool and did the spatial
+    mapping with a bilinear interpolate, which matched the first clause but not the second.
+    """
+    from scripts.train_dfs import _DFIRE_KD_VARIANTS as V
+
+    assert arm in V, arm
+    diff = sorted(k for k in set(V[base]) | set(V[arm]) if V[base].get(k) != V[arm].get(k))
+    assert diff == ["dict_match_pool", "dict_student_encoder"], (arm, diff)
+    assert V[arm]["dict_match_pool"] == "none"
+    assert V[arm]["dict_student_encoder"] == expect_enc
+    # and both survive config filtering
+    cfg = _yolo_overrides(build_overrides("dcn-kd", _args(kd_variant=arm)))
+    assert cfg["dict_match_pool"] == "none", arm
+    assert cfg["dict_student_encoder"] == expect_enc, arm
+
+
+def test_depthwise_upsample_encoder_is_depthwise_bn_activation_and_resamples():
+    """Every clause of the requested student encoder, asserted separately.
+
+    depthwise (groups == channels, so no channel mixing) + BN + activation, and the conv stack itself
+    performs the 20x20 -> 40x40 mapping rather than an interpolation layer.
+    """
+    import torch
+    from torch import nn
+
+    from ultralytics.nn.modules.yolof import _build_encoder, _normalize_encoder_form
+
+    assert _normalize_encoder_form("dwup") == "depthwise_upsample"
+    enc = _build_encoder(256, "depthwise_upsample", in_size=20, out_size=40)
+    convs = [m for m in enc if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d))]
+    assert convs, "no convolution in the stack"
+    assert all(c.groups == 256 for c in convs), "not depthwise: a conv mixes channels"
+    assert any(isinstance(m, nn.BatchNorm2d) for m in enc), "no BN"
+    assert any(isinstance(m, (nn.ReLU, nn.SiLU, nn.GELU, nn.LeakyReLU)) for m in enc), "no activation"
+    with torch.no_grad():
+        y = enc(torch.randn(2, 256, 20, 20))
+    assert tuple(y.shape[-2:]) == (40, 40), y.shape
+
+
+def test_depthwise_upsample_requires_sizes():
+    """Without the sizes the form cannot know how far to upsample, so it must refuse."""
+    import pytest
+
+    from ultralytics.nn.modules.yolof import _build_encoder
+
+    with pytest.raises(ValueError):
+        _build_encoder(256, "depthwise_upsample")
+
+
+def test_full_resolution_matching_reproduces_the_requested_pipeline():
+    """Teacher has no network; student reaches the teacher's size; attention is on the full maps."""
+    import torch
+
+    t = torch.randn(2, 128, 40, 40)
+    s = torch.randn(2, 256, 20, 20)
+    torch.manual_seed(0)
+    m = _mk_pool_module("none")
+    # rebuild with the upsampling encoder, which is what the `np` arms use
+    from ultralytics.nn.modules.yolof import DictionaryModule
+    torch.manual_seed(0)
+    m = DictionaryModule(128, 256, 40, 20, grid=2, match="hard", temperature=0.07, match_norm="l2",
+                         teacher_encoder=False, student_encoder="depthwise_upsample",
+                         init_seed=_DICT_INIT_SEED, match_pool="none")
+    m.eval()
+    assert m.key_enc is None, "the teacher side must carry no network"
+    with torch.no_grad():
+        qs = m.query_enc(s)
+        k = torch.nn.functional.normalize(t.flatten(2), dim=2)
+        q = torch.nn.functional.normalize(qs.flatten(2), dim=2)
+        attn = q @ k.transpose(1, 2)
+        _s_proj, t_reorg, _c, _i = m(t, s)
+    assert tuple(qs.shape) == (2, 256, 40, 40), qs.shape
+    assert tuple(attn.shape) == (2, 256, 128), attn.shape
+    assert k.shape[-1] == 40 * 40, "matching must be on the full maps (d = 1600)"
+    assert tuple(t_reorg.shape) == (2, 256, 40, 40), t_reorg.shape
+
+
+def test_existing_arms_carry_no_pool_key():
+    """If a previous arm started setting match_pool, its measured numbers would no longer apply."""
+    from scripts.train_dfs import _DFIRE_KD_VARIANTS as V
+
+    for arm in ("pindw", "pindwonly", "pindwonlyu", "basefix", "nodict"):
+        assert "dict_match_pool" not in V[arm], arm

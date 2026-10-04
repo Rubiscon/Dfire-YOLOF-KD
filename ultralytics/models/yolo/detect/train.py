@@ -526,6 +526,10 @@ class YOLOFDistillationModel(DetectionModel):
                 )
                 proj_form = str(getattr(self.args, "dict_proj_form", "deconv") or "deconv")
                 proj_kernel = int(getattr(self.args, "dict_proj_kernel", 3) or 3)
+                # Tokenisation for the matching step: "avg" (pooled grid tokens, the shipped
+                # behaviour) or "none" (match on the full maps, student resampled to the teacher's
+                # spatial size). Default keeps every existing arm bit-identical.
+                match_pool = str(getattr(self.args, "dict_match_pool", "avg") or "avg")
                 fixed_map = None
                 if match == "fixed":
                     fixed_map = self._load_fixed_match_map(
@@ -588,6 +592,7 @@ class YOLOFDistillationModel(DetectionModel):
                         proj_form=proj_form,
                         proj_kernel=proj_kernel,
                         fixed_map=fixed_map,
+                        match_pool=match_pool,
                     )
                     frozen_sides = mod.freeze_encoders(teacher=freeze_teacher, student=freeze_student)
                     frozen_fragments += [
@@ -596,7 +601,8 @@ class YOLOFDistillationModel(DetectionModel):
                     modules.append(mod)
                     msgs.append(
                         f"x{li}{tuple(t_feat.shape[1:])} <- n{self._dict_student_layer}{tuple(s_tap.shape[1:])} "
-                        f"(token grid {grid}x{grid}, match={mod.match}, norm={match_norm}, init={match_init}, "
+                        f"(token grid {grid}x{grid}, match={mod.match}, pool={mod.match_pool}, "
+                        f"norm={match_norm}, init={match_init}, "
                         f"teacher_encoder={teacher_encoder}, student_encoder={mod.student_encoder}, "
                         f"proj={proj_form}, freeze(teacher={freeze_teacher}, student={freeze_student}), "
                         f"frozen_sides={frozen_sides or '-'})"

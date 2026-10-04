@@ -103,7 +103,7 @@ class DeconvNet(nn.Module):
 # forms follow MobileNetV2: ``depthwise`` is a per-channel 3x3 with no cross-channel
 # mixing, ``depthwise_separable`` appends the 1x1 pointwise that restores it.
 # Depthwise forms require in_channels == out_channels.
-_ENCODER_FORMS = ("full", "depthwise", "depthwise_separable")
+_ENCODER_FORMS = ("full", "depthwise", "depthwise_separable", "depthwise_upsample")
 
 
 class ChannelIdentityProjection(nn.Module):
@@ -209,6 +209,9 @@ def _normalize_encoder_form(form: str) -> str:
         "separable": "depthwise_separable",
         "dw_pw": "depthwise_separable",
         "mobilenetv2": "depthwise_separable",
+        "dwup": "depthwise_upsample",
+        "dw_up": "depthwise_upsample",
+        "depthwise_up": "depthwise_upsample",
     }
     raw = aliases.get(raw, raw)
     if raw not in _ENCODER_FORMS:
@@ -216,8 +219,13 @@ def _normalize_encoder_form(form: str) -> str:
     return raw
 
 
-def _build_encoder(channels: int, form: str) -> nn.Sequential:
-    """Build a dictionary key/query encoder with the requested form."""
+def _build_encoder(channels: int, form: str, in_size: int | None = None,
+                   out_size: int | None = None) -> nn.Sequential:
+    """Build a dictionary key/query encoder with the requested form.
+
+    ``in_size`` / ``out_size`` are only needed by ``depthwise_upsample``, which is the one form that
+    changes the spatial size (it is what maps the student tap onto the teacher's resolution).
+    """
     c = int(channels)
     if form == "full":
         return nn.Sequential(
@@ -238,6 +246,36 @@ def _build_encoder(channels: int, form: str) -> nn.Sequential:
             nn.Conv2d(c, c, kernel_size=1, stride=1, padding=0, bias=False),
             nn.BatchNorm2d(c),
         )
+    if form == "depthwise_upsample":
+        # The student-side encoder used when the matching is done at full resolution: it both
+        # transforms the features and RESAMPLES them onto the teacher's spatial size, using only
+        # depthwise convolutions (groups == channels, so no channel mixing) followed by BN and an
+        # activation. Deliberately no average pooling and no interpolation: the spatial change is
+        # done by the learnable transposed depthwise conv, matching the requested design.
+        if in_size is None or out_size is None:
+            raise ValueError("depthwise_upsample needs in_size and out_size")
+        in_size, out_size = int(in_size), int(out_size)
+        scale = max(out_size // max(in_size, 1), 1)
+        num_up = max(int(round(math.log2(scale))), 0) if scale > 1 else 0
+        layers: list[nn.Module] = []
+        if num_up == 0:
+            # Already at the target resolution: keep the depthwise conv + BN + activation shape so
+            # the architecture is the same kind of block, just without any upsampling.
+            layers += [
+                nn.Conv2d(c, c, kernel_size=3, stride=1, padding=1, groups=c, bias=False),
+                nn.BatchNorm2d(c),
+                nn.ReLU(inplace=True),
+            ]
+        else:
+            for _ in range(num_up):
+                # kernel 2 / stride 2 doubles the side exactly, so the stack lands on out_size when
+                # the scale is a power of two; `forward` interpolates only as a guard otherwise.
+                layers += [
+                    nn.ConvTranspose2d(c, c, kernel_size=2, stride=2, groups=c, bias=False),
+                    nn.BatchNorm2d(c),
+                    nn.ReLU(inplace=True),
+                ]
+        return nn.Sequential(*layers)
     raise ValueError(f"Unknown dictionary encoder form={form!r}; expected one of {list(_ENCODER_FORMS)}")
 
 
@@ -312,6 +350,10 @@ class DictionaryModule(nn.Module):
         t_size (int): teacher feature spatial size (H == W) at trace time.
         s_size (int): student feature spatial size (H == W) at trace time.
         grid (int): pooled token grid; token dim d = grid * grid.
+        match_pool (str): ``avg`` pools both sides to ``grid x grid`` before matching (the common
+            space that makes the two different-sized maps comparable); ``none`` skips that pooling
+            and matches on the full maps, with the student resampled to the teacher's spatial size,
+            giving d = t_size * t_size.
         match (str): ``soft``, ``hard``, or ``straight_through``.
         temperature (float): softmax temperature for soft matching.
         teacher_encoder (bool): build the teacher-side (key) encoder.
@@ -336,6 +378,7 @@ class DictionaryModule(nn.Module):
         proj_form: str = "deconv",
         proj_kernel: int = 3,
         fixed_map=None,
+        match_pool: str = "avg",
     ):
         super().__init__()
         match_aliases = {
@@ -380,11 +423,29 @@ class DictionaryModule(nn.Module):
         # is needed; building them would only add parameters that cannot influence anything.
         self.has_teacher_encoder = bool(teacher_encoder) and self.match != "fixed"
         self.key_enc = _build_encoder(c_t, "full") if self.has_teacher_encoder else None
-        # Student query path: same encoder family without downsampling conv stride.
+        # Student query path: same encoder family without downsampling conv stride. The
+        # `depthwise_upsample` form additionally resamples onto the teacher's spatial size, which is
+        # how the no-pool matching gets two maps of the same shape.
         self.student_encoder = _normalize_encoder_form(student_encoder)
         self.query_enc = (
-            None if self.match == "fixed" else _build_encoder(c_s, self.student_encoder)
+            None
+            if self.match == "fixed"
+            else _build_encoder(c_s, self.student_encoder, in_size=s_size, out_size=t_size)
         )
+        # Tokenisation for the matching step. ``avg`` pools both sides to a grid x grid map
+        # (``grid`` comes from ``dict_match_grid_divisor``; the recipe default is 2x2, i.e. d = 4),
+        # which is what makes the two sides comparable: teacher and student taps have different
+        # spatial sizes, so the pooled grid is the common space. ``none`` removes that pooling and
+        # matches on the FULL feature maps instead: the student side must then already be at the
+        # teacher's resolution, which is what the ``depthwise_upsample`` encoder form does (depthwise
+        # conv + BN + activation, no pooling, no interpolation). d becomes Ht * Wt. The interpolate
+        # below is only a guard for a form that reaches the same spatial size some other way.
+        self.match_pool = str(match_pool or "avg").lower()
+        if self.match_pool not in {"avg", "none"}:
+            raise ValueError(
+                "Unknown match_pool=%r; expected 'avg' (pooled grid tokens) or 'none' "
+                "(full-resolution tokens)" % (match_pool,)
+            )
         self.pool = nn.AdaptiveAvgPool2d(grid)
         # The projection. Under a frozen-encoder assignment (hard / index / fixed) this is
         # the only randomly initialised parameter in the module that training can still
@@ -613,8 +674,20 @@ class DictionaryModule(nn.Module):
             )
         else:
             k_src = self.key_enc(t_feat) if self.key_enc is not None else t_feat
-            k = self.pool(k_src).flatten(2)  # (B, Ct, d)
-            q = self.pool(self.query_enc(s_feat)).flatten(2)  # (B, Cs, d)
+            q_src = self.query_enc(s_feat)
+            if self.match_pool == "none":
+                # No average pooling: match on the full feature maps. Both sides must flatten to the
+                # same d, so the student side is resampled to the teacher's spatial size (the
+                # module's convention is student -> teacher space). d becomes Ht*Wt instead of
+                # grid*grid, i.e. every pixel contributes rather than a grid*grid average.
+                if q_src.shape[-2:] != k_src.shape[-2:]:
+                    q_src = F.interpolate(q_src, size=k_src.shape[-2:], mode="bilinear",
+                                          align_corners=False)
+                k = k_src.flatten(2)   # (B, Ct, Ht*Wt)
+                q = q_src.flatten(2)   # (B, Cs, Ht*Wt)
+            else:
+                k = self.pool(k_src).flatten(2)  # (B, Ct, d)
+                q = self.pool(q_src).flatten(2)  # (B, Cs, d)
             if self.match_norm == "l2":
                 k = F.normalize(k, dim=2)
                 q = F.normalize(q, dim=2)
