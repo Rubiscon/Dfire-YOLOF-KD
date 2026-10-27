@@ -118,8 +118,8 @@ EMA_DECAY = 0.9999
 EMA_TAU = 2000
 
 # Dataset contract. CLASS_NAMES / NUM_CLASSES are the D-Fire defaults, so existing D-Fire
-# tests and docs stay valid. VOC2007 is the other allowed host dataset (trainval->train,
-# test->val/test).
+# tests and docs stay valid. VOC2007 is the other allowed host dataset, using trainval as the
+# train split and test as both val and test.
 NUM_CLASSES = 2
 CLASS_NAMES = {0: "smoke", 1: "fire"}
 VOC2007_NUM_CLASSES = 20

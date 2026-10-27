@@ -168,7 +168,7 @@ def main():
     rel = abs(align_on - align_off) / max(abs(align_off), 1e-9)
     print("align term: ON=%.6f OFF=%.6f  relative difference=%.4f" % (align_on, align_off, rel))
     assert rel > 1e-6, (
-        "the align term did not change when the flags were toggled -- the cfg keys are being "
+        "the align term did not change when the flags were toggled: the cfg keys are being "
         "dropped (check _KD_EXTRA_KEYS and the CLI allowlist), or the weighting is inert"
     )
     assert float(total_on) != float(total_off), "flags had no effect on the total loss"

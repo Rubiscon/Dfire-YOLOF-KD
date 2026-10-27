@@ -123,8 +123,8 @@ def test_conf_weighting_lets_a_confident_target_dominate():
     # anchor 0: perfect fit but low teacher confidence; anchor 1: bad fit but confident.
     ciou_loss = torch.tensor([0.0, 10.0])
     conf = torch.tensor([0.05, 0.95])
-    unweighted = ciou_loss.mean()                    # 5.0 -- both count equally today
-    weighted = W(conf, ciou_loss)                    # 9.5 -- the confident target dominates
+    unweighted = ciou_loss.mean()                    # 5.0, both count equally
+    weighted = W(conf, ciou_loss)                    # 9.5, the confident target dominates
     assert weighted > unweighted
     assert torch.isclose(weighted, torch.tensor(9.5), atol=1e-5)
 

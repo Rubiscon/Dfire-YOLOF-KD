@@ -34,7 +34,7 @@ def test_identity_projection_is_parameter_free_and_channel_local():
 
 
 def test_deconv_projection_mixes_channels():
-    """The shipped projection is NOT channel local -- this is what absorbs the pairing."""
+    """The shipped projection mixes channels, which is what absorbs the pairing."""
     torch.manual_seed(0)
     proj = DeconvNet(4, 4, 3, 6)
     x = torch.randn(1, 4, 3, 3)

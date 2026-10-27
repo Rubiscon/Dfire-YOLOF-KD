@@ -138,32 +138,30 @@ class ChannelIdentityProjection(nn.Module):
 
 
 class ChannelLocalProjection(nn.Module):
-    """Channel-local projection WITH parameters: a depthwise conv, identity-initialised.
+    """Channel-local projection with parameters: a depthwise conv, identity-initialised.
 
-    Purpose. The parameter-free ``ChannelIdentityProjection`` above keeps the pairing visible
-    (13.4% of the align loss instead of 0.03%) but gives the model nothing to learn, so the
-    pairing has to carry the whole benefit by itself. This form keeps the pairing visible
-    while restoring a small amount of learnable freedom -- one spatial filter per channel.
+    The parameter-free ``ChannelIdentityProjection`` above keeps the pairing visible (13.4% of
+    the align loss instead of 0.03%) but gives the model nothing to learn, so the pairing has to
+    carry the whole benefit by itself. This form keeps the pairing visible while restoring a
+    small amount of learnable freedom: one spatial filter per channel.
 
-    Why depthwise (``groups=C``). Channel-locality is what keeps the pairing visible, and
-    ``groups=C`` guarantees it *structurally*: output channel c depends only on input channel
-    c, whatever the weights are. A mixing projection cannot preserve the pairing even in
-    principle, and a plain ``Conv2d(C, C, 1)`` (per-channel affine) does not work either --
-    see below.
+    Depthwise (``groups=C``). Channel-locality is what keeps the pairing visible, and
+    ``groups=C`` guarantees it structurally: output channel c depends only on input channel c,
+    whatever the weights are. A mixing projection cannot preserve the pairing even in principle,
+    and a plain ``Conv2d(C, C, 1)`` per-channel affine does not work either; see below.
 
-    Why a k x k kernel and not a per-channel affine. The align loss standardises each channel
-    over space (zero mean, unit variance). A per-channel affine ``a*S + b`` is EXACTLY
-    cancelled by that step -- ``standardize(a*S + b) = sign(a)*standardize(S)`` -- so its
-    parameters receive no gradient (measured: 1.4e-05 against 2.0e-02 for the k=3 form, and
-    the residual is pure ``eps`` leakage). Such a projection would silently sit at its
-    initialisation for the whole run and measure nothing. A k x k depthwise filter is not
-    cancelled, because standardisation removes only the per-channel mean and scale, not the
-    spatial reweighting.
+    Kernel instead of per-channel affine. The align loss standardises each channel over space
+    (zero mean, unit variance). A per-channel affine ``a*S + b`` is exactly cancelled by that
+    step, since ``standardize(a*S + b) = sign(a)*standardize(S)``, so its parameters receive no
+    gradient (1.4e-05 against 2.0e-02 for the k=3 form, and the residual is pure ``eps``
+    leakage). Such a projection would sit at its initialisation for the whole run and measure
+    nothing. A k x k depthwise filter is not cancelled, because standardisation removes only the
+    per-channel mean and scale, not the spatial reweighting.
 
     Initialisation is the identity (centre tap = 1, bias = 0), so training starts from the
-    configuration whose behaviour is already known, and note that the identity form passes
-    about 4.7x more align gradient to the student tap than ``DeconvNet`` does at the same
-    ``dict_align_loss`` -- the align weight may need to come down accordingly.
+    configuration whose behaviour is already known. The identity form also passes about 4.7x more
+    align gradient to the student tap than ``DeconvNet`` at the same ``dict_align_loss``, so the
+    align weight may need to come down accordingly.
     """
 
     def __init__(self, channels, out_size, kernel: int = 3, init_seed: int | None = None):

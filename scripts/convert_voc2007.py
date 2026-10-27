@@ -292,7 +292,7 @@ def convert(
     (output / "voc2007.yaml").write_text(yaml_text("."), encoding="utf-8")
     manifest = {
         "dataset": "VOC2007",
-        "protocol": "trainval->train, test->val/test",
+        "protocol": "trainval as train, test as val and test",
         "skip_difficult": True,
         "source": str(voc).replace("\\", "/"),
         "trainval": counts["trainval"],

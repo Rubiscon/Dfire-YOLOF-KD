@@ -3,7 +3,7 @@
 Baselines:
   yolo26n       - YOLO26n FPN upper bound
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
-  early         - dictionary KD (n10<->x6, attention weight)
+  early         - dictionary KD, n10 against x6, attention weight
   early-dldx    - same recipe + saliency_dLdx (dJ_task/dx^e)
   early-dldx-offline - frozen shared teacher
   infomax       - dLdx/old-AT base + straight-through InfoMax channel matching
@@ -21,7 +21,7 @@ Usage:
   python scripts/train_baselines.py --baseline early-tune1,early-tune2
   python scripts/train_baselines.py --baseline all
   python scripts/train_baselines.py --baseline early --test-only
-Aliases: kd-early -> early, early-S1a -> early-dldx.
+Aliases: kd-early is `early`, early-S1a is `early-dldx`.
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ _KD_COMMON: dict[str, Any] = {
 
 
 def _kd_early(**overrides: Any) -> dict[str, Any]:
-    """KD early recipe: student n10 <-> teacher x6. Overrides are layered on the shared keys."""
+    """KD early recipe: student n10 against teacher x6. Overrides layer on the shared keys."""
     cfg: dict[str, Any] = {
         "trainer": "kd",
         "model": "models/yolo26n-DCN.yaml",
@@ -184,7 +184,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     # Former kd-early / early-3 attention recipe (hyperparams unchanged).
     "early": _kd_early(
         name="baseline-kd-early",
-        description="dictionary KD: n10<->x6, hard match, attention weight, pretrained student",
+        description="dictionary KD: n10 against x6, hard match, attention weight, pretrained student",
     ),
     # Former early-S1a (hyperparams unchanged).
     "early-dldx": _kd_early(

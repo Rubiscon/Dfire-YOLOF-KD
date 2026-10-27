@@ -1,4 +1,4 @@
-"""Smoke: does `pindwsz_s6` (S[6] <-> T[6]) work end to end?
+"""Smoke: does `pindwsz_s6` (S[6] against T[6]) work end to end?
 
 Pins four things the config alone cannot show:
   1. the variant resolves with the shape-matched pairing and keeps (2)/(3) intact;
@@ -95,7 +95,7 @@ def test_projection_does_not_resample(model):
     mod = model.dictionary_modules[0]
     assert mod.query_enc is not None
     kinds = [type(x).__name__ for x in mod.query_enc.modules()]
-    assert "ConvTranspose2d" not in kinds, "P^D must not resample for S[6] <-> T[6]: %s" % kinds
+    assert "ConvTranspose2d" not in kinds, "P^D must not resample for S[6] against T[6]: %s" % kinds
     convs = [m for m in mod.query_enc.modules() if isinstance(m, torch.nn.Conv2d)]
     for c in convs:
         assert c.groups == c.in_channels == c.out_channels, "P^D must stay depthwise"

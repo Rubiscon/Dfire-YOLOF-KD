@@ -636,8 +636,8 @@ def test_delay_arms_move_only_the_schedule(delayed, base, expected):
 
 
 def test_delay_gate_switches_the_whole_dictionary_branch_off_and_on():
-    """`_dict_active` gates align AND AT, so before the start epoch nothing from the
-    dictionary reaches the student -- this is the property the delay arms rely on."""
+    """`_dict_active` gates align and attention, so before the start epoch nothing from the
+    dictionary reaches the student, which is the property the delay arms rely on."""
     from types import SimpleNamespace
 
     from ultralytics.models.yolo.detect.train import YOLOFDistillationModel
@@ -700,7 +700,7 @@ def test_pindwonly_keeps_the_dictionary_gains_and_does_not_touch_align_gating():
     from scripts.train_dfs import _DFIRE_KD_VARIANTS as V
 
     cfg = _yolo_overrides(build_overrides("dcn-kd", _args(kd_variant="pindwonly")))
-    assert cfg["dict_align_loss"] > 0.0, "dictionary align must stay on -- this arm is 'dict only'"
+    assert cfg["dict_align_loss"] > 0.0, "dictionary align must stay on; this arm is dict only"
     assert cfg["dict_attn_loss"] > 0.0, "dictionary attention must stay on"
     assert cfg["align"] is True, "align gating must stay at its default (see the docstring)"
 
@@ -889,12 +889,12 @@ def test_match_pool_rejects_an_unknown_value():
     ("pindwonly", "pindwonlynp", "depthwise_upsample"),
 ])
 def test_nopool_arms_move_only_the_pool_and_encoder_keys(base, arm, expect_enc):
-    """The `np` arms change exactly two keys, and BOTH belong to the one requested modification.
+    """The `np` arms change exactly two keys, and both belong to the one requested modification.
 
-    The specification is: "use only depthwise conv + BN + activation to map the student's spatial size
-    onto the teacher's, with no average-pool downsampling". Implemented literally that is
-      * dict_match_pool          "none"                 -- the pooling is gone
-      * dict_student_encoder     "depthwise_upsample"   -- and the conv now does the resampling
+    The specification is to use only depthwise conv + BN + activation to map the student's spatial
+    size onto the teacher's, with no average-pool downsampling. Implemented literally that is
+      * dict_match_pool          "none"                 the pooling is gone
+      * dict_student_encoder     "depthwise_upsample"   and the conv now does the resampling
     so two keys move, not one. An earlier implementation changed only the pool and did the spatial
     mapping with a bilinear interpolate, which matched the first clause but not the second.
     """

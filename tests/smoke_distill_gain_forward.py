@@ -142,7 +142,7 @@ def _capture_dict_losses(model):
     """Wrap `_dictionary_losses` to record its 4-tuple, which the reported loss items omit.
 
     loss_items only has slots for (box, cls, dfl, align, feature, dict_align, dict_attn, t_box,
-    t_cls, t_dfl) -- commit and InfoMax are NOT reported, so they must be captured here or a
+    t_cls, t_dfl). Commit and InfoMax are not reported, so they must be captured here or a
     silent InfoMax failure would be invisible.
     """
     rec = {}
@@ -174,7 +174,7 @@ def test_the_align_term_is_not_silently_zero(harness):
     """Regression guard for the ill-posed signed channel-mean weight.
 
     With the signed map the mass-normalised mean returned exactly 0.0 (sum(W) ~ -1e12 from
-    cancellation), so J_SSM was computed, reported as 0 and contributed nothing -- with no error.
+    cancellation), so J_SSM was computed, reported as 0, and contributed nothing, with no error.
     """
     model = harness["build"]()
     rec = _capture_dict_losses(model)

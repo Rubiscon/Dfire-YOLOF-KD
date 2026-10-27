@@ -76,9 +76,9 @@ BASELINES: dict[str, dict[str, Any]] = {
     #
     # In this codebase the Detect head derives its hidden width from the *first* level's
     # channel count, so a tap that emits fewer channels also narrows the C5 branch:
-    #   dcn-solo-p3     wide head + tap   vs  dcn-solo     -> isolates "one added lattice"
-    #   dcn-solo-headn  narrow head, no tap  (control)
-    #   dcn-solo-p3n    narrow head + tap vs dcn-solo-headn -> isolated, cheaper variant
+    #   dcn-solo-p3     wide head + tap vs dcn-solo: isolates the added lattice
+    #   dcn-solo-headn  narrow head, no tap (control)
+    #   dcn-solo-p3n    narrow head + tap vs dcn-solo-headn: isolated, cheaper variant
     "dcn-solo-p3": {
         "trainer": "detect",
         "description": "YOLOF-DCN solo + stride-8 high-resolution tap (wide Detect head)",
@@ -179,11 +179,11 @@ _KD_RECIPE: dict[str, Any] = {
     "dict_saliency_clip": 0.0,
 }
 
-# VOC2007 overlay on the D-Fire dLdx recipe. Response align at epoch 21 dumped
-# student mAP50 by 16 points (0.551 -> 0.393) because TAL+KL on a still-weak
-# 20-class teacher dominates box/cls GT. Delay align until the online teacher
-# is competent, cut box/KL gains so YOLOF can keep fitting its own boxes
-# (mAP50-95), and hold attention restriction until the same point.
+# VOC2007 overlay on the D-Fire dLdx recipe. Response align at epoch 21 cost 16 points of
+# student mAP50 (0.551 to 0.393) because TAL+KL on a still-weak 20-class teacher dominates
+# box/cls GT. Delay align until the online teacher is competent, cut the box/KL gains so
+# YOLOF can keep fitting its own boxes (mAP50-95), and hold the attention restriction until
+# the same point.
 _VOC_KD_OVERRIDES: dict[str, Any] = {
     "align_start_epoch": 80,
     "align_loss": 0.06,
@@ -378,9 +378,9 @@ _DFIRE_KD_VARIANTS.update(
         # series estimated on held-out images; chance = 0.78%): random encoders 0.72-0.75%,
         # identity encoders 1.33% at d=4 and 2.08% at d=100.
         "identinit": {**_DICT_ST_DIAG, "dict_match_init": "identity"},
-        # Same function as identinit -- a frozen, identity-initialised encoder is an identity
-        # regardless of conv type -- with the teacher-side encoder removed and a depthwise
-        # student encoder, so the module drops from 1,000,448 to 265,216 parameters.
+        # Same function as identinit: a frozen, identity-initialised encoder is an identity
+        # regardless of conv type. Here the teacher-side encoder is removed and the student
+        # encoder is depthwise, so the module drops from 1,000,448 to 265,216 parameters.
         "dwident": {
             **_DICT_ST_DIAG,
             "dict_teacher_encoder": False,
@@ -411,9 +411,10 @@ _DFIRE_KD_VARIANTS.update(
         #   (a) the freeze fix: encoder BatchNorm held in eval mode and the parameters kept out
         #       of the optimizer, versus the historical runs where BatchNorm sat in train mode;
         #   (b) any other code change between 09-18 and 09-24.
-        # Three points decompose them on the same machine:
-        #   r1-r3 (old code, unfrozen) vs nofreeze (new code, unfrozen) -> (b)
-        #   nofreeze (new code, unfrozen) vs basefix (new code, frozen) -> (a)
+        # Three points decompose them on the same machine: the first pair gives (b) and the
+        # second gives (a).
+        #   r1-r3 (old code, unfrozen) vs nofreeze (new code, unfrozen)
+        #   nofreeze (new code, unfrozen) vs basefix (new code, frozen)
         # Switching the encoder BatchNorm between the two modes on identical weights reassigns
         # ~90% of student channels (assignment-map agreement 0.0985) and shifts the tokens by
         # ~1.0 in relative L2. For the identity-init family the freeze is also what makes the
@@ -459,8 +460,8 @@ _DFIRE_KD_VARIANTS.update(
         },
         # Identity-init arms. identinit fits the align term better but scores slightly lower
         # on val, so these separate the possible causes, all built on identinit:
-        #   identlowalign : halve dict_align_loss (0.12 -> 0.06).
-        #   identlowattn  : halve dict_attn_loss (0.25 -> 0.12).
+        #   identlowalign : halve dict_align_loss, 0.12 to 0.06.
+        #   identlowattn  : halve dict_attn_loss, 0.25 to 0.12.
         #   identattnfix  : compute the AT residual as raw student energy vs raw teacher
         #                   energy instead of raw vs standardised.
         "identlowalign": {
@@ -491,7 +492,7 @@ _DFIRE_KD_VARIANTS.update(
         #
         # With identity initialisation the encoder is the identity function whatever its conv
         # type, so the reassembled teacher target is bit-identical to the full-conv version and
-        # only the parameter count changes (dictionary module: 1,000,448 -> 265,216). With a
+        # only the parameter count changes (dictionary module: 1,000,448 to 265,216). With a
         # random init the depthwise form gives a worse assignment (top-1 0.023 vs 0.070), so
         # this is not the same thing as `dw`/`dwnf`.
         #
@@ -526,10 +527,10 @@ _DFIRE_KD_VARIANTS.update(
         #     encoders are frozen at their random init and no supervision term can train them.
         #
         # So these arms pair `dict_proj_form=channel_local` (depthwise 3x3, identity-init, 2560
-        # params) with a differentiable assignment -- `straight_through` (hard forward, soft
-        # backward) or full `soft` -- and use identity init for the encoders so the assignment
-        # starts from a meaningful map and is then refined. `dict_commit_loss` is the only term
-        # that directly supervises the pairing.
+        # params) with a differentiable assignment, either `straight_through` (hard forward,
+        # soft backward) or full `soft`, and use identity init for the encoders so the
+        # assignment starts from a meaningful map and is then refined. `dict_commit_loss` is the
+        # only term that directly supervises the pairing.
         #
         # alpha is swept at the recipe value (0.12) and 0.06, because a channel-local projection
         # passes about 4.7x more align gradient to the student tap than the shipped DeconvNet
@@ -547,19 +548,22 @@ _DFIRE_KD_VARIANTS.update(
         # --- the freeze requirement, tested PER SIDE ------------------------------------------
         # The requirement is asymmetric: the teacher-side encoder must stay fixed so the
         # distillation target is stable, while the student-side encoder may either adapt or stay
-        # fixed. Gradient flow measured on the real module says the teacher side never trains
-        # anyway -- align/AT consume a detached target, `commit` detaches its teacher-side target
-        # (`k_n.detach()`), and `dict_infomax_loss` is 0 in every arm of this project -- so the
-        # freeze flag on that side changes only its BatchNorm mode (batch vs running statistics).
-        # These two arms make the choice explicit and verifiable instead of incidental, and add the
-        # one cell that was never run: a straight-through arm whose STUDENT encoder is also frozen.
-        #   alocst06tf : teacher frozen, student trainable  (the instruction, stated explicitly)
-        #                Prediction: numerically indistinguishable from `alocst06`. If so, that is
-        #                the direct confirmation that the teacher side contributed no learning.
-        #   alocst06bf : teacher frozen, student ALSO frozen
-        #                Isolates what letting the student query encoder adapt is worth. `proj` is a
-        #                separate learnable path (s_proj = proj(s_feat)), so it keeps learning the
-        #                alignment from the align term; only the commit-driven query refinement stops.
+        # fixed. Gradient flow on the real module shows the teacher side never trains anyway:
+        # align/AT consume a detached target, `commit` detaches its teacher-side target
+        # (`k_n.detach()`), and `dict_infomax_loss` is 0 in every arm of this project. The freeze
+        # flag on that side therefore changes only its BatchNorm mode (batch vs running
+        # statistics).
+        # These two arms make the choice explicit and verifiable instead of incidental, and add
+        # the one cell that was never run: a straight-through arm whose student encoder is also
+        # frozen.
+        #   alocst06tf : teacher frozen, student trainable
+        #                Numerically indistinguishable from `alocst06` if the teacher side
+        #                contributed no learning, which is the check this arm exists for.
+        #   alocst06bf : teacher frozen, student also frozen
+        #                Isolates what letting the student query encoder adapt is worth. `proj` is
+        #                separate learnable path (s_proj = proj(s_feat)), so it keeps learning
+        #                alignment from the align term; only the commit-driven query refinement
+        #                stops.
         "alocst06tf": {
             **_DICT_A_ST,
             "dict_align_loss": 0.06,
@@ -588,8 +592,8 @@ _DFIRE_KD_VARIANTS.update(
         # encoder shapes shifts the RNG stream, so `proj` starts somewhere else: measured
         # under an identical seed, removing the teacher encoder and switching the student
         # encoder to depthwise moves proj's weights by up to 0.062. That is larger than the
-        # effects being measured, and with one run per arm it is not controlled for -- which
-        # is why `dwident` cannot currently be compared against the baseline.
+        # effects being measured, and with one run per arm it is not controlled for, which is
+        # why `dwident` cannot currently be compared against the baseline.
         # These three arms pin proj's initialisation to a single value so that the baseline
         # and the depthwise designs differ only by their encoders. They are comparable to
         # EACH OTHER; the historical runs used the natural (unpinned) initialisation and are
@@ -617,8 +621,8 @@ _DFIRE_KD_VARIANTS.update(
         #     0.046 small vs 0.018 large, so the gradient is spent where the teacher has least to
         #     give. w_i = clip((median_side/side_i)**1, 0.25, 4), mass-normalised by
         #     sum(w*v)/sum(w) so the loss scale (and therefore `align_box`) needs no retuning.
-        #     Effect on the small-object gradient share: 2.9% -> 14.4% (stride 32) and
-        #     7.4% -> 24.5% (stride 16). A weaker exponent barely moves it (p=0.5 -> 7.3%).
+        #     Effect on the small-object gradient share: 2.9% to 14.4% at stride 32 and 7.4% to
+        #     24.5% at stride 16. A weaker exponent barely moves it (p=0.5 gives 7.3%).
         #
         # (3) align_box_conf_weight. The class term is already soft in `tconf` (a 0.05-confidence
         #     box yields a near-uniform target), but the box term is an unweighted mean, so such a
@@ -648,9 +652,9 @@ _DFIRE_KD_VARIANTS.update(
         # (256ch, stride 32, 20x20): both axes are mismatched, so the projector has to resample
         # 2x spatially and bridge a 2:1 channel change. Measured shapes:
         #     T[6] = 128ch 40x40 stride 16        S[6] = 128ch 40x40 stride 16
-        # S[6] <-> T[6] shares channel count, spatial size and stride. The projector degrades to
-        # a plain depthwise 3x3 without resampling, and the matching compares two features that
-        # live in the same space.
+        # S[6] and T[6] match in channel count, spatial size and stride. The projector degrades
+        # to a plain depthwise 3x3 without resampling, and the matching compares two features
+        # that live in the same space.
         #
         # This separates the channel-axis correspondence from the shape mismatch that every
         # earlier arm carried with it. CanKD's cross-attention correspondence sits on the
@@ -1015,10 +1019,10 @@ _SSM: dict[str, Any] = {
 
 # ---------------------------------------------------------------------------------------------
 # Student/teacher tap pair. `dict_student_layer` selects the student feature; the teacher tap is
-# set by the arm. The default pair (student n10, 256ch/20x20 at stride 32 -> teacher x6,
-# 128ch/40x40 at stride 16) differs in both shape and stride, so the projector has to invent the
-# correspondence. Pairing the same stage on both sides (n6 -> x6) removes that freedom; the `_s6`
-# arms below exist to measure the difference.
+# set by the arm. The default pair is student n10 (256ch, 20x20 at stride 32) against teacher x6
+# (128ch, 40x40 at stride 16), which differs in both shape and stride, so the projector has to
+# invent the resampling. Pairing the same stage on both sides (n6 against x6) removes that
+# freedom; the `_s6` arms below measure the difference.
 # ---------------------------------------------------------------------------------------------
 _SSM_SIZED: dict[str, Any] = {
     **_SSM,

@@ -194,7 +194,8 @@ class YOLOFDistillationModel(DetectionModel):
         self.current_epoch = 0
         self.distill_conf_thres = 0.25
         self.distill_iou_thres = 0.5
-        # Per-scale feature alignment: f1<->N1, f2<->N2, f3<->N3 (matched by receptive field / depth).
+        # Per-scale feature alignment: f1 to N1, f2 to N2, f3 to N3, matched by receptive field and
+    # depth.
         self.distill_temperature = 3.0  # KD temperature for response-level KL (overridable via args)
         self._align_assigner: TaskAlignedAssigner | None = None
         self._align_assigner_topk: int | None = None
@@ -427,7 +428,7 @@ class YOLOFDistillationModel(DetectionModel):
     def _build_feature_projectors(
         self, student_features: List[torch.Tensor], teacher_features: List[torch.Tensor]
     ):
-        """One projector per (student block, FPN level) pair: f1<->N1, f2<->N2, f3<->N3.
+        """One projector per (student block, FPN level) pair: f1 with N1, f2 with N2, f3 with N3.
 
         Student blocks and teacher FPN feats are both ordered by ascending depth, so the
         shallow/small-dilation block (local features) aligns to the high-resolution shallow
@@ -1479,7 +1480,7 @@ class YOLOFDistillationModel(DetectionModel):
 
     @staticmethod
     def _weighted_align_mean(weight: torch.Tensor, value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-        """``sum(w * v) / sum(w)`` -- a mass-normalised mean.
+        """Return ``sum(w * v) / sum(w)``, a mass-normalised mean.
 
         Normalising by the weight *mass* (not the count) keeps the loss scale fixed when the
         weights change, so ``align_box`` / ``align_cls`` need no retuning. With uniform weights

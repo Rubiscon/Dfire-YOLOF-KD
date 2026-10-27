@@ -134,7 +134,7 @@ def test_init_seed_pins_the_trainable_projection_across_encoder_configs():
     `proj` is the only randomly initialised dictionary parameter that training can still
     move under a frozen-encoder assignment, and it is built after the encoders, so any
     change to the encoder shapes shifts the RNG stream and gives `proj` a different start.
-    Measured, that shift is up to 0.062 on the weights -- larger than the effects being
+    Measured, that shift is up to 0.062 on the weights, larger than the effects being
     measured. `init_seed` must pin it.
     """
     kw = dict(match="hard", temperature=0.07, match_norm="l2")
