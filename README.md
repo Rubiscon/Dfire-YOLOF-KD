@@ -3,9 +3,6 @@
 Knowledge distillation from a YOLO26n feature-pyramid teacher into a YOLOF-style student on
 the D-Fire smoke/fire benchmark, inside one Ultralytics fork.
 
-The detection loss gains three terms: **SSM** (sliced-semantics matching over encoder
-features), **RFM** (receptive-field matching against the teacher pyramid), and **RKD**
-(response distillation from teacher pseudo-labels).
 
 ## Layout
 
