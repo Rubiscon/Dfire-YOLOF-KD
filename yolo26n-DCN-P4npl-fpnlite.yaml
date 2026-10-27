@@ -1,34 +1,8 @@
-# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head,
-# a stride-16 tap, AND a top-down fusion path: a minimal 2-level FPN.
+# YOLO26 with a DCN-enhanced YOLOF head, a stride-16 tap and a two-level top-down FPN.
 #
-# WHY THIS FILE EXISTS -- it is the falsification test for the paper's claim.
-#
-# yolo26n-DCN-P4n-pl.yaml adds a narrow stride-16 lattice but deliberately gives it NO signal
-# from C5: the tap sees only backbone stride-16 features, so that level carries local texture
-# and little semantics. The claim being made from that model is "sampling density is the
-# effective ingredient; FPN's expensive machinery (top-down path, lateral connections, fusion
-# conv, full-width P3) is not what is doing the work".
-#
-# That claim is only credible if someone actually adds the top-down path and shows it does not
-# help much. This model is exactly that:
-#
-#   * same backbone, same dilated encoder, same tap  (identical to P4n-pl)
-#   * plus: C5 is projected to the tap's width, upsampled to stride 16, concatenated with the
-#     tap, and fused back down. That is a genuine (if minimal) top-down FPN on two levels.
-#
-# Reading the result:
-#   AP_S rises a lot over P4n-pl  -> top-down semantic flow IS the active ingredient.
-#                                    Then the tap is an incomplete FPN, and the paper cannot
-#                                    claim "density, not FPN". Narrative must change.
-#   AP_S barely moves             -> density was the ingredient. This also explains why none of
-#                                    the nine controlled distillation variants could lift AP_S:
-#                                    no distillation objective adds sampling points.
-#
-# Detect input widths are held at [48 (stride 16), 128 (stride 32)] via `head_width: per_level`,
-# the same as P4n-pl, so the comparison isolates the top-down path.
-#
-# Layer indices: 11 = projection, 12/13/14 = dilated blocks (C5), 15 = stride-16 tap,
-# 16 = C5 lateral, 17 = upsample, 18 = concat, 19 = fusion, 20 = Detect.
+# Head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8), 15 = tap, 16 = C5 lateral,
+# 17 = upsample, 18 = concat, 19 = fusion, 20 = Detect. C5 is projected to the tap width,
+# upsampled and fused into it; Detect widths [48, 128] match yolo26n-DCN-P4n-pl.yaml.
 nc: 2 # number of classes
 end2end: True
 reg_max: 1

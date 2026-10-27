@@ -1,16 +1,8 @@
-# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head
-# and a narrowed detection head: the control arm for yolo26n-DCN-P3n.yaml.
+# YOLO26 with a DCN-enhanced YOLOF head and a C5 bottleneck, no extra lattice.
 #
-# Reason this file exists. In this codebase the Detect head derives its hidden width from
-# the *first* level's channel count:
-#     c2 = max(16, ch[0] // 4, reg_max * 4),   c3 = max(ch[0], min(nc, 100))
-# A stride-8 tap emitting 48 channels therefore also narrows the C5 head branch. Comparing
-# a tap model against the wide-head baseline would confound "added lattice" with "narrower
-# head". This arm applies the same 128 -> 48 bottleneck to the C5 path *without* the tap, so
-# that yolo26n-DCN-P3n.yaml differs from this model in exactly one thing: the added lattice.
-#
-# Layer indices in the head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8),
-# 15 = C5 bottleneck, 16 = Detect.
+# Head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8), 15 = C5 bottleneck,
+# 16 = Detect. Control arm for yolo26n-DCN-P3n.yaml: the 128 -> 48 bottleneck reproduces the
+# head width the stride-8 tap produces, so the two models differ only by the added lattice.
 nc: 2 # number of classes
 end2end: True
 reg_max: 1

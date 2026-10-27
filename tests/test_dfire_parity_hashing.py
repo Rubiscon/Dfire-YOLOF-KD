@@ -56,8 +56,8 @@ def test_enforce_and_manifest_roundtrip(tmp_path):
         str(work),
         seed=0,
         current_hash=current,
-        student_model_yaml="/root/Ultra/models/yolo26n-DCN.yaml",
-        student_init_weights="/root/Ultra/weights/yolo26n.pt",
+        student_model_yaml="yolo26n-DCN.yaml",
+        student_init_weights="yolo26n.pt",
         reference_path=str(reference),
     )
     manifest = (work / "student_init_state.json").read_text(encoding="utf-8")

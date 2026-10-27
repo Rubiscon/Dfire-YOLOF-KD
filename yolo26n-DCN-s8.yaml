@@ -1,16 +1,8 @@
-# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head,
-# SINGLE detection level moved from C5 (stride 32) to C3 (stride 8).
+# YOLO26 with a DCN-enhanced YOLOF head whose single detection level sits at stride 8.
 #
-# The more aggressive variant of yolo26n-DCN-s16.yaml: an 80x80 detection lattice, still a
-# single level and still one consumption of the backbone. Dilation is scaled by 4x to keep
-# the absolute receptive field: 1 + 2*(d1+d2+d3) cells; (8,24,32) -> 129 cells -> ~1032 px at
-# stride 8, versus 33 cells -> ~264 px if the shipped (2,6,8) were kept.
-#
-# Expect a large accuracy/compute trade: the head now runs at 80x80 while the backbone still
-# computes every layer including SPPF+C2PSA at stride 32 (Ultralytics runs the backbone
-# sequentially, so reading an earlier layer does NOT skip the later ones).
-#
-# Layer indices in the head: 11 = projection, 12/13/14 = dilated blocks, 15 = Detect.
+# Head: 11 = projection, 12/13/14 = dilated blocks, 15 = Detect. The level reads C3, giving
+# an 80x80 lattice at imgsz 640. Dilations are scaled 4x to (8, 24, 32) for full-image
+# coverage; the backbone still runs every later layer.
 nc: 2 # number of classes
 end2end: True
 reg_max: 1

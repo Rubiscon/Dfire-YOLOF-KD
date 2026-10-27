@@ -218,8 +218,6 @@ archive/
 experiments/
 local/
 configs/local/
-Log/
-Log1/
 
 # Notebooks (optional; remove this block if team tracks notebooks)
 notebooks/
@@ -235,7 +233,6 @@ _crisreport*/
 
 # Run artifacts (Ultralytics already ignores runs/; reinforce)
 *.csv
-!docs/**/*.csv
 teacher_val.csv
 results.csv
 *_args.yaml
@@ -257,7 +254,7 @@ Desktop.ini
 
 # === Local experiment artefacts (never commit) ===
 # Run logs, scratch analyses and one-off orchestration scripts stay on the machine
-# that produced them. Only scripts/ and configs/ are versioned.
+# that produced them; only the entry points under scripts/ are versioned.
 Log*/
 results/
 tmp/

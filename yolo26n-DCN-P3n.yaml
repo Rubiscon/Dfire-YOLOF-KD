@@ -1,23 +1,9 @@
-# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head
-# plus a stride-8 high-resolution tap feeding a two-level Detect head.
+# YOLO26 with a DCN-enhanced YOLOF head, a stride-8 tap and a C5 bottleneck.
 #
-# Why the tap exists: the dilated encoder widens the receptive field on C5 but never adds
-# sampling points. At imgsz 640 the detection lattice is 20x20, so objects below about one
-# cell are not resolvable however strong the encoder is - dilation is not resolution. That
-# is the AP_S floor of this architecture, and no feature- or response-matching distillation
-# objective can lift it, because the information was never sampled.
-#
-# Design. The tap reads the backbone's stride-8 feature (layer 4), compresses it to a
-# 64-channel depthwise bottleneck, and expands to 48 channels: cheap, and it supplies the
-# detection head with an 80x80 lattice alongside the existing 20x20 one.
-#
-# Controlled comparison. The C5 path also passes through a 128 -> 48 bottleneck (layer 16),
-# so the Detect head has identical width in this model and in yolo26n-DCN-headn.yaml. The
-# only difference between the two models is the added stride-8 lattice.
-#
-# Layer indices in the head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8),
-# 15 = stride-8 tap, 16 = C5 bottleneck, 17 = Detect. The student backbone tap used by
-# dictionary distillation (dict_student_layer = 10, the C2PSA output) is unchanged.
+# Head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8), 15 = tap, 16 = C5
+# bottleneck, 17 = Detect. Under the default head-width rule both levels come out at
+# 48 channels, so this model differs from yolo26n-DCN-headn.yaml only by the added lattice.
+# The tap reads backbone layer 4; `dict_student_layer = 10` is unaffected.
 nc: 2 # number of classes
 end2end: True
 reg_max: 1

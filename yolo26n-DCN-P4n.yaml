@@ -1,23 +1,11 @@
-# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head
-# plus a narrow *stride-16* high-resolution tap.
+# YOLO26 with a DCN-enhanced YOLOF head, a stride-16 tap and a C5 bottleneck.
 #
-# Why stride 16 rather than 8. The stride-8 tap (yolo26n-DCN-P3n.yaml) lifted AP_S by 40% but
-# cost roughly 25% inference latency, because the added 80x80 lattice makes the detection head
-# do 16x the spatial work of the existing 20x20 one. A stride-16 tap gives a 40x40 lattice,
-# i.e. 4x the head work instead of 16x, for roughly half the added cost. The question is
-# whether enough of the AP_S gain survives at a latency that can be defended.
+# Head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8), 15 = tap, 16 = C5
+# bottleneck, 17 = Detect. Structural mirror of yolo26n-DCN-P3n.yaml with the tap moved
+# from backbone layer 4 (stride 8) to layer 5 (stride 16).
 #
-# This file is a byte-for-byte structural mirror of yolo26n-DCN-P3n.yaml with one change: the
-# tap reads backbone layer 5 (stride 16) instead of layer 4 (stride 8). Same tap width, same
-# C5 bottleneck, same Detect width, default (legacy) head-width rule. So the pair
-# "P3n vs P4n" isolates the stride of the added lattice and nothing else.
-#
-# Note on the numbers below: parse_model scales a base module's c2 by the model width
-# (0.25 at scale n) and rounds to 8, so the literal 192 becomes 48 channels, and 256 stays 256
-# because only c2 is scaled. Layer 5 already emits 128 channels at stride 16.
-#
-# Layer indices in the head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8),
-# 15 = stride-16 tap, 16 = C5 bottleneck, 17 = Detect.
+# parse_model scales a module's second channel by the model width (0.25 at n) and rounds to
+# 8, so the literal 192 becomes 48 while 256 stays 256.
 nc: 2 # number of classes
 end2end: True
 reg_max: 1

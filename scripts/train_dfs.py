@@ -119,22 +119,14 @@ BASELINES: dict[str, dict[str, Any]] = {
         "model": "yolo26n-DCN-P4n-pl.yaml",
         "name": "dcn-solo-p4npl",
     },
-    # --- The falsification test for the tap's claim -----------------------------------
-    # The tap deliberately receives no signal from C5, and the argument made from it is that
-    # sampling density is the effective ingredient while FPN's machinery is not. That argument
-    # is only credible if someone adds the top-down path and shows it does not pay. This arm
-    # does exactly that: same backbone, same dilated encoder, same tap, plus C5 projected,
-    # upsampled, concatenated and fused back into the high-resolution level. Detect input widths
-    # are held identical to dcn-solo-p4npl (stride [16, 32], c2 [16, 32], c3 [48, 128]).
+    # Same head as dcn-solo-p4npl plus a two-level top-down fusion: C5 is projected,
+    # upsampled, concatenated with the tap and fused back. Detect widths are held identical
+    # (stride [16, 32], c2 [16, 32], c3 [48, 128]).
     #
-    # Read AP_S: if it rises a lot, top-down semantics are the active ingredient, the tap is an
-    # incomplete FPN, and the paper's framing has to change. If it barely moves, density was the
-    # story -- which also explains why no distillation variant could lift AP_S.
-    #
-    # Measured locally: +47,808 parameters, +0.139 GFLOPs, +8.9% latency over dcn-solo-p4npl.
+    # Measured locally: +47,808 parameters, +0.139 GFLOPs, +8.9% latency.
     "dcn-solo-p4npl-fpnlite": {
         "trainer": "detect",
-        "description": "YOLOF-DCN stride-16 tap + minimal top-down FPN fusion (falsification test)",
+        "description": "YOLOF-DCN stride-16 tap + minimal top-down FPN fusion",
         "model": "yolo26n-DCN-P4npl-fpnlite.yaml",
         "name": "dcn-solo-p4npl-fpnlite",
     },
@@ -294,29 +286,26 @@ _DFIRE_KD_VARIANTS: dict[str, dict[str, Any]] = {
     },
 }
 
-# Dictionary-structure ablations (advisor instruction): drop the teacher-side
-# dictionary encoder entirely, and make the student-side encoder a MobileNetV2
-# depthwise conv. Everything else stays on the D_dldx_new_2 recipe so the only
-# moved variable is the dictionary geometry.
+# Dictionary-structure ablations: drop the teacher-side dictionary encoder entirely and make
+# the student-side encoder a MobileNetV2 depthwise conv. Everything else stays on the
+# D_dldx_new_2 recipe so the only moved variable is the dictionary geometry.
 #
-# Note: under hard matching the encoders receive no gradient (argmax is not
-# differentiable), so "depthwise + hard" is a fixed random depthwise projection.
-# The ``*st`` arms switch to straight_through (hard forward, soft backward, i.e.
-# Figure 2's assignment is preserved) AND enable the commitment loss, because
+# Under hard matching the encoders receive no gradient (argmax is not differentiable), so
+# "depthwise + hard" is a fixed random depthwise projection. The ``*st`` arms switch to
+# straight_through (hard forward, soft backward) and enable the commitment loss, because
 # ``target = t_reorg.detach()`` means alignment alone cannot train Q/K.
 #
-# ``basefix`` is the untouched baseline recipe; it exists so the batch has a
-# reference measured under the same (freeze-corrected) code as the ablations.
+# ``basefix`` is the untouched baseline recipe, measured under the same code as the ablations.
 _DICT_ST_DIAG = {"dict_match_log_interval": 100}
 
 # Pinned initialisation for the trainable dictionary projection (see the `pinbase` arm).
 # One value for the whole clean set, so every arm in it starts from the same projection.
 _DICT_INIT_SEED = 1234
 
-# VOC flavour of the advisor's architecture: the same sliced-matching dictionary as `pindw`
-# (teacher-side encoder removed, channel-local depthwise student encoder, pinned projection)
-# with the VOC recipe, which is applied automatically for `--dataset voc2007` before the
-# variant is layered on.
+# VOC flavour of the sliced-matching dictionary: the same setup as `pindw` (teacher-side
+# encoder removed, channel-local depthwise student encoder, pinned projection) with the VOC
+# recipe, which is applied automatically for `--dataset voc2007` before the variant is
+# layered on.
 #
 # The name is deliberately NOT `pindw`. The two tables are separate namespaces when RESOLVING a
 # variant, but the guard in `_apply_kd_variant` is name-based: any name present in
@@ -455,41 +444,28 @@ _DFIRE_KD_VARIANTS.update(
             **_DICT_ST_DIAG,
             "dict_freeze_encoders": False,
         },
-        # The advisor's instruction executed literally, but with the encoders left
-        # UNFROZEN: teacher-side dictionary module removed, student-side encoder changed
-        # to a MobileNetV2 depthwise conv, hard matching kept (proposal eq. 3 is an
-        # argmax), and no freezing.
+        # Same dictionary geometry with the encoders left UNFROZEN: teacher-side dictionary
+        # module removed, student-side encoder changed to a MobileNetV2 depthwise conv, hard
+        # matching kept.
         #
-        # Note on what "unfrozen" means here: under hard matching the argmax is not
-        # differentiable, so the encoders receive no gradient and their weights cannot
-        # change either way. The only real effect of not freezing is that their
-        # BatchNorm stays in train mode, so its running statistics track the data. That
-        # is exactly the condition the historical r1-r3 baselines ran under (their
-        # freeze call was silently undone by the trainer), which makes this arm both the
-        # faithful reading of the instruction and a same-condition reference for them.
+        # Under hard matching the argmax is not differentiable, so the encoders receive no
+        # gradient either way. Not freezing only keeps their BatchNorm in train mode, which is
+        # the condition the older r1-r3 baselines ran under (their freeze call was undone by
+        # the trainer), so this arm doubles as a same-condition reference for them.
         "dwnf": {
             **_DICT_ST_DIAG,
             "dict_teacher_encoder": False,
             "dict_student_encoder": "depthwise",
             "dict_freeze_encoders": False,
         },
-        # --- component ablations for the narrative -------------------------------
-        # The paper claims four contributions (sliced matching, spatial-energy AT, FPN
-        # projection, delayed TAL) but only the dictionary has been probed. These three
-        # isolate the load-bearing claims, one moved variable each:
+        # Component ablations, one moved variable each:
         #   indexmatch : matching replaced by a fixed per-channel alignment
-        #                (student channel s <- teacher channel s mod Ct), everything else
-        #                identical to the recipe. Answers "does the argmax matching beat
-        #                naive channel alignment?" -- i.e. whether "matching" earns its
-        #                place in the title.
-        #   nodict     : alpha = beta = 0, so BOTH the sliced weighted align and the
-        #                spatial-energy AT term are off (both live in _dictionary_losses);
-        #                feature/response branches untouched. Answers "is the dictionary
-        #                branch necessary at all?"
-        #   unifw      : dict_weight=none, i.e. the same mass-normalised reduction with a
-        #                uniform weight instead of S = mean_c|dLt/dxe|. The saliency pass
-        #                is skipped entirely (no extra teacher backward). Answers "does
-        #                the |dLt/dxe| weighting matter?" -- the phrase in contribution 2.
+        #                (student channel s <- teacher channel s mod Ct).
+        #   nodict     : dict_align_loss = dict_attn_loss = 0, feature and response
+        #                branches untouched.
+        #   unifw      : dict_weight=none, the same mass-normalised reduction with a
+        #                uniform weight instead of S = mean_c|dLt/dxe|, so the saliency
+        #                backward is skipped.
         "indexmatch": {
             **_DICT_ST_DIAG,
             "dict_match": "index",
@@ -503,45 +479,24 @@ _DFIRE_KD_VARIANTS.update(
             **_DICT_ST_DIAG,
             "dict_weight": "none",
         },
-        # --- is the identity-init harm a tuning artefact, or the implementation? --------
-        # identinit made the align term fit better (dict_loss 1.703 -> 1.59/1.65) while the
-        # AT residual roughly doubled (0.174 -> 0.31/0.33), and a prior probe showed the
-        # matching accuracy itself improves a lot (random two independent projections give
-        # chance-level top-1 0.76% vs 0.78%; identity reaches 21.4%). Yet identinit scores
-        # ~0.003 lower on matched-epoch val curves. These three arms separate the possible
-        # causes, one moved variable each, all built on identinit:
-        #   identlowalign : halve dict_align_loss (0.12 -> 0.06). Tests over-regularisation
-        #                   by the align term, whose effective force rose with the better fit.
-        #   identlowattn  : halve dict_attn_loss (0.25 -> 0.12). Same idea for the AT term.
-        #   identattnfix  : keep both weights, but compute the AT residual consistently
-        #                   (raw student energy map vs raw teacher energy map) instead of the
-        #                   shipped raw-vs-standardised mismatch. Isolates the asymmetry.
-        # A positive result in any of these means the effect is tunable/fixable rather than
-        # a property of the matching criterion.
+        # Identity-init arms. identinit fits the align term better but scores slightly lower
+        # on val, so these separate the possible causes, all built on identinit:
+        #   identlowalign : halve dict_align_loss (0.12 -> 0.06).
+        #   identlowattn  : halve dict_attn_loss (0.25 -> 0.12).
+        #   identattnfix  : compute the AT residual as raw student energy vs raw teacher
+        #                   energy instead of raw vs standardised.
         "identlowalign": {
             **_DICT_ST_DIAG,
             "dict_match_init": "identity",
             "dict_align_loss": 0.06,
         },
-        # --- "turn the align term off" arms: the cleanest test of whether the matching-based
-        # term is net harmful, and whether an identity-init deficit is a weight problem.
-        # The alignment term is the ONLY place the correspondence enters the loss: the AT term
-        # averages over channels and is therefore invariant to the pairing, and commit/InfoMax
-        # are zero in this recipe. So switching `dict_align_loss` to 0 removes the matching
-        # contribution entirely while leaving the rest of the dictionary branch (AT, the
-        # saliency pass, the module itself) in place -- which is what separates this pair from
-        # `nodict`, that turns off align AND AT and therefore builds no modules at all.
-        #
-        #   noalign       align 0.0 with the recipe's default encoders: a ONE-KEY ablation
-        #                 against the reference trio (which sits at 0.12), so the align term's
-        #                 net effect is measured without moving anything else.
-        #   identnoalign  align 0.0 with identity encoders. Together with identinit (0.12) and
-        #                 identlowalign (0.06) this completes an alpha sweep at FIXED identity
-        #                 init. All three share the trio's encoder geometry, hence the same
-        #                 `proj` initialisation, so the sweep is a clean single-variable one:
-        #                 monotone improvement with lower alpha means the deficit was
-        #                 over-regularisation, a flat or worse curve at zero means the identity
-        #                 configuration itself is the problem.
+        # Align-off arms. dict_align_loss is the only place the correspondence enters the
+        # loss: the AT term averages over channels and is pairing-invariant, and commit and
+        # InfoMax are zero here. Unlike `nodict`, the AT term and the modules stay alive.
+        #   noalign       align 0.0 with the default encoders, a one-key ablation against
+        #                 the reference recipe.
+        #   identnoalign  align 0.0 with identity encoders; together with identinit (0.12)
+        #                 and identlowalign (0.06) this is an alpha sweep at fixed init.
         "noalign": {
             **_DICT_ST_DIAG,
             "dict_align_loss": 0.0,
@@ -551,27 +506,19 @@ _DFIRE_KD_VARIANTS.update(
             "dict_match_init": "identity",
             "dict_align_loss": 0.0,
         },
-        # --- the advisor's architecture with the alpha that actually works ----------------
-        # The advisor asked for the teacher-side dictionary module removed and the student-side
-        # encoder changed to a depthwise convolution. Those arms exist (`dwident`, `dwnf`) but run
-        # at the recipe's alpha=0.12, and at that weight the identity family is behind the
-        # baseline. The configuration that recovers is `identlowalign` (identity init, alpha 0.06)
-        # but it keeps BOTH encoders in full-conv form, so it does not answer the advisor.
+        # Teacher encoder removed and student encoder depthwise, at the alpha that works
+        # (0.06, identity init). `dwident` and `dwnf` run the same geometry at the recipe's
+        # alpha=0.12, where the identity family is behind the baseline, and `identlowalign`
+        # recovers at 0.06 but keeps both encoders in full-conv form.
         #
-        # These two arms combine the two: identity init, alpha 0.06, teacher encoder removed,
-        # depthwise student encoder. Measured, this is free -- with identity initialisation the
-        # encoder IS the identity function whatever its conv type, so the reassembled teacher
-        # target is bit-identical to the both-full-conv version and only the parameter count
-        # changes (dictionary module: 1,000,448 -> 265,216, a 3.8x reduction). With a RANDOM init
-        # the depthwise form instead gives a materially worse assignment (top-1 0.023 vs 0.070),
-        # which is why this must not be conflated with `dw`/`dwnf`.
+        # With identity initialisation the encoder is the identity function whatever its conv
+        # type, so the reassembled teacher target is bit-identical to the full-conv version and
+        # only the parameter count changes (dictionary module: 1,000,448 -> 265,216). With a
+        # random init the depthwise form gives a worse assignment (top-1 0.023 vs 0.070), so
+        # this is not the same thing as `dw`/`dwnf`.
         #
-        # The pair differs in exactly one thing, so that the report to the advisor cannot be
-        # undermined by a hidden confound: removing the teacher encoder and resizing the student
-        # encoder changes how much RNG the encoders consume before `proj` is built, which re-rolls
-        # `proj` -- the only freely-learnable dictionary parameter. One arm pins that
-        # initialisation (comparable to `identlowalign` and the trio), the other leaves it natural
-        # (what a normal run would do).
+        # The two arms differ only in whether `proj` is pinned: resizing the encoders changes
+        # how much RNG they consume before `proj` is built, which re-rolls it.
         "identlowaligndw": {
             **_DICT_ST_DIAG,
             "dict_match_init": "identity",
@@ -786,17 +733,11 @@ _DFIRE_KD_VARIANTS.update(
             "dict_student_encoder": "depthwise",
             "dict_match_init": "identity",
         },
-        # --- the advisor's other question: may the STUDENT FEATURE be frozen? --------------
-        # The advisor's instruction has two separable parts. Removing the teacher-side dictionary
-        # branch (`pindw`) settles the first. The second asks whether, inside the dictionary LOSS,
-        # the student's FEATURE may be detached -- i.e. whether the dictionary losses should be
-        # allowed to train the student backbone that produced the tap, or only the dictionary
-        # parameters. `dict_detach_student_tap` is exactly that switch, and the teacher side is
-        # frozen either way (the teacher network is requires_grad_(False), and every teacher tensor
-        # entering the dictionary loss is detached).
-        # The clean single-key pair is `dw` vs `dwdetach` (both unpinned), and `pindw` vs
-        # `pindwdetach` repeats it with the projection initialisation pinned, so the answer can be
-        # checked against the confound documented at the top of the `pinbase`/`pindw` block.
+        # May the student FEATURE be frozen inside the dictionary loss? `dict_detach_student_tap`
+        # is that switch: it decides whether the dictionary losses train the student backbone
+        # that produced the tap or only the dictionary parameters. The teacher side is frozen
+        # either way. `dw` vs `dwdetach` is the clean pair; `pindw` vs `pindwdetach` repeats it
+        # with the projection initialisation pinned.
         "pindwdetach": {
             **_DICT_ST_DIAG,
             "dict_init_seed": _DICT_INIT_SEED,
@@ -804,15 +745,11 @@ _DFIRE_KD_VARIANTS.update(
             "dict_student_encoder": "depthwise",
             "dict_detach_student_tap": True,
         },
-        # --- dictionary branch ONLY, on the advisor's architecture --------------------------
-        # `nodict` (above) switches the dictionary branch off and answers "is it needed at all".
-        # This is its exact counterpart: the two generic terms are switched off instead, so the
-        # ONLY live distillation is the matching-based dictionary pair (`dict_align_loss` +
-        # `dict_attn_loss`). Exactly two keys off `pindw`, which makes the contrast single-variable
-        # in both directions -- against `pindw` (everything on) and against `nodict` (dictionary
-        # off). Note the TAL alignment is still COMPUTED from `align_start_epoch` while
-        # `align=True`, but its weight is zero so it carries no gradient; setting `align=False`
-        # would remove that cost at the price of moving a third key and spoiling the comparison.
+        # Dictionary branch only, the counterpart of `nodict`: the two generic terms are off, so
+        # the only live distillation is the matching-based pair (`dict_align_loss` +
+        # `dict_attn_loss`). Two keys differ from `pindw`, which keeps the contrast
+        # single-variable in both directions. The TAL alignment is still computed from
+        # `align_start_epoch` while `align=True`, but at weight zero it carries no gradient.
         "pindwonly": {
             **_DICT_ST_DIAG,
             "dict_init_seed": _DICT_INIT_SEED,
@@ -873,28 +810,18 @@ _DFIRE_KD_VARIANTS.update(
             "feature_loss": 0.0,
             "dict_weight": "none",
         },
-        # --- the advisor's specification, implemented literally --------------------------------
-        # Stated in full: "in the dictionary module we use ONLY depthwise conv + BN + activation to
-        # map the student's spatial size onto the teacher's, with NO average-pool downsampling; the
-        # teacher side has no network at all; then, as before, compute the attention matrix between
-        # the depthwise-convolved student features and the teacher features."
-        #
-        # Mapped onto this codebase, that is three things:
+        # Dictionary module with depthwise conv + BN + activation to map the student's spatial
+        # size onto the teacher's, no average-pool downsampling, and no teacher-side network:
         #   dict_teacher_encoder=False        the teacher side carries no network
         #   dict_student_encoder="depthwise_upsample"
-        #                                     depthwise conv (groups == channels) + BN + ReLU, stacked
-        #                                     so the student's 20x20 is resampled onto the teacher's
-        #                                     40x40 BY THE CONV, not by interpolation
-        #   dict_match_pool="none"            no average pooling anywhere; the attention matrix is
-        #                                     computed on the full maps, so d = 40*40 = 1600
+        #                                     depthwise conv + BN + ReLU, stacked, so the
+        #                                     student's 20x20 is resampled by the conv
+        #   dict_match_pool="none"            no average pooling, so the attention matrix is
+        #                                     computed on the full maps (d = 40*40 = 1600)
         #
-        # Note this supersedes an earlier, looser reading in which the student kept its stride-1
-        # depthwise conv and the spatial change was done with a bilinear `F.interpolate`. That matched
-        # "no average pool" but not "map the spatial size with depthwise conv + BN + activation".
-        #
-        # Two bases, because the question is asked of two different things:
-        #   pindwnp      the advisor architecture with all branches on -- the paper candidate
-        #   pindwonlynp  dictionary-only, i.e. the line currently under investigation
+        # Two bases:
+        #   pindwnp      all distillation branches on
+        #   pindwonlynp  dictionary-only
         "pindwnp": {
             **_DICT_ST_DIAG,
             "dict_init_seed": _DICT_INIT_SEED,
@@ -911,26 +838,14 @@ _DFIRE_KD_VARIANTS.update(
             "feature_loss": 0.0,
             "dict_match_pool": "none",
         },
-        # --- does an ACCURATE correspondence help? (the fixed-map experiment) -----------
-        # The shipped projection is `ConvTranspose2d(Cs, Cs, k=2, s=2)`: every output channel
-        # carries its own weights over all student channels, and output pixel (2i+a, 2j+b)
-        # depends only on input pixel (i, j). Reassigning the target of student channel s is
-        # therefore a relabelling of independent sub-problems. Measured by fitting the
-        # projection to different target maps, the per-channel loss multiset for a map and
-        # for that map with the student channels permuted agreed to 0.0006, while changing
-        # which teacher channels are used at all was worth 0.04 -- so the pairing cannot
-        # influence the objective while that projection is in place, however accurate it is.
-        # These arms remove that escape route: `proj_form=identity` is parameter-free and
-        # channel-local, so the assignment decides what each student channel is aligned to.
-        # With that in place the pairing is worth 13.4% of the align loss (measured), which
-        # is what makes an accuracy comparison meaningful. The three arms differ ONLY in the
-        # map file; `oraclemap` and `shufmap` have byte-identical target multisets, so any
-        # gap is attributable to the correspondence itself.
-        #   oraclemap : a prior-built map with high measured out-of-sample reproducibility
-        #   shufmap   : the same map with the student channels permuted (multiset identical)
+        # Correspondence-accuracy arms. They run with `proj_form=identity`, which is
+        # parameter-free and channel-local, so the assignment decides what each student
+        # channel is aligned to. The three differ only in the map file; `oraclemap` and
+        # `shufmap` share a target multiset, so any gap comes from the correspondence.
+        #   oraclemap : a prior-built map
+        #   shufmap   : the same map with the student channels permuted
         #   randmap   : iid uniform targets (different multiset; loose control)
-        # Map path/sha are filled by the queue from the map-builder's manifest so the exact
-        # bytes used are recorded in the run log.
+        # Map path and sha are filled by the queue so the bytes used are recorded in the log.
         "oraclemap": {
             **_DICT_ST_DIAG,
             "dict_match": "fixed",

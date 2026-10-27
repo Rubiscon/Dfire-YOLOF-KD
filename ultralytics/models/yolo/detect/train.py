@@ -767,7 +767,7 @@ class YOLOFDistillationModel(DetectionModel):
     def _dict_weight_mode(args) -> str:
         """Normalize ``dict_weight`` to a canonical mode string.
 
-        Preferred (advisor / proposal intent): ``saliency_dLdx`` = spatial map from
+        Preferred: ``saliency_dLdx`` = spatial map from
         |∂J_task/∂x^e| on the teacher backbone tap (main-path feature).
 
         Longer ``dLdA_*`` / ``dLdx`` suffixes are matched before bare ``dLdA`` so
@@ -805,7 +805,7 @@ class YOLOFDistillationModel(DetectionModel):
 
     @staticmethod
     def _build_xe_saliency(g: torch.Tensor) -> torch.Tensor:
-        """Spatial saliency from teacher ∂J_task/∂x^e (advisor / proposal intent).
+        """Spatial saliency from teacher ∂J_task/∂x^e.
 
         ``g`` has shape (B,C,H,W). Align needs a (B,1,H,W) weight, so we take the
         channel-mean absolute gradient at each location:
@@ -989,7 +989,7 @@ class YOLOFDistillationModel(DetectionModel):
         """Spatial weight maps for dictionary align from teacher task gradients.
 
         Modes (``dict_weight``):
-          - ``saliency_dLdx`` (preferred, advisor/proposal intent):
+          - ``saliency_dLdx`` (preferred):
                 g = ∂J_task/∂x^e on teacher tap,  S = mean_c(|g|)
           - ``saliency`` / Grad-CAM (ablation):
                 α_c = GAP(∂J/∂x^e_c),  S = ReLU(Σ_c α_c x^e_c)

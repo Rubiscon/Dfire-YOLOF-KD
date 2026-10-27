@@ -1,18 +1,8 @@
-# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head
-# plus a narrow stride-8 high-resolution tap.
+# YOLO26 with a DCN-enhanced YOLOF head and a stride-8 high-resolution tap.
 #
-# Why the tap exists: the dilated encoder below widens the receptive field on C5 but never
-# adds sampling points. At imgsz 640 the detection lattice is 20x20, so objects below about
-# one cell are not resolvable no matter how strong the encoder is - dilation is not
-# resolution. That is the AP_S floor of this architecture.
-#
-# HighResTap restores one finer lattice from the backbone's stride-8 feature (layer 4) at
-# 48 channels, rather than an FPN P3 at full width. It pays the same O((H/8)^2) exponent as
-# a P3 pathway with a much smaller constant, and the Detect head gains a second level.
-#
-# Layer indices in the head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8),
-# 15 = high-resolution tap, 16 = Detect. The student backbone tap used by dictionary
-# distillation (dict_student_layer = 10, the C2PSA output) is unchanged.
+# Head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8), 15 = tap, 16 = Detect.
+# The tap reads backbone layer 4 (stride 8) and emits 48 channels, adding an 80x80 lattice
+# next to the 20x20 C5 lattice.
 nc: 2 # number of classes
 end2end: True
 reg_max: 1

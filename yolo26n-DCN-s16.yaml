@@ -1,18 +1,8 @@
-# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head,
-# SINGLE detection level moved from C5 (stride 32) to C4 (stride 16).
+# YOLO26 with a DCN-enhanced YOLOF head whose single detection level sits at stride 16.
 #
-# Why: YOLOF's premise is that one level suffices, and it puts that level at stride 32. On
-# small-object data the resulting 20x20 detection lattice is the binding constraint (measured:
-# AP_S 0.10 while a second lattice lifted it 40%). Moving the SINGLE level to stride 16 keeps
-# the model strictly single-scale and single-consumption -- it is still "only look feature
-# once" -- but doubles the sampling density to a 40x40 lattice.
-#
-# Dilation is retuned. The receptive field of the three dilated blocks is 1 + 2*(d1+d2+d3)
-# feature cells. The shipped d=(2,6,8) gives 33 cells, which at stride 32 covers 1056 px and
-# therefore the whole 640 image. At stride 16 the same dilations would cover only ~528 px, so
-# they are doubled here to (4,12,16) -> 65 cells -> ~1040 px, restoring full-image coverage.
-#
-# Layer indices in the head: 11 = projection, 12/13/14 = dilated blocks, 15 = Detect.
+# Head: 11 = projection, 12/13/14 = dilated blocks, 15 = Detect. The level reads C4 instead
+# of C5, giving a 40x40 lattice at imgsz 640. Dilations are doubled to (4, 12, 16) so the
+# receptive field still covers the whole image (~1040 px).
 nc: 2 # number of classes
 end2end: True
 reg_max: 1

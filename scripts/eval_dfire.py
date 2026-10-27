@@ -8,8 +8,8 @@ runs the standard validator on the val and test splits.
 
 Example
 -------
-python scripts/eval_dfire.py --data configs/datasets/dfire.yaml --out eval/paper \
-    --ckpt paper runs/detect/.../weights/best.pt
+python scripts/eval_dfire.py --data ultralytics/cfg/datasets/dfire.yaml --out eval/kd \
+    --ckpt kd runs/detect/.../weights/best.pt
 """
 
 from __future__ import annotations

@@ -1,4 +1,8 @@
-# D-Fire dataset (official train / val / test splits)
+# D-Fire dataset descriptor.
+#
+# Ultralytics resolves a relative `path` against its `datasets_dir` setting, so either put an
+# absolute root here or set `datasets_dir` to the directory that holds `D-Fire/`.
+#
 # Dataset structure:
 # datasets/D-Fire/data/
 #   ├── train/
@@ -7,13 +11,13 @@
 #   ├── val/
 #   │   ├── images/
 #   │   └── labels/
-#   └── tests/          # some dumps use this name instead of test/
+#   └── tests/          # the Kaggle release names this folder `test/`
 #       ├── images/
 #       └── labels/
 #
 # Legacy merged split (train+val combined, tests as val): datasets/D-Fire_old/
 
-path:  ./datasets/D-Fire/data
+path: ./datasets/D-Fire/data
 train: train/images
 val: val/images
 test: tests/images
