@@ -1,0 +1,58 @@
+# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head
+# plus a stride-16 high-resolution tap and a *per-level* Detect head width.
+#
+# Why this variant exists. In the default (legacy) rule the Detect head derives one hidden
+# width from the first level's channel count and applies it to every level. That couples the
+# tap to the whole head: when the tap was placed first and was narrow, the C5 branch was
+# narrowed with it, which is why yolo26n-DCN-P3n.yaml only reaches c3 = 48 on every level.
+#
+# With `head_width: per_level` each level derives its own width, so this model gets a narrow
+# head on the cheap 40x40 lattice AND the original full-width head on C5. The C5 level is only
+# 20x20, so restoring its width costs very little, while the tap level stays cheap. That is the
+# combination the latency budget needs.
+#
+# Concretely at scale n: the tap emits 48 channels -> head c2/c3 = 16/48; C5 keeps 128 channels
+# -> head c2/c3 = 32/128, which is exactly what yolo26n-DCN.yaml (no tap) uses on C5. So
+# against yolo26n-DCN.yaml the only differences are the added lattice and its narrow head.
+#
+# Requires `head_width: per_level` support in Detect (ultralytics/nn/modules/head.py) and the
+# yaml key being forwarded by parse_model (ultralytics/nn/tasks.py).
+#
+# Layer indices in the head: 11 = projection, 12/13/14 = dilated blocks (d = 2/6/8),
+# 15 = stride-16 tap, 16 = Detect. Note there is deliberately no C5 bottleneck here.
+nc: 2 # number of classes
+end2end: True
+reg_max: 1
+head_width: per_level
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5, 3, True]]
+  - [-1, 2, C2PSA, [1024]]
+
+head:
+  - [-1, 1, Conv, [512, 1, 1]]
+
+  - [-1, 1, DilatedDeformBlock, [512, 2]]
+  - [-1, 1, DilatedDeformBlock, [512, 6]]
+  - [-1, 1, DilatedDeformBlock, [512, 8]]
+
+  # Stride-16 tap: backbone layer 5 (128 ch, stride 16) -> 256-channel bottleneck -> 48 ch out.
+  - [5, 1, HighResTap, [192, 256, 3]]
+
+  # Two-level Detect: [stride 16 (48 ch, narrow head), stride 32 (128 ch, full head)].
+  - [[15, 14], 1, Detect, [nc]]

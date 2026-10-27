@@ -109,6 +109,7 @@ from .transformer import (
 from .yolof import DilatedResBlock
 from .dcnyolof import DilatedDCNBlock
 from .dilated_dcn import DilatedDeformBlock
+from .hires_tap import HighResTap
 
 
 __all__ = (
@@ -195,4 +196,5 @@ __all__ = (
     "DilatedResBlock",
     "DilatedDCNBlock",
     "DilatedDeformBlock",
+    "HighResTap",
 )

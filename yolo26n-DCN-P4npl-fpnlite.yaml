@@ -1,0 +1,76 @@
+# Ultralytics YOLO26 object detection model with a DCN-enhanced YOLOF head,
+# a stride-16 tap, AND a top-down fusion path: a minimal 2-level FPN.
+#
+# WHY THIS FILE EXISTS -- it is the falsification test for the paper's claim.
+#
+# yolo26n-DCN-P4n-pl.yaml adds a narrow stride-16 lattice but deliberately gives it NO signal
+# from C5: the tap sees only backbone stride-16 features, so that level carries local texture
+# and little semantics. The claim being made from that model is "sampling density is the
+# effective ingredient; FPN's expensive machinery (top-down path, lateral connections, fusion
+# conv, full-width P3) is not what is doing the work".
+#
+# That claim is only credible if someone actually adds the top-down path and shows it does not
+# help much. This model is exactly that:
+#
+#   * same backbone, same dilated encoder, same tap  (identical to P4n-pl)
+#   * plus: C5 is projected to the tap's width, upsampled to stride 16, concatenated with the
+#     tap, and fused back down. That is a genuine (if minimal) top-down FPN on two levels.
+#
+# Reading the result:
+#   AP_S rises a lot over P4n-pl  -> top-down semantic flow IS the active ingredient.
+#                                    Then the tap is an incomplete FPN, and the paper cannot
+#                                    claim "density, not FPN". Narrative must change.
+#   AP_S barely moves             -> density was the ingredient. This also explains why none of
+#                                    the nine controlled distillation variants could lift AP_S:
+#                                    no distillation objective adds sampling points.
+#
+# Detect input widths are held at [48 (stride 16), 128 (stride 32)] via `head_width: per_level`,
+# the same as P4n-pl, so the comparison isolates the top-down path.
+#
+# Layer indices: 11 = projection, 12/13/14 = dilated blocks (C5), 15 = stride-16 tap,
+# 16 = C5 lateral, 17 = upsample, 18 = concat, 19 = fusion, 20 = Detect.
+nc: 2 # number of classes
+end2end: True
+reg_max: 1
+head_width: per_level
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]]
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5, 3, True]]
+  - [-1, 2, C2PSA, [1024]]
+
+head:
+  - [-1, 1, Conv, [512, 1, 1]]
+
+  # YOLOF dilated encoder on C5 -- unchanged from every other variant here.
+  - [-1, 1, DilatedDeformBlock, [512, 2]]
+  - [-1, 1, DilatedDeformBlock, [512, 6]]
+  - [-1, 1, DilatedDeformBlock, [512, 8]]
+
+  # Lateral tap: backbone stride-16 feature (layer 5) -> 48 ch lattice. No top-down signal.
+  - [5, 1, HighResTap, [192, 256, 3]]
+
+  # Top-down path: project C5 to the tap width, then upsample x2 to stride 16.
+  - [14, 1, Conv, [192, 1, 1]]
+  - [16, 1, nn.Upsample, [None, 2, "nearest"]]
+
+  # Fuse and project back to 48 ch.
+  - [[15, 17], 1, Concat, [1]]
+  - [-1, 1, Conv, [192, 3, 1]]
+
+  # Detect over [fused stride-16 (48 ch), C5 (128 ch)] -- same widths as P4n-pl.
+  - [[19, 14], 1, Detect, [nc]]

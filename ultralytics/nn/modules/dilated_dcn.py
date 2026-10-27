@@ -40,9 +40,13 @@ class DilatedDeformBlock(nn.Module):
         """
         super().__init__()
         mid = max(1, c2 // max(1, mid_factor))
-        self.cv1 = Conv(c1, mid, k=1, s=1, p=0)  # reduce
+        # ``Conv`` already applies BatchNorm. Its own SiLU is turned off so each of the
+        # three stages has exactly one SiLU, applied below. The DCN path previously had
+        # none between the two 1x1s.
+        self.cv1 = Conv(c1, mid, k=1, s=1, p=0, act=False)  # reduce
         self.d = int(d)
         self.use_dcn = bool(use_dcn) and DCN_AVAILABLE
+        self.act = nn.SiLU()
 
         if self.use_dcn:
             # offset conv predicts 2*k*k offsets (k=3)
@@ -52,24 +56,21 @@ class DilatedDeformBlock(nn.Module):
             nn.init.constant_(self.offset.weight, 0.0)
             nn.init.constant_(self.offset.bias, 0.0)
         else:
-            # fallback to regular dilated conv
+            # fallback to regular dilated conv. No extra BN: same three-SiLU pattern as the DCN path.
             self.conv_dil = nn.Conv2d(mid, mid, kernel_size=3, padding=self.d, dilation=self.d, bias=False)
-            self.bn = nn.BatchNorm2d(mid)
-            self.act = nn.ReLU(inplace=True)
 
-        self.cv3 = Conv(mid, c2, k=1, s=1, p=0)  # expand
+        self.cv3 = Conv(mid, c2, k=1, s=1, p=0, act=False)  # expand
         self.last_feature = None  # cached residual output for knowledge distillation
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.cv1(x)
+        y = self.act(self.cv1(x))
         if self.use_dcn:
             off = self.offset(y)
             y = self.dcn(y, off)
         else:
             y = self.conv_dil(y)
-            y = self.bn(y)
-            y = self.act(y)
-        y = self.cv3(y)
+        y = self.act(y)
+        y = self.act(self.cv3(y))
         out = x + y
         self.last_feature = out
         return out

@@ -75,7 +75,7 @@ class Detect(nn.Module):
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
     xyxy = False  # xyxy or xywh output
 
-    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = ()):
+    def __init__(self, nc: int = 80, reg_max=16, end2end=False, ch: tuple = (), head_width: str = "legacy"):
         """Initialize the YOLO detection layer with specified number of classes and channels.
 
         Args:
@@ -83,6 +83,13 @@ class Detect(nn.Module):
             reg_max (int): Maximum number of DFL channels.
             end2end (bool): Whether to use end-to-end NMS-free detection.
             ch (tuple): Tuple of channel sizes from backbone feature maps.
+            head_width (str): How the hidden width of each branch is derived.
+                ``"legacy"`` reproduces the original behaviour exactly: one width for every
+                level, taken from ``ch[0]``. ``"per_level"`` derives it independently per
+                level, so a narrow input level (e.g. a narrow high-resolution tap) gets a
+                narrow head while the others keep theirs. For models whose levels all have
+                the same channel count the two modes are identical, which is the case for
+                every model except the high-resolution-tap variants.
         """
         super().__init__()
         self.nc = nc  # number of classes
@@ -90,20 +97,36 @@ class Detect(nn.Module):
         self.reg_max = reg_max  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
-        c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
+        self.head_width = str(head_width or "legacy").lower()
+        # ``_w2``/``_w3`` are per-level when head_width == "per_level"; otherwise they are lists
+        # of equal values, which reproduces the single-width behaviour.
+        if self.head_width == "per_level":
+            self._w2 = [max((16, int(x) // 4, self.reg_max * 4)) for x in ch]
+            self._w3 = [max((int(x), min(self.nc, 100))) for x in ch]
+        else:
+            _c2 = max((16, ch[0] // 4, self.reg_max * 4))
+            _c3 = max(ch[0], min(self.nc, 100))
+            self._w2 = [_c2] * self.nl
+            self._w3 = [_c3] * self.nl
         self.cv2 = nn.ModuleList(
-            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch
+            nn.Sequential(Conv(x, self._w2[i], 3), Conv(self._w2[i], self._w2[i], 3),
+                          nn.Conv2d(self._w2[i], 4 * self.reg_max, 1))
+            for i, x in enumerate(ch)
         )
         self.cv3 = (
-            nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+            nn.ModuleList(
+                nn.Sequential(Conv(x, self._w3[i], 3), Conv(self._w3[i], self._w3[i], 3),
+                              nn.Conv2d(self._w3[i], self.nc, 1))
+                for i, x in enumerate(ch)
+            )
             if self.legacy
             else nn.ModuleList(
                 nn.Sequential(
-                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
-                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
-                    nn.Conv2d(c3, self.nc, 1),
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, self._w3[i], 1)),
+                    nn.Sequential(DWConv(self._w3[i], self._w3[i], 3), Conv(self._w3[i], self._w3[i], 1)),
+                    nn.Conv2d(self._w3[i], self.nc, 1),
                 )
-                for x in ch
+                for i, x in enumerate(ch)
             )
         )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
