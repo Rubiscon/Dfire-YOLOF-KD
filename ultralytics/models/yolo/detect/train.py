@@ -514,9 +514,11 @@ class YOLOFDistillationModel(DetectionModel):
                 match_temp = float(getattr(self.args, "dict_match_temp", 0.07) or 0.07)
                 match_norm = str(getattr(self.args, "dict_match_norm", "l2") or "l2")
                 match_init = str(getattr(self.args, "dict_match_init", "default") or "default")
-                infomax_marginal_weight = float(
-                    getattr(self.args, "dict_infomax_marginal_weight", 1.0) or 1.0
-                )
+                # NOTE: no `or` fallback here. 0.0 is a meaningful value: with
+                # infomax_marginal_weight = 0 the module returns H(T|S) alone, which is what a
+                # uniform student marginal implies. `x or 1.0` would turn it into H(T|S) - H(T).
+                _marg = getattr(self.args, "dict_infomax_marginal_weight", 1.0)
+                infomax_marginal_weight = 1.0 if _marg is None else float(_marg)
                 grid_divisor = max(int(getattr(self.args, "dict_match_grid_divisor", 16) or 16), 1)
                 # Encoder ablations: drop the teacher-side encoder and/or switch the
                 # student-side conv to a MobileNetV2 depthwise (separable) form.
@@ -788,6 +790,13 @@ class YOLOFDistillationModel(DetectionModel):
             return "entropy_inverse"
         if raw in {"dldx_entropy_gate", "saliency_dldx_entropy_gate", "entropy_gate"}:
             return "dldx_entropy_gate"
+        # First-order channel mean of the teacher feature, used as the per-location weight.
+        # Distinct from `attention` (mean of squares, second order) and from the saliency modes
+        # (task gradient).
+        if raw in {"activation_mean", "mean_activation", "feature_energy", "eq8", "ssm_eq8"}:
+            return "activation_mean"
+        if raw in {"activation_mean_signed", "eq8_signed", "mean_activation_signed"}:
+            return "activation_mean_signed"
         return raw
 
     def _dict_weight_needs_task_grad(self) -> bool:
@@ -1036,8 +1045,8 @@ class YOLOFDistillationModel(DetectionModel):
         """Feature normalization for dictionary align (default ``channel``).
 
         Channel standardization keeps ``dict_loss`` on the same ~O(1) scale as the
-        proven n_kd_n_batch112 recipe. ``none`` collapses dict_loss by ~50× and
-        effectively turns backbone KD off at the usual ``dict_align_loss`` weights.
+        task losses. ``none`` shrinks dict_loss by ~50× and effectively turns
+        backbone KD off at the usual ``dict_align_loss`` weights.
         """
         raw = getattr(self.args, "dict_feature_norm", None)
         if raw is None or str(raw).lower() in {"", "default"}:
@@ -1113,7 +1122,7 @@ class YOLOFDistillationModel(DetectionModel):
         ``residual`` is (B,C,H,W); ``weight`` is (B,1,H,W). Channel-mean first keeps the
         same scale as ``(w * r).mean()`` when ``mean(w)≈1``. Skipping that mean multiplies
         the loss by C. Reductions run in float32 so AMP ``weight.sum()`` does not overflow
-        at batch 112 and 40×40 maps.
+        on large batches and 40×40 maps.
         """
         if weight.ndim != 4 or weight.shape[1] != 1:
             raise ValueError(f"Expected weight (B,1,H,W), got {tuple(weight.shape)}")
@@ -1246,6 +1255,21 @@ class YOLOFDistillationModel(DetectionModel):
                         weight = ema.expand(pred.shape[0], -1, -1, -1)
             elif mode == "attention":
                 weight = self._spatial_attention(t_feat.detach()).unsqueeze(1)
+            elif mode == "activation_mean":
+                # First-order channel mean of the teacher feature: a per-location weight map.
+                #
+                # Rectified on purpose. The map multiplies a squared residual, so the weight has
+                # to be non-negative. Measured on a real teacher tap the signed version has 29.6%
+                # negative entries and a mean of only 0.043; `_normalize_dict_weight("mean")`
+                # then inflates it to a range of [-4e5, +1e6] whose mass cancels to
+                # sum(W) ~ -1e12, so the mass-normalised mean returns exactly 0 and the align
+                # term is dead without any error. Rectifying keeps sum(W) at the number of
+                # locations.
+                weight = torch.relu(t_feat.detach().float().mean(dim=1, keepdim=True))
+            elif mode == "activation_mean_signed":
+                # Ablation only: the same map without the non-negativity clamp. Ill posed under
+                # mean normalisation (see above); kept so the difference is measurable.
+                weight = t_feat.detach().float().mean(dim=1, keepdim=True)
             if mode in {"entropy", "entropy_inverse", "dldx_entropy_gate"}:
                 divisor = max(int(getattr(self.args, "dict_entropy_grid_divisor", 4)), 1)
                 entropy_grid = (
@@ -1281,7 +1305,20 @@ class YOLOFDistillationModel(DetectionModel):
                 weight = self._normalize_dict_weight(weight, weight_norm, content_mask).to(pred.dtype).detach()
                 elem = (pred - target).float().pow(2)
                 residual = elem.mean(dim=1, keepdim=True)
-                d_align = d_align + self._mass_normalized_weighted_mse(weight, elem)
+                mass = float(weight.sum())
+                if mass > 0.0:
+                    d_align = d_align + self._mass_normalized_weighted_mse(weight, elem)
+                else:
+                    # Guard: a non-positive weight mass makes sum(W*r)/sum(W) ill posed. A signed
+                    # weight map drove sum(W) to -1e12 on a real teacher tap and returned exactly
+                    # 0.0 with no error, so any weight mode that can go negative is checked here.
+                    if not getattr(self, "_align_mass_warned", False):
+                        LOGGER.warning(
+                            "dictionary align: non-positive weight mass (sum=%.6g, mode=%s); "
+                            "falling back to the unweighted MSE for this step", mass, mode
+                        )
+                        self._align_mass_warned = True
+                    d_align = d_align + F.mse_loss(pred, target)
             else:
                 residual = (pred - target).float().pow(2).mean(dim=1, keepdim=True)
                 d_align = d_align + F.mse_loss(pred, target)
@@ -1441,6 +1478,41 @@ class YOLOFDistillationModel(DetectionModel):
         pred_bboxes = dist2bbox(pred_dist, anchor_points, xywh=False)
         return pred_distri, pred_scores, pred_bboxes, anchor_points, stride_tensor
 
+    @staticmethod
+    def _weighted_align_mean(weight: torch.Tensor, value: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        """``sum(w * v) / sum(w)`` -- a mass-normalised mean.
+
+        Normalising by the weight *mass* (not the count) keeps the loss scale fixed when the
+        weights change, so ``align_box`` / ``align_cls`` need no retuning. With uniform weights
+        this is exactly ``value.mean()``.
+        """
+        w = weight.reshape(-1).to(value.dtype)
+        return (w * value.reshape(-1)).sum() / w.sum().clamp_min(eps)
+
+    def _align_size_weight(self, t_box_px: torch.Tensor) -> torch.Tensor:
+        """Per-anchor GT-size weight for the decision-level align terms (``align_size_weight``).
+
+        ``w_i = clip((median_side / side_i) ** exp, min, max)`` where ``side_i`` is the geometric
+        mean side of the anchor's assigned teacher box in pixels. Returns ones when the option is
+        off, so the caller's mass-normalised mean is then exactly the original plain mean.
+        """
+        n = t_box_px.shape[0]
+        if not bool(getattr(self.args, "align_size_weight", False)) or n == 0:
+            return torch.ones(n, device=t_box_px.device, dtype=t_box_px.dtype)
+        w_px = (t_box_px[:, 2] - t_box_px[:, 0]).clamp_min(1.0)
+        h_px = (t_box_px[:, 3] - t_box_px[:, 1]).clamp_min(1.0)
+        side = (w_px * h_px).sqrt()
+        ref = side.median().clamp_min(1.0)
+        exp = getattr(self.args, "align_size_weight_exp", 1.0)
+        lo = getattr(self.args, "align_size_weight_min", 0.25)
+        hi = getattr(self.args, "align_size_weight_max", 4.0)
+        exp = 1.0 if exp is None else float(exp)
+        lo = 0.25 if lo is None else float(lo)
+        hi = 4.0 if hi is None else float(hi)
+        if lo > hi:
+            lo, hi = hi, lo
+        return ((ref / side) ** exp).clamp(lo, hi).detach()
+
     def _alignment_loss(self, student_raw: Dict[str, torch.Tensor], teacher_raw: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Lalign = Lyolo26(Yf, Y_FPNNMS) via teacher-only pseudo labels + TAL assignment (P0).
 
@@ -1525,7 +1597,18 @@ class YOLOFDistillationModel(DetectionModel):
         strides_f = strides.to(assign_dtype)
         s_box_px = pred_bboxes[bb, aa].float() * strides_f[aa].unsqueeze(-1)
         t_box_px = target_bboxes[bb, aa].float()
-        box_loss = (1.0 - bbox_iou(s_box_px, t_box_px, xywh=False, CIoU=True)).squeeze(-1).mean()
+        # Term weights for (2) size-gating and (3) confidence-weighted box regression. Both
+        # options default off; with both off `_align_size_weight` returns ones and
+        # `_weighted_align_mean(ones, v)` is exactly `v.mean()`, so the original path is intact.
+        _w_size = self._align_size_weight(t_box_px)
+        if bool(getattr(self.args, "align_box_conf_weight", False)):
+            # The box term is hard, so a low-confidence teacher box currently pulls the student's
+            # box at full strength. Weight it by the teacher's own confidence in that target.
+            _w_box = _w_size * pseudo_conf[bb, target_gt_idx[bb, aa].long()].clamp(1e-6, 1 - 1e-6).detach()
+        else:
+            _w_box = _w_size
+        _ciou_loss = (1.0 - bbox_iou(s_box_px, t_box_px, xywh=False, CIoU=True)).squeeze(-1)
+        box_loss = self._weighted_align_mean(_w_box, _ciou_loss)
 
         if cls_mode == "bce_tal":
             target_scores_sum = max(target_scores.sum(), 1)
@@ -1544,12 +1627,16 @@ class YOLOFDistillationModel(DetectionModel):
             other_share = (1.0 - tconf).unsqueeze(1) / other_mask.sum(dim=1, keepdim=True).clamp(min=1)
             teacher_prob = teacher_prob + other_mask * other_share
             student_logits = pred_scores[bb, aa].float()
+            # Per-anchor KL (reduction="none" then sum over classes) so the same mass-normalised
+            # weight can be applied. With uniform weights this equals the previous
+            # reduction="batchmean", which is what `_weighted_align_mean` reduces to.
+            # Deliberately weighted by SIZE only: the class target is already soft in `tconf`.
             kl_per = F.kl_div(
                 F.log_softmax(student_logits / T, dim=-1),
                 teacher_prob.detach(),
-                reduction="batchmean",
-            )
-            cls_loss = (T * T) * kl_per
+                reduction="none",
+            ).sum(-1)
+            cls_loss = (T * T) * self._weighted_align_mean(_w_size, kl_per)
 
         return cls_gain * cls_loss + box_gain * box_loss.to(pred_scores.dtype)
 

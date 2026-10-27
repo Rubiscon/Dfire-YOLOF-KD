@@ -28,7 +28,7 @@ import torch
 
 torch.backends.cudnn.benchmark = True
 
-from dfire_parity.protocol import CONTROLLED_ARGS
+from dfire_parity.protocol import CONTROLLED_ARGS, warmup_epochs_for
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect.train import DetectionTrainer, YOLOFDistillationTrainer
 
@@ -67,6 +67,92 @@ BASELINES: dict[str, dict[str, Any]] = {
         "description": "YOLOF-DCN + dLdx dictionary KD (D_dldx_new_2 gains)",
         "model": "yolo26n-DCN.yaml",
         "name": "dcn-kd",
+    },
+    # --- Narrow stride-8 high-resolution tap arms -----------------------------------
+    # The dilated encoder widens the receptive field on C5 but never adds sampling points,
+    # so at 640 the detection lattice is 20x20 and AP_S is bounded by the stride, not by
+    # capacity. These three arms test whether adding one finer lattice lifts that bound,
+    # and by how much latency it costs.
+    #
+    # In this codebase the Detect head derives its hidden width from the *first* level's
+    # channel count, so a tap that emits fewer channels also narrows the C5 branch:
+    #   dcn-solo-p3     wide head + tap   vs  dcn-solo     -> isolates "one added lattice"
+    #   dcn-solo-headn  narrow head, no tap  (control)
+    #   dcn-solo-p3n    narrow head + tap vs dcn-solo-headn -> isolated, cheaper variant
+    "dcn-solo-p3": {
+        "trainer": "detect",
+        "description": "YOLOF-DCN solo + stride-8 high-resolution tap (wide Detect head)",
+        "model": "yolo26n-DCN-P3.yaml",
+        "name": "dcn-solo-p3",
+    },
+    "dcn-solo-headn": {
+        "trainer": "detect",
+        "description": "YOLOF-DCN solo, narrowed Detect head, no tap (control arm)",
+        "model": "yolo26n-DCN-headn.yaml",
+        "name": "dcn-solo-headn",
+    },
+    "dcn-solo-p3n": {
+        "trainer": "detect",
+        "description": "YOLOF-DCN solo + stride-8 tap, narrowed Detect head",
+        "model": "yolo26n-DCN-P3n.yaml",
+        "name": "dcn-solo-p3n",
+    },
+    # --- Stride-16 tap: the latency-conscious version of the same idea -------------------
+    # The stride-8 tap lifts AP_S by 40% but costs ~25% latency, because the added 80x80
+    # lattice makes the head do 16x the spatial work of the existing 20x20 one. A stride-16
+    # lattice is 40x40, i.e. 4x instead of 16x, and measures at only +4.7% GFLOPs against the
+    # baseline (versus +27.9% for stride 8). These two arms ask whether a defensible amount of
+    # the AP_S gain survives at a cost that keeps the CPU-efficiency claim intact.
+    #
+    #   dcn-solo-p4n     stride-16 tap, legacy head  (mirror of dcn-solo-p3n)
+    #   dcn-solo-p4npl   stride-16 tap, per-level head: narrow on the 40x40 lattice, full
+    #                    width restored on C5. Needs `head_width: per_level` support in Detect.
+    "dcn-solo-p4n": {
+        "trainer": "detect",
+        "description": "YOLOF-DCN solo + stride-16 tap (legacy global head width)",
+        "model": "yolo26n-DCN-P4n.yaml",
+        "name": "dcn-solo-p4n",
+    },
+    "dcn-solo-p4npl": {
+        "trainer": "detect",
+        "description": "YOLOF-DCN solo + stride-16 tap, per-level head width",
+        "model": "yolo26n-DCN-P4n-pl.yaml",
+        "name": "dcn-solo-p4npl",
+    },
+    # --- The falsification test for the tap's claim -----------------------------------
+    # The tap deliberately receives no signal from C5, and the argument made from it is that
+    # sampling density is the effective ingredient while FPN's machinery is not. That argument
+    # is only credible if someone adds the top-down path and shows it does not pay. This arm
+    # does exactly that: same backbone, same dilated encoder, same tap, plus C5 projected,
+    # upsampled, concatenated and fused back into the high-resolution level. Detect input widths
+    # are held identical to dcn-solo-p4npl (stride [16, 32], c2 [16, 32], c3 [48, 128]).
+    #
+    # Read AP_S: if it rises a lot, top-down semantics are the active ingredient, the tap is an
+    # incomplete FPN, and the paper's framing has to change. If it barely moves, density was the
+    # story -- which also explains why no distillation variant could lift AP_S.
+    #
+    # Measured locally: +47,808 parameters, +0.139 GFLOPs, +8.9% latency over dcn-solo-p4npl.
+    "dcn-solo-p4npl-fpnlite": {
+        "trainer": "detect",
+        "description": "YOLOF-DCN stride-16 tap + minimal top-down FPN fusion (falsification test)",
+        "model": "yolo26n-DCN-P4npl-fpnlite.yaml",
+        "name": "dcn-solo-p4npl-fpnlite",
+    },
+    # --- pindw distillation on top of the stride-8 tap -------------------------------
+    # Same training objective as the existing `dcn-kd --kd-variant pindw` arms, but the student
+    # is the tap model instead of the single-level one. Everything the KD machinery taps is
+    # unchanged: the backbone tap is still layer 10 (C2PSA) and there are still three
+    # DilatedDeformBlocks, so the three per-scale projectors and the dictionary pairing are
+    # identical in count and shape. HighResTap deliberately does NOT register a distillation
+    # block, so the added lattice is presently trained by the task loss alone; distilling the
+    # teacher's P3 into it is a separate change.
+    #
+    # Run it as:  --baseline dcn-kd-p3n --kd-variant pindw
+    "dcn-kd-p3n": {
+        "trainer": "kd",
+        "description": "YOLOF-DCN stride-8 tap + dictionary/neck/response KD (student of the tap family)",
+        "model": "yolo26n-DCN-P3n.yaml",
+        "name": "dcn-kd-p3n",
     },
 }
 
@@ -243,6 +329,15 @@ _VOC_KD_VARIANTS["vocpindw"] = {
     "dict_teacher_encoder": False,
     "dict_student_encoder": "depthwise",
     "dict_init_seed": _DICT_INIT_SEED,
+}
+_VOC_KD_VARIANTS["vocpindwbox"] = {
+    # vocpindw plus the two boxlate gains. The VOC schedule is unchanged:
+    # align still starts at 80, and dict_attn stays at 0.10 from that epoch.
+    "dict_teacher_encoder": False,
+    "dict_student_encoder": "depthwise",
+    "dict_init_seed": _DICT_INIT_SEED,
+    "align_box": 2.0,
+    "align_loss": 0.08,
 }
 
 # Epoch at which the delayed fixed-map arms switch the whole dictionary branch on. 0-indexed,
@@ -591,6 +686,99 @@ _DFIRE_KD_VARIANTS.update(
             "dict_teacher_encoder": False,
             "dict_student_encoder": "depthwise",
         },
+        # --- (2)+(3) on top of pindw: size-weighted align + confidence-weighted box term ------
+        # Every number below is measured on the D-Fire test split, not assumed.
+        #
+        # (2) align_size_weight. ``align_loss`` is a plain mean over ASSIGNED ANCHORS, so an
+        #     object's gradient share is proportional to its anchor count. On the stride-32 grid
+        #     that is 2.9% for small objects vs 75.5% for large, while the teacher's headroom is
+        #     0.046 small vs 0.018 large -- the gradient is spent where the teacher has least to
+        #     give. w_i = clip((median_side/side_i)**1, 0.25, 4), mass-normalised by
+        #     sum(w*v)/sum(w) so the loss scale (and therefore `align_box`) needs no retuning.
+        #     Measured effect on the small-object gradient share: 2.9% -> 14.4% (stride 32) and
+        #     7.4% -> 24.5% (stride 16). A weaker exponent barely moves it (p=0.5 -> 7.3%).
+        #
+        # (3) align_box_conf_weight. The class term is already soft in `tconf` (a 0.05-confidence
+        #     box yields a near-uniform target), but the BOX term is an unweighted mean, so such a
+        #     box pulls the student's box at full strength. Measured: the band admitted by
+        #     lowering the threshold carries 9.7 false positives per new true positive. Weighting
+        #     the box term by tconf makes a target's contribution proportional to the teacher's
+        #     own confidence in it. The class term is deliberately NOT weighted again.
+        #
+        # distill_conf_thres stays at the recipe value (0.25) on purpose: (3) removes the need to
+        # lower it, so this arm changes exactly two things and both are attributable.
+        #
+        # Caveat carried from the analysis: 57.2% of small objects receive ZERO assigned anchor
+        # at stride 32 (20.3% at stride 16). No weighting can reach those, which is why this arm
+        # is run on a tap student and why it is expected to be a <=1 pp effect, not a rescue.
+        "pindwsz": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "align_size_weight": True,
+            "align_size_weight_exp": 1.0,
+            "align_size_weight_min": 0.25,
+            "align_size_weight_max": 4.0,
+            "align_box_conf_weight": True,
+        },
+        # --- pindwsz with the dictionary pairing moved to the SHAPE-MATCHED layer pair ------------
+        # Every earlier D-Fire arm pairs teacher x6 (128ch, stride 16, 40x40) with student n10
+        # (256ch, stride 32, 20x20): two axes mismatched at once, which forces the projector to
+        # INVENT a 2x spatial resolution and to bridge a 2:1 channel change. Measured shapes:
+        #     T[6] = 128ch 40x40 stride 16        S[6] = 128ch 40x40 stride 16
+        # so S[6] <-> T[6] shares channel count, spatial size AND stride. The projector degrades to
+        # a plain depthwise 3x3 with no resampling, and the matching compares two features that live
+        # in the same space.
+        #
+        # Why this is the right experiment (motivated by CanKD, WACV 2026): CanKD's cross-attention
+        # correspondence sits on the SPATIAL axis and it hard-asserts y_s.shape == y_t.shape, i.e. it
+        # never has to bridge a shape mismatch; it also COARSENS the teacher with maxpool rather than
+        # expanding the student. Our channel-axis correspondence has no observable anchor (measured:
+        # label-aware reproducibility 0.271, below a constant central box at 0.307), so the question
+        # this arm isolates is whether the failure is the CHANNEL axis itself or the SHAPE MISMATCH
+        # that every previous arm confounded with it.
+        #
+        # `dict_student_encoder="depthwise"` (not `depthwise_upsample`): no resampling is needed at
+        # equal spatial size, and keeping the plain depthwise form avoids the learnable transposed
+        # conv entirely, so the residual is computed with no upsampling branch at all.
+        # `dict_match_pool="avg"` is kept (the shipped tokenisation): CanKD's own softmax-free
+        # attention is not adopted here, so this arm changes the PAIRING and nothing else about the
+        # matching machinery -- that keeps it a single-variable delta against `pindwsz`.
+        "pindwsz_s6": {
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "dict_student_layer": 6,
+            "dict_teacher_layers": [6],
+            "align_size_weight": True,
+            "align_size_weight_exp": 1.0,
+            "align_size_weight_min": 0.25,
+            "align_size_weight_max": 4.0,
+            "align_box_conf_weight": True,
+        },
+        "pindwdelay40": {
+            # pindw, with response align delayed from epoch 20 to 40.
+            # dict_attn stays on from epoch 0, the same single change as delay40.
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "align_start_epoch": 40,
+        },
+        "pindwhardgain": {
+            # pindw dictionary plus the hardgain response weights.
+            # Align still starts at epoch 20; dict_attn stays on from epoch 0.
+            **_DICT_ST_DIAG,
+            "dict_init_seed": _DICT_INIT_SEED,
+            "dict_teacher_encoder": False,
+            "dict_student_encoder": "depthwise",
+            "align_loss": 0.16,
+            "align_box": 3.0,
+            "align_cls": 6.0,
+            "feature_loss": 0.10,
+        },
         "pindwident": {
             **_DICT_ST_DIAG,
             "dict_init_seed": _DICT_INIT_SEED,
@@ -871,7 +1059,7 @@ _DFIRE_KD_VARIANTS.update(
 
 
 def _apply_kd_variant(cfg: dict[str, Any], dataset: str, variant: str) -> None:
-    variant = str(variant or "").strip()
+    variant = _VARIANT_ALIASES.get(str(variant or "").strip(), str(variant or "").strip())
     if not variant:
         return
     if variant in _VOC_KD_VARIANTS and dataset != "voc2007":
@@ -913,10 +1101,103 @@ _DICT_STRUCTURE_KEYS = frozenset(
     )
 )
 
+# --- Shipped SSM recipe ("ssm") ------------------------------------------------------------
+# Slice assignment at full student resolution: the student side is resampled with depthwise
+# convolutions (groups == channels) and the teacher side stays raw, so pi is a cosine-similarity
+# softmax over every teacher location instead of a pooled grid.
+#
+# "straight_through" keeps the argmax assignment in the forward pass while leaving the soft pi
+# visible to the InfoMax term; the plain "hard" mode computes that term outside its branch, so
+# the projector would get no gradient there.
+#
+# The spatial weight is the first-order channel mean of the teacher feature
+# ("activation_mean"), not the second-order mean of squares used by "attention". The attention
+# (AT) and cosine-commitment terms are off: both were tuned on the older saliency recipes and
+# neither has a role here. The residual projector is channel-local (depthwise 3x3, identity
+# init) because a channel-mixing DeconvNet absorbs the slice correspondence, which is the one
+# thing the matching term is supposed to constrain.
+_SSM: dict[str, Any] = {
+    "dict_teacher_encoder": False,
+    "dict_student_encoder": "depthwise_upsample",
+    "dict_match_pool": "none",
+    "dict_match": "straight_through",
+    "dict_weight": "activation_mean",
+    "dict_proj_form": "channel_local",
+    "dict_align_loss": 0.1,
+    "dict_infomax_loss": 0.1,
+    "dict_infomax_marginal_weight": 0.0,
+    "dict_attn_loss": 0.0,
+    "dict_commit_loss": 0.0,
+    "dict_init_seed": _DICT_INIT_SEED,
+    # Diagnostics only, no effect on the loss.
+    "dict_match_log_interval": 100,
+}
+
+# ---------------------------------------------------------------------------------------------
+# Student/teacher tap pair. `dict_student_layer` selects the student feature; the teacher tap is
+# set by the arm. The default pair (student n10, 256ch/20x20 at stride 32 -> teacher x6,
+# 128ch/40x40 at stride 16) differs in both shape and stride, so the projector has to invent the
+# correspondence. Pairing the same stage on both sides (n6 -> x6) removes that freedom; the `_s6`
+# arms below exist to measure the difference.
+# ---------------------------------------------------------------------------------------------
+_SSM_SIZED: dict[str, Any] = {
+    **_SSM,
+    "align_size_weight": True,
+    "align_size_weight_exp": 1.0,
+    "align_size_weight_min": 0.25,
+    "align_size_weight_max": 4.0,
+    "align_box_conf_weight": True,
+}
+
+_DFIRE_KD_VARIANTS.update(
+    {
+        "ssm": dict(_SSM),
+        "ssm_sz": dict(_SSM_SIZED),
+        "ssm_sz_s6": {**_SSM_SIZED, "dict_student_layer": 6},
+        # Soft assignment: the align target is the pi-weighted mean of teacher slices rather than
+        # the single argmax slice, so every teacher location contributes.
+        "ssm_soft_s6": {**_SSM_SIZED, "dict_match": "soft", "dict_student_layer": 6},
+    }
+)
+
+# Names used by the archived queues, kept so old launch lines still resolve.
+_VARIANT_ALIASES: dict[str, str] = {
+    "paperssm": "ssm",
+    "paperssm_sz": "ssm_sz",
+    "paperssm_sz_s6": "ssm_sz_s6",
+    "paperssm_soft_s6": "ssm_soft_s6",
+}
+
+
+# Decision-level align weighting (the `*sz` variants). These keys live only in
+# this fork's cfg, so they must be listed here or ``_yolo_overrides`` silently drops them (no
+# error, no effect). Kept separate from the dictionary keys because they act on
+# `_alignment_loss`, not on the dictionary branch.
+_ALIGN_WEIGHT_KEYS = frozenset(
+    (
+        "align_size_weight",
+        "align_size_weight_exp",
+        "align_size_weight_min",
+        "align_size_weight_max",
+        "align_box_conf_weight",
+    )
+)
+
+# `dict_infomax_loss` and `dict_infomax_marginal_weight` are not in `_KD_RECIPE`, so without this
+# they would be dropped by `_yolo_overrides` and the InfoMax term would silently stay at zero.
+_SSM_EXTRA_KEYS = frozenset(
+    (
+        "dict_infomax_loss",
+        "dict_infomax_marginal_weight",
+    )
+)
+
 _KD_EXTRA_KEYS = (
     frozenset(_KD_RECIPE)
     | frozenset(_VOC_KD_OVERRIDES)
     | _DICT_STRUCTURE_KEYS
+    | _ALIGN_WEIGHT_KEYS
+    | _SSM_EXTRA_KEYS
     | frozenset(("teacher_weights", "teacher_freeze_epoch"))
 )
 
@@ -1060,6 +1341,8 @@ def build_overrides(baseline: str, args: argparse.Namespace) -> dict[str, Any]:
     if args.batch is not None:
         cfg["batch"] = int(args.batch)
         cfg["nbs"] = int(args.batch)
+        # Warmup is a fixed number of updates, so its epoch length follows the batch.
+        cfg["warmup_epochs"] = warmup_epochs_for(int(args.batch))
     if getattr(args, "nbs", None) is not None:
         # Decouple the nominal batch size from the gradient batch. Ultralytics scales the
         # effective weight decay as wd * batch * accumulate / nbs, so this is the supported way
@@ -1131,7 +1414,8 @@ def train_one(baseline: str, args: argparse.Namespace) -> Path:
     print("pretrained:", overrides["pretrained"])
     print("epochs:", overrides["epochs"], "close_mosaic:", overrides["close_mosaic"])
     print(
-        "protocol: CONTROLLED_ARGS (SGD, batch/nbs=112, mosaic=1.0, amp=True, seed=0)"
+        "protocol: CONTROLLED_ARGS (SGD, batch/nbs=%d, mosaic=1.0, amp=True, seed=0)"
+        % overrides["batch"]
     )
     if spec.get("trainer") == "kd":
         print("teacher:", overrides.get("teacher"), overrides.get("teacher_weights"))

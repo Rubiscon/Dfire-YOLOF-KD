@@ -537,6 +537,11 @@ def check_dict_alignment(
             "align_cls_mode",
             "align_tal_topk",
             "align_max_fg",
+            "align_size_weight",
+            "align_size_weight_exp",
+            "align_size_weight_min",
+            "align_size_weight_max",
+            "align_box_conf_weight",
             "distill_max_boxes",
             # backbone distillation (dictionary module)
             "dict_align_loss",
