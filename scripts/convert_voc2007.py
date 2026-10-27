@@ -6,7 +6,7 @@ Protocol (do not invent a split):
   test   = the same test images          (4952)
 
 This is VOC2007-only. Do not use ultralytics/cfg/datasets/VOC.yaml (that is
-07+12: 2007 trainval + 2012 trainval). Do not mix D-Fire or DFS teachers.
+07+12: 2007 trainval + 2012 trainval). Do not mix D-Fire teachers.
 
 Label conversion matches Ultralytics VOC.yaml: skip ``difficult==1``, and
 treat boxes as 1-based inclusive pixels (subtract 1 before normalizing).

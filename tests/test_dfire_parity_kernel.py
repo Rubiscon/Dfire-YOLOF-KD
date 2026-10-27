@@ -25,8 +25,8 @@ def _tiny_model() -> nn.Module:
 
 
 def test_controlled_args_match_full_aug_protocol():
-    args = build_args(data="dfire.yaml", model="models/yolo26n-DCN.yaml")
-    assert (args.epochs, args.batch, args.nbs) == (200, 112, 112)
+    args = build_args(data="dfire.yaml", model="yolo26n-DCN.yaml")
+    assert (args.epochs, args.batch, args.nbs) == (200, 32, 32)
     assert (args.lr0, args.lrf, args.momentum, args.weight_decay) == (0.01, 0.01, 0.9, 0.0005)
     assert args.optimizer == "SGD" and not args.cos_lr and args.amp and not args.rect
     assert args.mosaic == 1.0 and args.close_mosaic == 10
@@ -150,3 +150,66 @@ def test_scheduler_advances_once_per_epoch():
         engine.on_epoch_end()
     assert engine.epoch == 85
     assert engine.optimizer.param_groups[0]["lr"] == pytest.approx(0.01 * lr_lambda(args)(85))
+
+
+def test_online_teacher_init_must_be_coco_yolo26n():
+    from dfire_parity.protocol import (
+        assert_online_teacher_init, is_in_dataset_finetuned_teacher)
+
+    assert not is_in_dataset_finetuned_teacher("/root/Ultra/weights/yolo26n.pt")
+    assert is_in_dataset_finetuned_teacher(
+        "/root/Ultra/weights/yolo26n_teacher_N200_best.pt")
+    assert is_in_dataset_finetuned_teacher(
+        "/root/Ultra/weights/yolo26n_voc2007_teacher_best.pt")
+    assert_online_teacher_init("/root/Ultra/weights/yolo26n.pt")
+    assert_online_teacher_init(
+        "/root/Ultra/weights/yolo26n_teacher_N200_best.pt", online_distill=False)
+    with pytest.raises(ValueError, match="COCO yolo26n.pt"):
+        assert_online_teacher_init(
+            "/root/Ultra/weights/yolo26n_teacher_N200_best.pt")
+    with pytest.raises(ValueError, match="COCO yolo26n.pt"):
+        assert_online_teacher_init(
+            "/root/Ultra/weights/yolo26n_voc2007_teacher_best.pt")
+
+
+def test_teacher_freeze_epoch_defaults_to_full_schedule():
+    from dfire_parity.protocol import resolve_teacher_freeze_epoch, teacher_joint_training
+
+    assert resolve_teacher_freeze_epoch(None, 200) == 200
+    assert resolve_teacher_freeze_epoch(0, 200) == 200
+    assert resolve_teacher_freeze_epoch(50, 200) == 50
+    assert teacher_joint_training(True, 200, 200, 200)
+    assert not teacher_joint_training(True, 200, 201, 200)
+    assert teacher_joint_training(True, None, 1, 200)
+    assert not teacher_joint_training(False, 200, 1, 200)
+    assert not teacher_joint_training(True, 10, 5, 200, teacher_frozen=True)
+
+
+def test_split_kd_grad_groups_and_detached_teacher_targets():
+    from dfire_parity.protocol import split_kd_grad_param_groups
+
+    class DistillSurface(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.student_model = nn.Linear(2, 2, bias=False)
+            self.teacher_model = nn.Linear(2, 2, bias=False)
+            self.cankd = nn.Linear(2, 2, bias=False)
+
+    model = DistillSurface()
+    student, teacher, distill = split_kd_grad_param_groups(model)
+    assert [id(param) for param in student] == [id(model.student_model.weight)]
+    assert [id(param) for param in teacher] == [id(model.teacher_model.weight)]
+    assert [id(param) for param in distill] == [id(model.cankd.weight)]
+
+    inputs = torch.randn(4, 2)
+    teacher_out = model.teacher_model(inputs)
+    kd = (model.student_model(inputs) - teacher_out.detach()).pow(2).mean()
+    task = model.teacher_model(inputs).pow(2).mean()
+    (kd + task).backward()
+    assert model.teacher_model.weight.grad is not None
+    assert model.teacher_model.weight.grad.abs().sum() > 0
+    model.zero_grad()
+    kd_only = (model.student_model(inputs) - model.teacher_model(inputs).detach()).pow(2).mean()
+    kd_only.backward()
+    assert model.teacher_model.weight.grad is None
+    assert model.student_model.weight.grad is not None

@@ -128,10 +128,56 @@ def test_match_diagnostics_csv_writer():
     assert lines[1].startswith("100,2,")
 
 
+def test_init_seed_pins_the_trainable_projection_across_encoder_configs():
+    """Changing the encoders must not silently re-roll `proj`.
+
+    `proj` is the only randomly initialised dictionary parameter that training can still
+    move under a frozen-encoder assignment, and it is built after the encoders, so any
+    change to the encoder shapes shifts the RNG stream and gives `proj` a different start.
+    Measured, that shift is up to 0.062 on the weights -- larger than the effects being
+    measured. `init_seed` must pin it.
+    """
+    kw = dict(match="hard", temperature=0.07, match_norm="l2")
+    variants = {
+        "basefix": dict(match_init="default"),
+        "identinit": dict(match_init="identity"),
+        "dwident": dict(match_init="identity", teacher_encoder=False, student_encoder="depthwise"),
+        "dwpwst": dict(match_init="default", teacher_encoder=False,
+                       student_encoder="depthwise_separable"),
+    }
+
+    def proj_of(seed, name, extra, advance):
+        torch.manual_seed(11)
+        torch.randn(advance)
+        m = DictionaryModule(8, 6, 12, 6, 2, init_seed=seed, **kw, **extra)
+        return m.proj.net[0].weight.detach().clone()
+
+    # without a pinned seed the initialisation differs between encoder configs
+    loose = {n: proj_of(None, n, e, 500 + i * 37) for i, (n, e) in enumerate(variants.items())}
+    assert not torch.equal(loose["basefix"], loose["dwident"])
+
+    # with a pinned seed every config starts from the same projection
+    pinned = {n: proj_of(7, n, e, 500 + i * 37) for i, (n, e) in enumerate(variants.items())}
+    for name, weight in pinned.items():
+        assert torch.equal(pinned["basefix"], weight), name
+
+    # The substantive property: proj must not depend on how much RNG the encoders consumed
+    # before it. (The global stream legitimately still advances, because the encoders draw
+    # from it; only proj's starting point is pinned.)
+    a = proj_of(7, "basefix", variants["basefix"], advance=17)
+    b = proj_of(7, "dwident", variants["dwident"], advance=99991)
+    assert torch.equal(a, b)
+    assert not torch.equal(
+        proj_of(7, "basefix", variants["basefix"], advance=17),
+        proj_of(8, "basefix", variants["basefix"], advance=17),
+    ), "a different init_seed should give a different projection"
+
+
 if __name__ == "__main__":
     test_infomax_prefers_balanced_deterministic_assignments()
     test_straight_through_forward_is_hard_and_assignment_losses_train_qk()
     test_match_diagnostics_cover_collapse_and_stability_signals()
     test_match_diagnostics_csv_writer()
+    test_init_seed_pins_the_trainable_projection_across_encoder_configs()
     print("InfoMax matching tests passed")
 

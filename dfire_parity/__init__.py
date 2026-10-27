@@ -39,7 +39,14 @@ from .protocol import (
     build_args,
     identify_dataset,
     names_for_num_classes,
+    DEFAULT_TEACHER_TASK_WEIGHT,
+    assert_online_teacher_init,
+    is_in_dataset_finetuned_teacher,
+    resolve_teacher_freeze_epoch,
+    split_kd_grad_param_groups,
     steps_per_epoch,
+    teacher_joint_training,
+    warmup_epochs_for,
 )
 
 __all__ = [
@@ -48,9 +55,14 @@ __all__ = [
     "EMA_DECAY",
     "EMA_TAU",
     "GRAD_CLIP_MAX_NORM",
+    "DEFAULT_TEACHER_TASK_WEIGHT",
+    "assert_online_teacher_init",
     "identify_dataset",
+    "is_in_dataset_finetuned_teacher",
     "names_for_num_classes",
-    "NUM_CLASSES",
+    "resolve_teacher_freeze_epoch",
+    "split_kd_grad_param_groups",
+    "teacher_joint_training",
     "VOC2007_CLASS_NAMES",
     "VOC2007_NUM_CLASSES",
     "PARITY_TOLERANCE",
@@ -71,6 +83,7 @@ __all__ = [
     "state_dict_sha256",
     "steps_per_epoch",
     "val_batch_size",
+    "warmup_epochs_for",
     "warmup_iterations",
     "write_student_init_manifest",
 ]

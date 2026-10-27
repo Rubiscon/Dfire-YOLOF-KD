@@ -156,8 +156,60 @@ def test_train_voc2007_overrides_use_protocol_and_not_dfire():
     )
     cfg = build_overrides("yolo26n", args)
     assert cfg["epochs"] == 200
-    assert cfg["batch"] == 112
+    assert cfg["batch"] == 32
     assert cfg["seed"] == 0
     assert "dfire.yaml" not in cfg["data"]
     assert cfg["pretrained"] == "yolo26n.pt"
     assert cfg["name"] == "voc2007-yolo26n-200e-seed0"
+
+
+def test_voc2007_online_kd_inits_teacher_from_coco_not_voc_best():
+    from scripts.train_dfs import build_overrides
+
+    args = Namespace(
+        epochs=200,
+        batch=None,
+        device=None,
+        workers=None,
+        pretrained="yolo26n.pt",
+        project=None,
+        dataset="voc2007",
+        name_suffix="seed0",
+        teacher_weights="",
+        resume=False,
+        weights="",
+    )
+    cfg = build_overrides("dcn-kd", args)
+    assert cfg["online_distill"] is True
+    assert cfg["teacher_freeze_epoch"] == 200
+    assert cfg["teacher_weights"] == "yolo26n.pt"
+    assert cfg["pretrained"] == "yolo26n.pt"
+    assert cfg["align_start_epoch"] == 80
+    assert cfg["align_loss"] == 0.06
+    assert cfg["align_box"] == 1.0
+    assert cfg["align_cls"] == 2.0
+    assert cfg["distill_conf_thres"] == 0.45
+    assert cfg["feature_loss"] == 0.04
+    assert cfg["dict_align_loss"] == 0.08
+    assert cfg["dict_attn_loss"] == 0.10
+    assert cfg["dict_attn_start_epoch"] == 80
+
+
+def test_voc2007_online_kd_rejects_finetuned_voc_teacher():
+    from scripts.train_dfs import build_overrides
+
+    args = Namespace(
+        epochs=200,
+        batch=None,
+        device=None,
+        workers=None,
+        pretrained="yolo26n.pt",
+        project=None,
+        dataset="voc2007",
+        name_suffix="seed0",
+        teacher_weights="/root/Ultra/weights/yolo26n_voc2007_teacher_best.pt",
+        resume=False,
+        weights="",
+    )
+    with pytest.raises(SystemExit, match="COCO init"):
+        build_overrides("dcn-kd", args)

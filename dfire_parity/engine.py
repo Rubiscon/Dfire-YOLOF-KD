@@ -22,6 +22,7 @@ from .protocol import (
     GRAD_CLIP_NORM_TYPE,
     STRIDE,
     VAL_BATCH_MULTIPLIER,
+    split_kd_grad_param_groups,
 )
 
 
@@ -183,7 +184,14 @@ class UltralyticsParityEngine:
     dataset so mosaic can be closed for the final ``close_mosaic`` epochs).
     """
 
-    def __init__(self, model: nn.Module, args, steps_per_epoch: int, enable_ema: bool = True):
+    def __init__(
+        self,
+        model: nn.Module,
+        args,
+        steps_per_epoch: int,
+        enable_ema: bool = True,
+        split_kd_grad_clip: bool = False,
+    ):
         from ultralytics.utils.torch_utils import ModelEMA
 
         self.model = model
@@ -198,6 +206,7 @@ class UltralyticsParityEngine:
         self.scaler = _grad_scaler(self.amp)
         self.ema = ModelEMA(model, decay=EMA_DECAY, tau=EMA_TAU) if enable_ema else None
         self.epoch = 0
+        self.split_kd_grad_clip = bool(split_kd_grad_clip)
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -255,9 +264,16 @@ class UltralyticsParityEngine:
         """Unscale (AMP), clip, step, update scaler, zero grads, advance EMA."""
         if self.amp:
             self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), max_norm=GRAD_CLIP_MAX_NORM, norm_type=GRAD_CLIP_NORM_TYPE
-        )
+        if self.split_kd_grad_clip:
+            for group in split_kd_grad_param_groups(self.model):
+                if group:
+                    torch.nn.utils.clip_grad_norm_(
+                        group, max_norm=GRAD_CLIP_MAX_NORM, norm_type=GRAD_CLIP_NORM_TYPE
+                    )
+        else:
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), max_norm=GRAD_CLIP_MAX_NORM, norm_type=GRAD_CLIP_NORM_TYPE
+            )
         if self.amp:
             self.scaler.step(self.optimizer)
             self.scaler.update()

@@ -18,7 +18,7 @@ from dfire_parity.engine import UltralyticsParityEngine
 from ultralytics.engine.trainer import BaseTrainer
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_YAML = ROOT / "models" / "yolo26n-DCN.yaml"
+MODEL_YAML = ROOT / "yolo26n-DCN.yaml"
 DATA_YAML = ROOT / "Log" / "_eval_val_test" / "dfire_local.yaml"
 
 

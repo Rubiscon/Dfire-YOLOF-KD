@@ -1,14 +1,31 @@
 """Canonical D-Fire controlled training protocol for framework-fair comparison.
 
 Source of truth for Ultralytics / MMDetection (SKD) / Detectron2 (GID). Values
-below match the full-augmentation YOLOF solo recipe (see
-``Log/YOLOF_batch64_args.yaml``) with the controlled comparison overrides:
-batch/nbs=112, SGD momentum=0.9, short warmup, amp=True.
+below match the full-augmentation YOLOF solo recipe with the controlled
+comparison overrides: batch/nbs=32, SGD momentum=0.9, short warmup, amp=True.
+
+Warmup is fixed in optimizer updates, so the same schedule applies at any batch:
+``warmup_epochs`` comes from :func:`warmup_epochs_for`.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
+
+# D-Fire train split and warmup length. Warmup is fixed in optimizer updates so that a
+# change of physical batch does not change the schedule.
+DFIRE_TRAIN_IMAGES = 14122
+PROTOCOL_WARMUP_UPDATES = 101
+
+
+def warmup_epochs_for(
+    batch: int, images: int = DFIRE_TRAIN_IMAGES, updates: int = PROTOCOL_WARMUP_UPDATES
+) -> float:
+    """Warmup length in epochs for ``batch``, covering ``updates`` optimizer steps."""
+    steps = max(1, -(-int(images) // int(batch)))
+    return updates / steps
+
 
 # Every field the reference protocol pins. Anything absent falls back to the
 # fork's DEFAULT_CFG_DICT so future upstream defaults stay shared.
@@ -19,8 +36,8 @@ CONTROLLED_ARGS: dict[str, Any] = {
     "imgsz": 640,
     "epochs": 200,
     "patience": 200,
-    "batch": 112,
-    "nbs": 112,
+    "batch": 32,
+    "nbs": 32,
     "fixed_accumulate": True,
     "seed": 0,
     "deterministic": False,
@@ -43,8 +60,8 @@ CONTROLLED_ARGS: dict[str, Any] = {
     "cos_lr": False,
     "momentum": 0.9,
     "weight_decay": 0.0005,
-    # short warmup: max(round(0.79275 * 127), 100) == 101 updates
-    "warmup_epochs": 0.7927519818799547,
+    # 101 optimizer updates regardless of batch: 101/442 epochs at batch 32.
+    "warmup_epochs": warmup_epochs_for(32),
     "warmup_momentum": 0.9,
     "warmup_bias_lr": 0.0,
     # loss gains
@@ -103,7 +120,7 @@ EMA_TAU = 2000
 
 # Dataset contract. CLASS_NAMES / NUM_CLASSES remain the D-Fire defaults so
 # existing D-Fire tests and docs stay valid. VOC2007 is the other allowed
-# host dataset (trainval→train, test→val/test). Do not silently accept DFS.
+# host dataset (trainval→train, test→val/test).
 NUM_CLASSES = 2
 CLASS_NAMES = {0: "smoke", 1: "fire"}
 VOC2007_NUM_CLASSES = 20
@@ -162,7 +179,7 @@ def identify_dataset(names: Any, nc: int | None = None) -> str:
     else:
         raise ValueError(
             "Unsupported dataset classes %s. Controlled Ultralytics/GID/SKD/CanKD "
-            "hosts accept D-Fire %s or VOC2007 %s (not DFS)."
+            "hosts accept D-Fire %s or VOC2007 %s."
             % (mapping, CLASS_NAMES, VOC2007_CLASS_NAMES)
         )
     if nc is not None and int(nc) != expected_nc:
@@ -172,8 +189,7 @@ def identify_dataset(names: Any, nc: int | None = None) -> str:
     return key
 
 # Solo gate for this full-augmentation protocol (YOLOF_batch64 peak ~0.709 under
-# the same aug family). Re-measure after the first Ultra batch-112 amp run if
-# the observed peak differs; until then use the batch64 Ultra peak as reference.
+# the same aug family).
 REFERENCE_MAP50 = 0.709
 PARITY_TOLERANCE = 0.005
 
@@ -204,3 +220,82 @@ def build_args(**overrides: Any):
 def steps_per_epoch(num_images: int, batch: int = CONTROLLED_ARGS["batch"]) -> int:
     """Optimizer updates per epoch, matching the fork's non-dropping dataloader."""
     return -(-int(num_images) // int(batch))
+
+
+# Online distillation (matches Ultralytics YOLOFDistillationModel).
+# Teacher learns only from GT; KD/GID/CanKD/SKD targets stay detached.
+DEFAULT_TEACHER_TASK_WEIGHT = 1.0
+_TEACHER_NAME_PREFIXES = ("teacher_model.", "teacher.")
+_DISTILL_NAME_TOKENS = ("cankd", "structural_kd", "adapters")
+_COCO_TEACHER_INIT_NAME = "yolo26n.pt"
+_IN_DATASET_TEACHER_TOKENS = (
+    "teacher_n200",
+    "voc2007_teacher",
+    "_teacher_best.pt",
+)
+
+
+def is_in_dataset_finetuned_teacher(path: Any) -> bool:
+    """True for a finished in-dataset YOLO26n checkpoint, not COCO yolo26n.pt."""
+    name = Path(str(path or "")).name.lower()
+    if not name or name == _COCO_TEACHER_INIT_NAME:
+        return False
+    return any(token in name for token in _IN_DATASET_TEACHER_TOKENS)
+
+
+def assert_online_teacher_init(path: Any, *, online_distill: bool = True) -> None:
+    """Online KD teacher must start from COCO yolo26n.pt and train with the student."""
+    if not online_distill:
+        return
+    if not path:
+        raise ValueError(
+            "Online KD requires teacher init from COCO yolo26n.pt.")
+    name = Path(str(path)).name.lower()
+    if name != _COCO_TEACHER_INIT_NAME or is_in_dataset_finetuned_teacher(path):
+        raise ValueError(
+            "Online KD trains the teacher from COCO yolo26n.pt jointly with "
+            "the student; do not load a finished in-dataset teacher. Got: %s"
+            % path)
+
+
+def resolve_teacher_freeze_epoch(freeze_epoch: Any, epochs: int) -> int:
+    """1-indexed freeze epoch; ``<=0`` or ``None`` means never freeze during ``epochs``."""
+    if freeze_epoch in (None, "", False):
+        return int(epochs)
+    value = int(freeze_epoch)
+    if value <= 0:
+        return int(epochs)
+    return value
+
+
+def teacher_joint_training(
+    online_distill: bool,
+    freeze_epoch: Any,
+    epoch_1indexed: int,
+    epochs: int,
+    teacher_frozen: bool = False,
+) -> bool:
+    """True while the teacher receives GT task loss.
+
+    Same rule as Ultralytics: epochs ``1..freeze_epoch`` are joint. When
+    ``freeze_epoch == epochs`` the teacher stays trainable for the whole run.
+    """
+    if not online_distill or teacher_frozen:
+        return False
+    freeze_ep = resolve_teacher_freeze_epoch(freeze_epoch, epochs)
+    return int(epoch_1indexed) <= freeze_ep
+
+
+def split_kd_grad_param_groups(model):
+    """Partition trainable params for per-branch clip (student / teacher / distill)."""
+    student, teacher, distill = [], [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith(_TEACHER_NAME_PREFIXES) or ".teacher_model." in name:
+            teacher.append(param)
+        elif any(token in name for token in _DISTILL_NAME_TOKENS):
+            distill.append(param)
+        else:
+            student.append(param)
+    return student, teacher, distill

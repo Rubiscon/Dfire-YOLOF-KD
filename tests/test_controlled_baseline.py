@@ -45,8 +45,8 @@ def test_offline_controlled_baseline_freezes_shared_teacher(tmp_path):
     assert config["augmentations"] == []
     assert config["optimizer"] == "SGD"
     assert config["momentum"] == 0.9
-    assert config["batch"] == 112
-    assert config["nbs"] == 112
+    assert config["batch"] == 32
+    assert config["nbs"] == 32
     assert config["fixed_accumulate"] is False
 
 
@@ -63,5 +63,5 @@ def test_controlled_solo_uses_same_initialization_and_augmentation(tmp_path):
     assert config["translate"] == 0.0
     assert config["fliplr"] == 0.5
     assert config["optimizer"] == "SGD"
-    assert config["batch"] == 112
-    assert config["nbs"] == 112
+    assert config["batch"] == 32
+    assert config["nbs"] == 32

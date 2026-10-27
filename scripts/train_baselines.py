@@ -46,6 +46,8 @@ torch.backends.cudnn.benchmark = True
 from ultralytics import YOLO
 from ultralytics.models.yolo.detect.train import DetectionTrainer, YOLOFDistillationTrainer
 
+# 101 warmup updates over ceil(14122/32) = 442 steps per epoch.
+_WARMUP_EPOCHS = 101 / 442
 # ---------------------------------------------------------------------------
 # Shared training config (official split: datasets/D-Fire/data)
 # ---------------------------------------------------------------------------
@@ -63,8 +65,8 @@ COMMON: dict[str, Any] = {
     "val": True,
 }
 
-DEFAULT_BATCH = 112  # solo / KD when VRAM allows (matches n_kd_n_batch112)
-DEFAULT_KD_BATCH = 112  # proven KD recipe; drop with --batch if saliency OOM
+DEFAULT_BATCH = 32
+DEFAULT_KD_BATCH = 32
 
 # Shared controlled related-work augmentation: centered 640 letterbox plus
 # horizontal flip only. Structural KD and GID wrappers use the same transform.
@@ -89,24 +91,23 @@ _CONTROLLED_AUG: dict[str, Any] = {
 _CONTROLLED_OPT: dict[str, Any] = {
     # A common optimizer is used across all framework ports. Explicit SGD
     # avoids framework-specific MuSGD/Muon grouping from becoming a confounder.
-    # Physical batch 112 on one GPU; no gradient accumulation.
-    "batch": 112,
+    "batch": 32,
     "optimizer": "SGD",
     "lr0": 0.01,
     "lrf": 0.01,
     "momentum": 0.9,
     "weight_decay": 0.0005,
-    "nbs": 112,
+    "nbs": 32,
     "fixed_accumulate": False,
-    # 100 optimizer updates warmup over ceil(14122/112)=127 steps/epoch.
-    "warmup_epochs": 100.0 / 127.0,
+    # Warmup fixed in updates, so it does not move with the batch: 101/442 epochs at 32.
+    "warmup_epochs": _WARMUP_EPOCHS,
     "warmup_momentum": 0.9,
     "warmup_bias_lr": 0.0,
     "cos_lr": False,
     "amp": False,
 }
 
-# Shared online KD — aligned to Log/n_kd_n_batch112 (best mAP50≈0.728).
+# Shared online KD.
 _KD_COMMON: dict[str, Any] = {
     "online_distill": True,
     "teacher_freeze_epoch": 200,
@@ -353,6 +354,10 @@ def build_overrides(baseline_key: str, args: argparse.Namespace) -> dict[str, An
         cfg["patience"] = args.patience
     if args.batch is not None:
         cfg["batch"] = args.batch
+        if "nbs" in cfg:
+            cfg["nbs"] = args.batch
+        # Warmup is a fixed number of updates, so its epoch length follows the batch.
+        cfg["warmup_epochs"] = 101 / max(1, -(-14122 // int(args.batch)))
     if args.device is not None:
         cfg["device"] = args.device
     if args.workers is not None:
