@@ -254,3 +254,27 @@ diagnose_pgd.py
 # OS
 Thumbs.db
 Desktop.ini
+
+# === Local experiment artefacts (never commit) ===
+# Run logs, scratch analyses and one-off orchestration scripts stay on the machine
+# that produced them. Only scripts/ and configs/ are versioned.
+Log*/
+results/
+tmp/
+analysis/
+canvases/
+cropped-detections/
+images/
+tools/
+tools_exp/
+tools_picodet/
+
+# Ad-hoc debugging output
+*.npy
+*.index
+*.ndjson
+*.bundle
+_saliency_robust.json
+default_copy.yaml
+2111.00902v1.pdf
+pytest_*.txt
