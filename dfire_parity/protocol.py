@@ -1,8 +1,7 @@
-"""Canonical D-Fire controlled training protocol for framework-fair comparison.
+"""Training protocol shared by the framework-fair comparison.
 
-Source of truth for Ultralytics / MMDetection (SKD) / Detectron2 (GID). Values
-below match the full-augmentation YOLOF solo recipe with the controlled
-comparison overrides: batch/nbs=32, SGD momentum=0.9, short warmup, amp=True.
+Pins the values the Ultralytics, MMDetection (SKD) and Detectron2 (GID) ports must agree on:
+batch/nbs=32, SGD momentum=0.9, short warmup, amp=True.
 
 Warmup is fixed in optimizer updates, so the same schedule applies at any batch:
 ``warmup_epochs`` comes from :func:`warmup_epochs_for`.
@@ -53,7 +52,7 @@ CONTROLLED_ARGS: dict[str, Any] = {
     "freeze": None,
     "profile": False,
     "plots": False,
-    # optimizer (explicit SGD; do not use optimizer=auto / MuSGD)
+    # optimizer (explicit SGD; optimizer=auto / MuSGD is not comparable across ports)
     "optimizer": "SGD",
     "lr0": 0.01,
     "lrf": 0.01,
@@ -118,9 +117,9 @@ GRAD_CLIP_NORM_TYPE = 2.0
 EMA_DECAY = 0.9999
 EMA_TAU = 2000
 
-# Dataset contract. CLASS_NAMES / NUM_CLASSES remain the D-Fire defaults so
-# existing D-Fire tests and docs stay valid. VOC2007 is the other allowed
-# host dataset (trainval→train, test→val/test).
+# Dataset contract. CLASS_NAMES / NUM_CLASSES are the D-Fire defaults, so existing D-Fire
+# tests and docs stay valid. VOC2007 is the other allowed host dataset (trainval->train,
+# test->val/test).
 NUM_CLASSES = 2
 CLASS_NAMES = {0: "smoke", 1: "fire"}
 VOC2007_NUM_CLASSES = 20
@@ -188,8 +187,8 @@ def identify_dataset(names: Any, nc: int | None = None) -> str:
         )
     return key
 
-# Solo gate for this full-augmentation protocol (YOLOF_batch64 peak ~0.709 under
-# the same aug family).
+# Solo reference for this full-augmentation protocol (YOLOF_batch64 peak ~0.709 under the
+# same augmentation family).
 REFERENCE_MAP50 = 0.709
 PARITY_TOLERANCE = 0.005
 
@@ -253,9 +252,8 @@ def assert_online_teacher_init(path: Any, *, online_distill: bool = True) -> Non
     name = Path(str(path)).name.lower()
     if name != _COCO_TEACHER_INIT_NAME or is_in_dataset_finetuned_teacher(path):
         raise ValueError(
-            "Online KD trains the teacher from COCO yolo26n.pt jointly with "
-            "the student; do not load a finished in-dataset teacher. Got: %s"
-            % path)
+            "Online KD trains the teacher from COCO yolo26n.pt jointly with the student, "
+            "not from a finished in-dataset checkpoint. Got: %s" % path)
 
 
 def resolve_teacher_freeze_epoch(freeze_epoch: Any, epochs: int) -> int:

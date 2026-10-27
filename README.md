@@ -1,7 +1,5 @@
 # DFire-YOLOF-KD
 
-Project repository under the CDMP Research and Innovation Scheme.
-
 Knowledge distillation from a YOLO26n feature-pyramid teacher into a YOLOF-style student on
 the D-Fire smoke/fire benchmark, inside one Ultralytics fork.
 
@@ -15,7 +13,7 @@ the D-Fire smoke/fire benchmark, inside one Ultralytics fork.
 | `scripts/eval_dfire.py` | distillation checkpoint to val/test metrics |
 | `scripts/convert_voc2007.py` | optional VOC2007 conversion |
 | `dfire_parity/` | training protocol shared by the comparison runs |
-| `yolo26n-DCN.yaml` | student model |
+| `models/` | student model and the head/tap variants |
 | `tests/` | unit tests and forward smoke tests |
 
 The detection loss gains three terms: **SSM** (sliced-semantics matching of encoder
@@ -79,5 +77,5 @@ writing `summary.json`. Plain detector checkpoints go straight into `YOLO(...).v
 
 ## License
 
-Forked from [Ultralytics](https://github.com/ultralytics/ultralytics) under **AGPL-3.0**.
-Redistribution and commercial use must comply with AGPL-3.0 and the upstream license.
+Forked from [Ultralytics](https://github.com/ultralytics/ultralytics), **AGPL-3.0**. Redistribution
+and commercial use are bound by that license.

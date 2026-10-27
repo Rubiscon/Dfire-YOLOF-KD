@@ -1,8 +1,7 @@
-"""Shared Ultralytics training-protocol kernel for the D-Fire related-work comparison.
+"""Training-protocol kernel shared by the D-Fire framework comparison.
 
-Import this from MMDetection (Structural KD) and Detectron2 (GID) so every framework
-trains against the same data pipeline, optimizer grouping, schedule and EMA that the
-reference Ultralytics run used.
+Import this from MMDetection (Structural KD) and Detectron2 (GID) so every framework trains
+against the same data pipeline, optimizer grouping, schedule and EMA as the Ultralytics run.
 """
 
 from .engine import (

@@ -2,9 +2,9 @@
 """Evaluate D-Fire val/test checkpoints written by the distillation trainer.
 
 The distillation trainer saves a host checkpoint whose student weights live under a
-``student.*`` / ``ema.*`` prefix.  ``YOLO.val`` cannot consume that layout directly, so this
-script extracts the student state dict, rewrites it as a plain Ultralytics ``.pt`` and then
-runs the standard validator on the val and test splits.
+``student.*`` / ``ema.*`` prefix, which ``YOLO.val`` cannot read. This script extracts the
+student state dict, rewrites it as a plain Ultralytics ``.pt`` and runs the standard validator
+on the val and test splits.
 
 Example
 -------
@@ -127,7 +127,7 @@ def run_val(weights: Path, data: Path, split: str, device: str, batch: int, imgs
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
-    parser.add_argument("--student-yaml", default=str(ROOT / "yolo26n-DCN.yaml"))
+    parser.add_argument("--student-yaml", default=str(ROOT / "models" / "yolo26n-DCN.yaml"))
     parser.add_argument("--out", required=True)
     parser.add_argument("--device", default="0")
     parser.add_argument("--batch", type=int, default=16)

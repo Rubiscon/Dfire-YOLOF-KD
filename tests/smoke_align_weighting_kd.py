@@ -1,13 +1,11 @@
 """Model-level smoke for the `pindwsz` arm: (2) size-weighted align + (3) conf-weighted box.
 
-This is the integration check that the unit tests cannot give. Its most important assertion is
-that turning the two flags ON actually CHANGES the loss: this codebase has a documented failure
-mode where a cfg key not listed in `_KD_EXTRA_KEYS` / the CLI allowlist is dropped silently, with
-no error and no effect. A finite-loss assertion would pass in that case; a "the loss must change"
-assertion cannot.
+The integration check the unit tests cannot give. The key assertion is that turning the two
+flags on changes the loss: a cfg key missing from `_KD_EXTRA_KEYS` or the CLI allowlist is
+dropped without an error, and a finite-loss assertion would still pass.
 
 Also exercises the real `pindw` dictionary architecture (teacher encoder removed, depthwise
-student encoder) so the two changes are validated together, exactly as the arm will run.
+student encoder) so both changes run together as the arm will.
 """
 import os
 import sys
@@ -81,7 +79,7 @@ def build(batch_size=4):
         dfl=1.5,
         epochs=3,
     )
-    model = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
+    model = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
     model.args = args
     model.nc = 2
     model.names = {0: "smoke", 1: "fire"}

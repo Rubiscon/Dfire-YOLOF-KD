@@ -248,10 +248,10 @@ def _build_encoder(channels: int, form: str, in_size: int | None = None,
         )
     if form == "depthwise_upsample":
         # The student-side encoder used when the matching is done at full resolution: it both
-        # transforms the features and RESAMPLES them onto the teacher's spatial size, using only
+        # transforms the features and resamples them onto the teacher's spatial size, using only
         # depthwise convolutions (groups == channels, so no channel mixing) followed by BN and an
-        # activation. Deliberately no average pooling and no interpolation: the spatial change is
-        # done by the learnable transposed depthwise conv, matching the requested design.
+        # activation. No average pooling and no interpolation: the spatial change comes from the
+        # learnable transposed depthwise conv.
         if in_size is None or out_size is None:
             raise ValueError("depthwise_upsample needs in_size and out_size")
         in_size, out_size = int(in_size), int(out_size)
@@ -545,10 +545,9 @@ class DictionaryModule(nn.Module):
         estimated from the data instead of from two independently projected token spaces.
         Returns one teacher index per student channel, shared by every image of the batch.
 
-        Diagnostic role: this is an oracle-ish matcher under the "channels that fire on
-        the same images correspond" criterion. It exists to settle whether matching
-        accuracy is the binding constraint, so it deliberately ignores ``key_enc`` and
-        ``query_enc``.
+        Diagnostic role: an oracle-ish matcher under the "channels that fire on the same images
+        correspond" criterion. It exists to test whether matching accuracy is the binding
+        constraint, so it ignores ``key_enc`` and ``query_enc``.
         """
         with torch.no_grad():
             t_series = t_feat.float().mean(dim=(2, 3))  # (B, Ct)

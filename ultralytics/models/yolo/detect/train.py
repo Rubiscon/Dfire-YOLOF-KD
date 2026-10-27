@@ -420,7 +420,7 @@ class YOLOFDistillationModel(DetectionModel):
         if not features:
             raise RuntimeError(
                 "Student model does not contain YOLOF distillation blocks with cached features. "
-                "Use a YOLOF/DCN yaml (e.g. yolo26n-yolof.yaml or yolo26n-DCN.yaml)."
+                "Use a YOLOF/DCN yaml (e.g. models/yolo26n-DCN.yaml)."
             )
         return features
 
@@ -1360,13 +1360,12 @@ class YOLOFDistillationModel(DetectionModel):
             att_s = F.normalize(self._spatial_attention(s_proj).flatten(1), dim=1)
             # AT / Zagoruyko: squared Euclidean distance between unit vectors (scale ~0.2-1).
             #
-            # att_s is the spatial-energy map of the raw projection output. By default att_t
-            # is taken from `target` AFTER feature normalisation, which is a different
-            # functional: per-channel standardisation divides each channel by its own
-            # spatial std, so the two sides no longer carry the same quantity. Measured on
-            # real features, that mismatch inflates the residual from 0.206 to 0.467
-            # (random encoders) and to 0.678 (identity encoders), while the consistent
-            # raw/raw pairing is insensitive to the encoder change (0.2064 -> 0.2082).
+            # att_s is the spatial-energy map of the raw projection output. By default att_t is
+            # taken from `target` after feature normalisation, a different functional: per-channel
+            # standardisation divides each channel by its own spatial std, so the two sides no
+            # longer carry the same quantity. On real features that mismatch inflates the residual
+            # from 0.206 to 0.467 (random encoders) and 0.678 (identity encoders), while the
+            # raw/raw pairing stays insensitive to the encoder change (0.2064 -> 0.2082).
             # dict_attn_consistent uses the raw target so both sides are energy maps.
             attn_target = target_raw if attn_consistent else target
             att_t = F.normalize(self._spatial_attention(attn_target).flatten(1), dim=1)
@@ -1630,7 +1629,7 @@ class YOLOFDistillationModel(DetectionModel):
             # Per-anchor KL (reduction="none" then sum over classes) so the same mass-normalised
             # weight can be applied. With uniform weights this equals the previous
             # reduction="batchmean", which is what `_weighted_align_mean` reduces to.
-            # Deliberately weighted by SIZE only: the class target is already soft in `tconf`.
+            # Weighted by size only: the class target is already soft in `tconf`.
             kl_per = F.kl_div(
                 F.log_softmax(student_logits / T, dim=-1),
                 teacher_prob.detach(),

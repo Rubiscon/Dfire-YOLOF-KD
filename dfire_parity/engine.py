@@ -1,9 +1,8 @@
-"""Reusable pieces of the Ultralytics training loop for external frameworks.
+"""Pieces of the Ultralytics training loop reused by the external framework ports.
 
-MMDetection (Structural KD) and Detectron2 (GID) call into this module so that the
-data pipeline, optimizer parameter grouping, LR/momentum warmup, LR schedule, EMA,
-AMP and gradient clipping are literally the same code as ``BaseTrainer``, not a
-re-implementation that can silently drift.
+MMDetection (Structural KD) and Detectron2 (GID) call into this module so that the data
+pipeline, optimizer parameter grouping, LR/momentum warmup, LR schedule, EMA, AMP and
+gradient clipping are the same code as ``BaseTrainer`` rather than a re-implementation.
 """
 
 from __future__ import annotations
@@ -61,9 +60,8 @@ def build_loader(args, dataset, mode: str = "train", rank: int = -1,
                  pin_memory: bool | None = None):
     """Wrap a dataset in the fork's ``InfiniteDataLoader`` with matching worker counts.
 
-    ``pin_memory`` defaults to ``args.pin_memory`` (controlled protocol: False) so
-    host trainers do not inherit Ultralytics' True default, which has crashed
-    long CanKD runs inside the pin_memory worker thread.
+    ``pin_memory`` defaults to ``args.pin_memory`` (protocol: False). Ultralytics defaults it
+    to True, which has crashed long CanKD runs inside the pin_memory worker thread.
     """
     from ultralytics.data.build import build_dataloader
 

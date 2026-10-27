@@ -23,7 +23,7 @@ device = 0 if torch.cuda.is_available() else "cpu"
 
 trainer = YOLOFDistillationTrainer(
     overrides={
-        "model": "yolo26n-DCN.yaml",
+        "model": "models/yolo26n-DCN.yaml",
         "teacher": "yolo26n.yaml",
         "pretrained": False,
         "data": "dfire.yaml",

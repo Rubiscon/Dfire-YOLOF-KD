@@ -68,7 +68,7 @@ def _images():
 def model():
     assert pathlib.Path(TEACHER_CKPT).is_file()
     args = _args()
-    m = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
+    m = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
     m.args, m.nc, m.names = args, 2, {0: "smoke", 1: "fire"}
     ck = torch.load(TEACHER_CKPT, map_location="cpu", weights_only=False)
     t = ck.get("model", ck).float().eval().requires_grad_(False)

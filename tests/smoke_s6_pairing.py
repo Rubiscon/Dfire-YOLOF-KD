@@ -1,11 +1,10 @@
-"""Smoke: does `pindwsz_s6` (S[6] <-> T[6]) actually work end to end?
+"""Smoke: does `pindwsz_s6` (S[6] <-> T[6]) work end to end?
 
-Pins three things the config alone cannot guarantee:
+Pins four things the config alone cannot show:
   1. the variant resolves with the shape-matched pairing and keeps (2)/(3) intact;
-  2. the student tap at layer 6 is really captured during the loss (not silently None / 10);
-  3. the residual is computed with NO upsampling, because S[6] and T[6] are both 40x40;
-  4. it differs from `pindwsz` in exactly the pairing keys -- otherwise the arm is not a
-     single-variable delta and nothing can be concluded from it.
+  2. the student tap at layer 6 is captured during the loss (not None and not 10);
+  3. the residual is computed with no upsampling, because S[6] and T[6] are both 40x40;
+  4. it differs from `pindwsz` only in the pairing keys.
 """
 import os
 import pathlib
@@ -62,7 +61,7 @@ def _images():
 def model():
     assert pathlib.Path(TEACHER_CKPT).is_file()
     args = _args()
-    m = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
+    m = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
     m.args, m.nc, m.names = args, 2, {0: "smoke", 1: "fire"}
     ck = torch.load(TEACHER_CKPT, map_location="cpu", weights_only=False)
     t = ck.get("model", ck).float().eval().requires_grad_(False)

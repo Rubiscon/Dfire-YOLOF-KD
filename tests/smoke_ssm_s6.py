@@ -1,9 +1,9 @@
 """Smoke test for `ssm_sz_s6`: the same recipe with the tap moved to the matching stage.
 
 `ssm_sz` pairs a 20x20 student tap with a 40x40 teacher tap, so its encoder upsamples and its
-matcher interpolates. With the tap at n6 both sides are 40x40 and those two steps must become
-no-ops instead of still resampling; otherwise the arm keeps inventing resolution and the pairing
-change measures nothing.
+matcher interpolates. With the tap at n6 both sides are 40x40 and those two steps become
+no-ops; if they still resample, the arm invents resolution and the pairing change measures
+nothing.
 """
 import os
 import pathlib
@@ -64,7 +64,7 @@ def _images():
 def model():
     assert pathlib.Path(TEACHER_CKPT).is_file()
     args = _args()
-    m = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
+    m = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
     m.args, m.nc, m.names = args, 2, {0: "smoke", 1: "fire"}
     ck = torch.load(TEACHER_CKPT, map_location="cpu", weights_only=False)
     t = ck.get("model", ck).float().eval().requires_grad_(False)

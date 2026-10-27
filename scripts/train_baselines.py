@@ -1,19 +1,15 @@
-"""Unified D-Fire baselines on official train/val/test split (dfire.yaml).
+"""Unified D-Fire baselines on the official train/val/test split (dfire.yaml).
 
-Baselines (kept lean):
+Baselines:
   yolo26n       - YOLO26n FPN upper bound
   dcn-solo      - YOLO26n-DCN / YOLOF student, no KD
-  early         - CrisReport early dictionary (n10↔x6, attention weight)
-  early-dldx    - same recipe + saliency_dLdx (∂J_task/∂x^e)
-  early-dldx-offline - controlled related-work run with a shared frozen teacher
+  early         - dictionary KD (n10<->x6, attention weight)
+  early-dldx    - same recipe + saliency_dLdx (dJ_task/dx^e)
+  early-dldx-offline - frozen shared teacher
   infomax       - dLdx/old-AT base + straight-through InfoMax channel matching
   entropy-align - hard dictionary + positive spatial-entropy weighted align
-  entropy-align-minmax / entropy-inverse / dldx-entropy-gate - opt-in entropy candidates
+  entropy-align-minmax / entropy-inverse / dldx-entropy-gate - entropy candidates
   early-tune1/2 - editable copies for hyperparameter sweeps
-
-Hyperparameters below match the previous script bit-for-bit for these recipes
-(pretrained / batch / teacher_weights / KD gains). Sweep entries (early-B..T3,
-kd-p0, …) were removed; use early-tune* instead.
 
 Usage:
   python scripts/train_baselines.py --baseline yolo26n
@@ -25,8 +21,7 @@ Usage:
   python scripts/train_baselines.py --baseline early-tune1,early-tune2
   python scripts/train_baselines.py --baseline all
   python scripts/train_baselines.py --baseline early --test-only
-
-Aliases (old names still work): kd-early → early, early-S1a → early-dldx.
+Aliases: kd-early -> early, early-S1a -> early-dldx.
 """
 
 from __future__ import annotations
@@ -68,8 +63,8 @@ COMMON: dict[str, Any] = {
 DEFAULT_BATCH = 32
 DEFAULT_KD_BATCH = 32
 
-# Shared controlled related-work augmentation: centered 640 letterbox plus
-# horizontal flip only. Structural KD and GID wrappers use the same transform.
+# Controlled comparison augmentation: centered 640 letterbox plus horizontal flip only.
+# The Structural KD and GID wrappers use the same transform.
 _CONTROLLED_AUG: dict[str, Any] = {
     "mosaic": 0.0,
     "mixup": 0.0,
@@ -89,8 +84,8 @@ _CONTROLLED_AUG: dict[str, Any] = {
 }
 
 _CONTROLLED_OPT: dict[str, Any] = {
-    # A common optimizer is used across all framework ports. Explicit SGD
-    # avoids framework-specific MuSGD/Muon grouping from becoming a confounder.
+    # Shared across every framework port. Explicit SGD keeps framework-specific MuSGD/Muon
+    # grouping out of the comparison.
     "batch": 32,
     "optimizer": "SGD",
     "lr0": 0.01,
@@ -141,10 +136,10 @@ _KD_COMMON: dict[str, Any] = {
 
 
 def _kd_early(**overrides: Any) -> dict[str, Any]:
-    """KD early recipe: student n10 ↔ teacher x6. Overrides must not silently drop shared keys."""
+    """KD early recipe: student n10 <-> teacher x6. Overrides are layered on the shared keys."""
     cfg: dict[str, Any] = {
         "trainer": "kd",
-        "model": "yolo26n-DCN.yaml",
+        "model": "models/yolo26n-DCN.yaml",
         "teacher": "yolo26n.yaml",
         "batch": DEFAULT_KD_BATCH,
         **_KD_COMMON,
@@ -167,7 +162,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     },
     "dcn-solo": {
         "trainer": "detect",
-        "model": "yolo26n-DCN.yaml",
+        "model": "models/yolo26n-DCN.yaml",
         "name": "baseline-dcn-solo",
         "batch": DEFAULT_BATCH,
         "pretrained": "yolo26n.pt",
@@ -175,26 +170,26 @@ BASELINES: dict[str, dict[str, Any]] = {
     },
     "dcn-solo-controlled": {
         "trainer": "detect",
-        "model": "yolo26n-DCN.yaml",
+        "model": "models/yolo26n-DCN.yaml",
         "name": "controlled-dcn-solo-letterbox-flip",
         "batch": DEFAULT_BATCH,
         "pretrained": None,
         **_CONTROLLED_AUG,
         **_CONTROLLED_OPT,
         "description": (
-            "CONTROLLED RELATED-WORK SOLO: shared initialization and "
+            "Controlled solo run: shared initialization and "
             "letterbox+horizontal-flip augmentation; requires --student-weights"
         ),
     },
     # Former kd-early / early-3 attention recipe (hyperparams unchanged).
     "early": _kd_early(
         name="baseline-kd-early",
-        description="CrisReport early dictionary: n10↔x6, hard match, attention weight, pretrained student",
+        description="dictionary KD: n10<->x6, hard match, attention weight, pretrained student",
     ),
     # Former early-S1a (hyperparams unchanged).
     "early-dldx": _kd_early(
         name="baseline-early-S1a-dLdx",
-        description="early + saliency_dLdx (mean_c|∂J_task/∂x^e|); blur/clip off",
+        description="early + saliency_dLdx (mean_c|dJ_task/dx^e|); blur/clip off",
         dict_weight="saliency_dLdx",
         dict_saliency_blur=0.0,
         dict_saliency_clip=0.0,
@@ -202,7 +197,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     "early-dldx-offline": _kd_early(
         name="controlled-early-S1a-dLdx-offline",
         description=(
-            "CONTROLLED RELATED-WORK RUN: early-dLdx with a shared frozen D-Fire teacher; "
+            "Controlled run: early-dLdx with a shared frozen D-Fire teacher; "
             "requires --teacher-weights and --student-weights"
         ),
         online_distill=False,
@@ -220,7 +215,7 @@ BASELINES: dict[str, dict[str, Any]] = {
     "infomax": _kd_early(
         name="baseline-early-infomax-st",
         description=(
-            "N dLdx + spatial AT with proposal-style Q/K, straight-through hard assignment, "
+            "N dLdx + spatial AT with L2-normalised Q/K, straight-through hard assignment, "
             "and H(T|S)-H(T) regularization"
         ),
         dict_weight="saliency_dLdx",

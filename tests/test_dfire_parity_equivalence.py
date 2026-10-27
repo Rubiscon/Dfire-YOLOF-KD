@@ -1,7 +1,7 @@
 """End-to-end equivalence between the parity kernel and the fork's own DetectionTrainer.
 
-These are the tests that justify the claim that a run driven by ``dfire_parity`` from
-MMDetection or Detectron2 is the same experiment as a native ``yolo train`` run.
+Checking that a run driven by ``dfire_parity`` from MMDetection or Detectron2 is the same
+experiment as a native ``yolo train`` run.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from dfire_parity.engine import UltralyticsParityEngine
 from ultralytics.engine.trainer import BaseTrainer
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL_YAML = ROOT / "yolo26n-DCN.yaml"
+MODEL_YAML = ROOT / "models" / "yolo26n-DCN.yaml"
 DATA_YAML = ROOT / "Log" / "_eval_val_test" / "dfire_local.yaml"
 
 

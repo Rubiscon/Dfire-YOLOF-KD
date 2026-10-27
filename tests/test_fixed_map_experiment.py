@@ -1,10 +1,9 @@
 """Tests for the fixed-assignment experiment.
 
-The experiment only means anything if the correspondence assignment can actually influence
-the objective. The shipped module cannot, because its projection mixes all student channels
-into every output channel and each output channel has its own weights: reassigning targets
-is then a relabelling of independent sub-problems. These tests pin down both halves of that
-statement, so a future change cannot silently restore the absorption.
+The experiment only means anything if the correspondence assignment can influence the
+objective. The shipped module cannot: its projection mixes all student channels into every
+output channel and each output channel has its own weights, so reassigning targets relabels
+independent sub-problems. These tests cover both halves of that statement.
 """
 import hashlib
 from argparse import Namespace

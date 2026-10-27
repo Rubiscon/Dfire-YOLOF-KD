@@ -1,4 +1,4 @@
-"""End-to-end trainer smoke for kd-p0 + backbone dictionary distillation (tiny fraction, 1 epoch)."""
+"""End-to-end trainer smoke for backbone dictionary distillation (tiny fraction, 1 epoch)."""
 
 import os
 
@@ -8,7 +8,7 @@ from ultralytics.models.yolo.detect.train import YOLOFDistillationTrainer
 
 trainer = YOLOFDistillationTrainer(
     overrides={
-        "model": "yolo26n-DCN.yaml",
+        "model": "models/yolo26n-DCN.yaml",
         "teacher": "yolo26n.yaml",
         "pretrained": False,
         "data": "dfire.yaml",

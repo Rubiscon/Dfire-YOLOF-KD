@@ -1,12 +1,12 @@
 """Convert official VOC2007 into a YOLO layout for Ultralytics / GID / SKD / CanKD.
 
-Protocol (do not invent a split):
+Split:
   train  = ImageSets/Main/trainval.txt   (5011)
   val    = ImageSets/Main/test.txt       (4952)
   test   = the same test images          (4952)
 
-This is VOC2007-only. Do not use ultralytics/cfg/datasets/VOC.yaml (that is
-07+12: 2007 trainval + 2012 trainval). Do not mix D-Fire teachers.
+VOC2007 only. ultralytics/cfg/datasets/VOC.yaml is 07+12 (2007 trainval + 2012
+trainval) and is not used here.
 
 Label conversion matches Ultralytics VOC.yaml: skip ``difficult==1``, and
 treat boxes as 1-based inclusive pixels (subtract 1 before normalizing).

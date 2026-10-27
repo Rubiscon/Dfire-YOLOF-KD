@@ -1,6 +1,6 @@
-"""Smoke test for backbone dictionary distillation (proposal fig. 1/2).
+"""Smoke test for backbone dictionary distillation.
 
-Builds YOLOFDistillationModel (student yolo26n-DCN + teacher yolo26n) with the new
+Builds YOLOFDistillationModel (student models/yolo26n-DCN + teacher yolo26n) with the
 dictionary modules and runs: joint-phase loss (Grad-CAM saliency) + backward,
 frozen-phase loss (saliency EMA fallback) + backward, and an EMA-style deepcopy.
 """
@@ -53,7 +53,7 @@ args = SimpleNamespace(
 )
 
 nc = 2
-model = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=nc, ch=3, verbose=False)
+model = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=nc, ch=3, verbose=False)
 model.args = args
 model.nc = nc
 model.names = {0: "smoke", 1: "fire"}
@@ -133,7 +133,7 @@ print("deepcopy (EMA path) OK")
 args.dict_match = "soft"
 args.dict_commit_loss = 0.05
 args.dict_weight = "saliency"
-model2 = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=nc, ch=3, verbose=False)
+model2 = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=nc, ch=3, verbose=False)
 model2.args = args
 model2.nc = nc
 model2.names = model.names

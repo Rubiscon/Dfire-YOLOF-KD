@@ -60,7 +60,7 @@ args = SimpleNamespace(
 )
 
 nc = 2
-model = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=nc, ch=3, verbose=False)
+model = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=nc, ch=3, verbose=False)
 model.args = args
 model.nc = nc
 model.names = {0: "smoke", 1: "fire"}

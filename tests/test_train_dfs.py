@@ -460,8 +460,8 @@ def test_dfire_dict_structure_variants(variant, expect):
     assert cfg["optimizer"] == "SGD"
     for key, value in expect.items():
         assert cfg[key] == value, key
-    # Untouched baseline knobs must still hold (unless this arm deliberately moves them,
-    # e.g. the `nodict` ablation zeroes both dictionary gains).
+    # Baseline knobs not moved by this arm keep their recipe value (the `nodict` ablation
+    # zeroes both dictionary gains, for example).
     from scripts.train_dfs import _KD_RECIPE
 
     for key in ("dict_align_loss", "dict_attn_loss", "align_start_epoch", "feature_loss"):

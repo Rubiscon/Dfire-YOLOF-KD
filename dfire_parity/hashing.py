@@ -1,10 +1,10 @@
-"""Stable student-init hashing for cross-framework solo/KD parity.
+"""Student-init hashing for cross-framework solo/KD comparison.
 
 GID (Detectron2) and SKD (MMDetection) both partial-load ``yolo26n.pt`` into
 YOLOF-DCN. Unmatched layers stay randomly initialized, so the post-load
-``state_dict`` hash is the fair-comparison fingerprint. This module is the
-shared implementation so both hosts write the same manifest schema and can
-enforce the same reference file.
+``state_dict`` hash identifies the resulting initialisation. Both hosts share
+this module so they write the same manifest schema and check the same reference
+file.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ def enforce_student_init_hash(
     """Compare ``current_hash`` to a one-line reference file.
 
     If the reference is missing and ``create_if_missing`` is true, write it
-    (exclusive create) so the first controlled run pins the fingerprint.
+    (exclusive create) so the first run pins the initialisation.
     """
     reference_path = os.path.expanduser(str(reference_path))
     if not reference_path:
@@ -53,7 +53,7 @@ def enforce_student_init_hash(
             expected_hash = handle.read().strip()
         if expected_hash != current_hash:
             raise RuntimeError(
-                "Student initialization differs from controlled reference: "
+                "Student initialization differs from the reference: "
                 f"expected {expected_hash}, got {current_hash}"
             )
         return expected_hash

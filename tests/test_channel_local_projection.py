@@ -85,11 +85,11 @@ def test_unknown_proj_form_is_rejected():
 
 
 def test_per_channel_affine_would_be_a_dead_no_op_but_the_3x3_is_not():
-    """The trap this design avoids, asserted so it cannot be reintroduced silently.
+    """The trap this design avoids: an affine projection would be a dead no-op.
 
-    The align loss standardises per channel over space; that cancels an affine exactly, leaving
-    only eps leakage in its gradient, whereas a 3x3 depthwise filter survives and gets a real
-    gradient.
+    The align loss standardises per channel over space, which cancels an affine exactly and
+    leaves only eps leakage in its gradient, whereas a 3x3 depthwise filter survives and gets a
+    real gradient.
     """
     def standardize(v, eps=1e-5):
         m = v.mean(dim=(2, 3), keepdim=True)

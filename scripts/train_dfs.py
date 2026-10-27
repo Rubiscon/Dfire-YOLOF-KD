@@ -59,13 +59,13 @@ BASELINES: dict[str, dict[str, Any]] = {
     "dcn-solo": {
         "trainer": "detect",
         "description": "YOLOF-DCN student solo",
-        "model": "yolo26n-DCN.yaml",
+        "model": "models/yolo26n-DCN.yaml",
         "name": "dcn-solo",
     },
     "dcn-kd": {
         "trainer": "kd",
         "description": "YOLOF-DCN + dLdx dictionary KD (D_dldx_new_2 gains)",
-        "model": "yolo26n-DCN.yaml",
+        "model": "models/yolo26n-DCN.yaml",
         "name": "dcn-kd",
     },
     # --- Narrow stride-8 high-resolution tap arms -----------------------------------
@@ -82,68 +82,63 @@ BASELINES: dict[str, dict[str, Any]] = {
     "dcn-solo-p3": {
         "trainer": "detect",
         "description": "YOLOF-DCN solo + stride-8 high-resolution tap (wide Detect head)",
-        "model": "yolo26n-DCN-P3.yaml",
+        "model": "models/yolo26n-DCN-P3.yaml",
         "name": "dcn-solo-p3",
     },
     "dcn-solo-headn": {
         "trainer": "detect",
         "description": "YOLOF-DCN solo, narrowed Detect head, no tap (control arm)",
-        "model": "yolo26n-DCN-headn.yaml",
+        "model": "models/yolo26n-DCN-headn.yaml",
         "name": "dcn-solo-headn",
     },
     "dcn-solo-p3n": {
         "trainer": "detect",
         "description": "YOLOF-DCN solo + stride-8 tap, narrowed Detect head",
-        "model": "yolo26n-DCN-P3n.yaml",
+        "model": "models/yolo26n-DCN-P3n.yaml",
         "name": "dcn-solo-p3n",
     },
-    # --- Stride-16 tap: the latency-conscious version of the same idea -------------------
-    # The stride-8 tap lifts AP_S by 40% but costs ~25% latency, because the added 80x80
-    # lattice makes the head do 16x the spatial work of the existing 20x20 one. A stride-16
-    # lattice is 40x40, i.e. 4x instead of 16x, and measures at only +4.7% GFLOPs against the
-    # baseline (versus +27.9% for stride 8). These two arms ask whether a defensible amount of
-    # the AP_S gain survives at a cost that keeps the CPU-efficiency claim intact.
+    # --- Stride-16 tap: cheaper version of the same idea ----------------------------------
+    # A stride-8 tap adds an 80x80 lattice, i.e. 16x the head's spatial work; a stride-16 tap
+    # adds 40x40, i.e. 4x, at +4.7% GFLOPs against the baseline instead of +27.9%.
     #
     #   dcn-solo-p4n     stride-16 tap, legacy head  (mirror of dcn-solo-p3n)
     #   dcn-solo-p4npl   stride-16 tap, per-level head: narrow on the 40x40 lattice, full
-    #                    width restored on C5. Needs `head_width: per_level` support in Detect.
+    #                    width restored on C5. Needs `head_width: per_level` in Detect.
     "dcn-solo-p4n": {
         "trainer": "detect",
         "description": "YOLOF-DCN solo + stride-16 tap (legacy global head width)",
-        "model": "yolo26n-DCN-P4n.yaml",
+        "model": "models/yolo26n-DCN-P4n.yaml",
         "name": "dcn-solo-p4n",
     },
     "dcn-solo-p4npl": {
         "trainer": "detect",
         "description": "YOLOF-DCN solo + stride-16 tap, per-level head width",
-        "model": "yolo26n-DCN-P4n-pl.yaml",
+        "model": "models/yolo26n-DCN-P4n-pl.yaml",
         "name": "dcn-solo-p4npl",
     },
     # Same head as dcn-solo-p4npl plus a two-level top-down fusion: C5 is projected,
     # upsampled, concatenated with the tap and fused back. Detect widths are held identical
     # (stride [16, 32], c2 [16, 32], c3 [48, 128]).
     #
-    # Measured locally: +47,808 parameters, +0.139 GFLOPs, +8.9% latency.
+    # Local measurement: +47,808 parameters, +0.139 GFLOPs, +8.9% latency.
     "dcn-solo-p4npl-fpnlite": {
         "trainer": "detect",
         "description": "YOLOF-DCN stride-16 tap + minimal top-down FPN fusion",
-        "model": "yolo26n-DCN-P4npl-fpnlite.yaml",
+        "model": "models/yolo26n-DCN-P4npl-fpnlite.yaml",
         "name": "dcn-solo-p4npl-fpnlite",
     },
     # --- pindw distillation on top of the stride-8 tap -------------------------------
-    # Same training objective as the existing `dcn-kd --kd-variant pindw` arms, but the student
-    # is the tap model instead of the single-level one. Everything the KD machinery taps is
-    # unchanged: the backbone tap is still layer 10 (C2PSA) and there are still three
-    # DilatedDeformBlocks, so the three per-scale projectors and the dictionary pairing are
-    # identical in count and shape. HighResTap deliberately does NOT register a distillation
-    # block, so the added lattice is presently trained by the task loss alone; distilling the
-    # teacher's P3 into it is a separate change.
+    # Same objective as the `dcn-kd --kd-variant pindw` arms, with the tap model as student.
+    # The distillation taps are unchanged: the backbone tap is still layer 10 (C2PSA) and there
+    # are still three DilatedDeformBlocks, so the projectors and the dictionary pairing keep the
+    # same count and shape. HighResTap does not register a distillation block, so the added
+    # lattice is trained by the task loss only.
     #
     # Run it as:  --baseline dcn-kd-p3n --kd-variant pindw
     "dcn-kd-p3n": {
         "trainer": "kd",
         "description": "YOLOF-DCN stride-8 tap + dictionary/neck/response KD (student of the tap family)",
-        "model": "yolo26n-DCN-P3n.yaml",
+        "model": "models/yolo26n-DCN-P3n.yaml",
         "name": "dcn-kd-p3n",
     },
 }
@@ -307,13 +302,12 @@ _DICT_INIT_SEED = 1234
 # recipe, which is applied automatically for `--dataset voc2007` before the variant is
 # layered on.
 #
-# The name is deliberately NOT `pindw`. The two tables are separate namespaces when RESOLVING a
-# variant, but the guard in `_apply_kd_variant` is name-based: any name present in
-# `_VOC_KD_VARIANTS` is rejected for non-VOC datasets with "VOC KD variant X is voc2007-only".
-# Registering `pindw` here therefore broke the D-Fire `pindw` arm outright -- caught by
-# tests/test_train_dfs.py. A distinct name keeps both usable.
+# The name is not `pindw`. The two tables are separate namespaces when resolving a variant, but
+# the guard in `_apply_kd_variant` is name-based: any name present in `_VOC_KD_VARIANTS` is
+# rejected for non-VOC datasets with "VOC KD variant X is voc2007-only". Registering `pindw`
+# here would break the D-Fire `pindw` arm; tests/test_train_dfs.py covers this.
 # Defined here rather than inline in `_VOC_KD_VARIANTS` because that table sits above
-# `_DICT_INIT_SEED` and the seed must not be duplicated as a literal.
+# `_DICT_INIT_SEED` and the seed is shared.
 _VOC_KD_VARIANTS["vocpindw"] = {
     "dict_teacher_encoder": False,
     "dict_student_encoder": "depthwise",
@@ -330,19 +324,18 @@ _VOC_KD_VARIANTS["vocpindwbox"] = {
 }
 
 # Epoch at which the delayed fixed-map arms switch the whole dictionary branch on. 0-indexed,
-# because `_dict_active()` compares it against `self.current_epoch`. Chosen at 40 because the
-# measured deficit of the undelayed fixed-map arm is widest over e21-40.
+# because `_dict_active()` compares it against `self.current_epoch`. 40, because the deficit of
+# the undelayed fixed-map arm is widest over e21-40.
 _DICT_DELAY_EPOCH = 40
 
 # A-path shared configuration: channel-local learnable projection plus a differentiable
 # assignment so the correspondence can actually be trained.
 #   proj_form=channel_local : depthwise 3x3, identity-init. Channel-locality is structural
 #                             (groups=C), so the pairing stays visible whatever the weights do.
-#                             A per-channel affine would NOT work here: the align loss
+#                             A per-channel affine does not work here: the align loss
 #                             standardises each channel over space, which cancels an affine
-#                             exactly and leaves its parameters with no gradient (measured
-#                             1.4e-05 vs 2.0e-02 for the 3x3 form, and that residual is pure
-#                             eps leakage).
+#                             exactly and leaves its parameters with no gradient (1.4e-05 vs
+#                             2.0e-02 for the 3x3 form, and that residual is pure eps leakage).
 #   proj_kernel=3           : the smallest odd kernel that survives standardisation.
 #   match_init=identity     : start from a meaningful correspondence so the differentiable
 #                             assignment refines a good map instead of random noise.
@@ -377,41 +370,32 @@ _DICT_ST_MODS = {
 _DICT_DW_ST = {**_DICT_DW, **_DICT_ST_MODS}
 _DFIRE_KD_VARIANTS.update(
     {
-        # Both encoders kept (proposal figure intact) but initialised as channel-wise
-        # identities, so K = pool(x^e) and Q = pool(n) exactly: the two sides stay in
-        # their ORIGINAL feature spaces and are therefore comparable. Two independent
-        # random projections do the opposite and sit at chance.
-        # Matching accuracy against an INDEPENDENT, layout-free ground truth (per-channel
-        # activation-intensity series correlated across images, ground truth estimated on
-        # held-out images; chance = 0.78%): random encoders 0.72-0.75%, identity encoders
-        # 1.33% at d=4 and 2.08% at d=100. So identity is genuinely better than chance but
-        # the absolute accuracy is ~2%. An earlier figure of 21.4% came from a
-        # spatial-pattern oracle that shares the raw features with the identity design and
-        # is therefore partly circular; it must not be quoted.
+        # Both encoders kept but initialised as channel-wise identities, so K = pool(x^e) and
+        # Q = pool(n) exactly: the two sides stay in their original feature spaces and are
+        # comparable. Two independent random projections do the opposite and sit at chance.
+        #
+        # Matching accuracy against a layout-free ground truth (per-channel activation-intensity
+        # series estimated on held-out images; chance = 0.78%): random encoders 0.72-0.75%,
+        # identity encoders 1.33% at d=4 and 2.08% at d=100.
         "identinit": {**_DICT_ST_DIAG, "dict_match_init": "identity"},
-        # Same function as identinit (a frozen, identity-initialised encoder is an
-        # identity regardless of conv type) but with the teacher-side encoder removed and
-        # a depthwise student encoder, so the module drops from 1,000,448 to 265,216
-        # parameters. This is the variant that is both correct AND lightweight.
+        # Same function as identinit -- a frozen, identity-initialised encoder is an identity
+        # regardless of conv type -- with the teacher-side encoder removed and a depthwise
+        # student encoder, so the module drops from 1,000,448 to 265,216 parameters.
         "dwident": {
             **_DICT_ST_DIAG,
             "dict_teacher_encoder": False,
             "dict_student_encoder": "depthwise",
             "dict_match_init": "identity",
         },
-        # Token-resolution pair. The proposal reduces the teacher early feature "by 16
-        # times" with x^{es} in R^{Ce x He/4 x We/4}, i.e. each side /4 (area /16), so the
-        # 40x40 tap gives a 10x10 map and d = 100. The recipe default divides each side by
-        # 16 instead (d = 4), which is 25x fewer tokens.
-        # Against the independent held-out intensity ground truth, adding tokens raises the
-        # identity matcher from 1.33% (d=4) to 2.08% (d=100); chance is 0.78% and random
-        # encoders stay at 0.72-0.75% at every resolution. So resolution helps the matcher,
-        # it is just nowhere near a usable correspondence either way.
-        #   res      : resolution alone, recipe otherwise untouched (isolates the effect)
-        #   resident : resolution + identity encoders (the proposal's stated intent:
-        #              comparable spaces AND enough tokens to compare fine structure)
-        # Note: batch_corr ignores tokens entirely (it correlates per-image channel means),
-        # so the oracle arm is already resolution-independent.
+        # Token-resolution pair. The default divisor is 16 per side, so the 40x40 tap gives a
+        # 2x2 map (d = 4); divisor 4 per side gives a 10x10 map (d = 100), i.e. 25x the tokens.
+        # On the held-out intensity ground truth, adding tokens raises the identity matcher
+        # from 1.33% (d=4) to 2.08% (d=100); chance is 0.78% and random encoders stay at
+        # 0.72-0.75% at every resolution.
+        #   res      : resolution alone, recipe otherwise untouched
+        #   resident : resolution + identity encoders (comparable spaces and fine structure)
+        # batch_corr ignores tokens entirely (it correlates per-image channel means), so the
+        # oracle arm is already resolution-independent.
         "res": {
             **_DICT_ST_DIAG,
             "dict_match_grid_divisor": 4,
@@ -422,24 +406,18 @@ _DFIRE_KD_VARIANTS.update(
             "dict_match_grid_divisor": 4,
         },
         "basefix": dict(_DICT_ST_DIAG),
-        # Single-key delta from basefix: only dict_freeze_encoders is flipped. This arm
-        # exists to separate the two things that changed between the r1-r3 baselines and
-        # every arm measured since 2026-09-22, which were confounded:
-        #   (a) the freeze fix itself -- encoder BatchNorm held in eval mode and the params
-        #       kept out of the optimizer, versus the historical runs where BatchNorm sat in
-        #       train mode (normalising by per-batch statistics, running stats updating);
+        # Single-key delta from basefix: only dict_freeze_encoders is flipped. It separates the
+        # two changes between the r1-r3 baselines and the arms measured since 2026-09-22:
+        #   (a) the freeze fix: encoder BatchNorm held in eval mode and the parameters kept out
+        #       of the optimizer, versus the historical runs where BatchNorm sat in train mode;
         #   (b) any other code change between 09-18 and 09-24.
-        # Reading three points together decomposes them, same-machine on westb:
-        #   r1-r3 (old code, unfrozen) vs nofreeze (new code, unfrozen) -> (b) alone
-        #   nofreeze (new code, unfrozen) vs basefix (new code, frozen) -> (a) alone
-        # Why it matters: 13 of the 21 measured arms to date run with frozen=True, so almost
-        # every "arm vs the reference trio" gap in the ledger currently mixes (a) and (b)
-        # with the arm's own change, and cannot be attributed. The measured size of the
-        # effect is not small -- switching the encoder BatchNorm between the two modes on
-        # identical weights reassigns ~90% of student channels (assignment-map agreement
-        # 0.0985) and shifts the tokens by ~1.0 in relative L2 -- and for the identity-init
-        # family the freeze is what makes identity initialisation actually mean the identity
-        # function, since train-mode BatchNorm would re-normalise it away.
+        # Three points decompose them on the same machine:
+        #   r1-r3 (old code, unfrozen) vs nofreeze (new code, unfrozen) -> (b)
+        #   nofreeze (new code, unfrozen) vs basefix (new code, frozen) -> (a)
+        # Switching the encoder BatchNorm between the two modes on identical weights reassigns
+        # ~90% of student channels (assignment-map agreement 0.0985) and shifts the tokens by
+        # ~1.0 in relative L2. For the identity-init family the freeze is also what makes the
+        # initialisation mean the identity function, since train-mode BatchNorm re-normalises it.
         "nofreeze": {
             **_DICT_ST_DIAG,
             "dict_freeze_encoders": False,
@@ -535,7 +513,7 @@ _DFIRE_KD_VARIANTS.update(
             "dict_align_loss": 0.06,
         },
         # --- A PATH: channel-local LEARNABLE projection + a correspondence that can be trained --
-        # Motivation, all measured rather than assumed:
+        # Motivation:
         #   * The shipped projection mixes every student channel into every output channel, so
         #     reassigning a student channel's target merely relabels independent sub-problems and
         #     the pairing is absorbed: fitting the projection to a map versus to that map with the
@@ -545,19 +523,18 @@ _DFIRE_KD_VARIANTS.update(
         #     of 0.03%. But the parameter-free identity projection then leaves nothing learnable,
         #     so the pairing must carry the entire benefit.
         #   * Under `hard` matching the assignment is an argmax, so it is non-differentiable: the
-        #     encoders are frozen at their random init and there is nothing for a supervision term
-        #     to train. That is why every accuracy improvement measured so far changed nothing.
+        #     encoders are frozen at their random init and no supervision term can train them.
         #
         # So these arms pair `dict_proj_form=channel_local` (depthwise 3x3, identity-init, 2560
-        # params) with a DIFFERENTIABLE assignment -- `straight_through` (hard forward, soft
-        # backward, preserving Figure 2's forward assignment) or full `soft` -- and use identity
-        # init for the encoders so the assignment starts meaningful rather than arbitrary, then
-        # is refined. `dict_commit_loss` is the only term that directly supervises the pairing.
+        # params) with a differentiable assignment -- `straight_through` (hard forward, soft
+        # backward) or full `soft` -- and use identity init for the encoders so the assignment
+        # starts from a meaningful map and is then refined. `dict_commit_loss` is the only term
+        # that directly supervises the pairing.
         #
-        # alpha is swept at both the recipe value (0.12) and 0.06, because a channel-local
-        # projection passes about 4.7x more align gradient to the student tap than the shipped
-        # DeconvNet does (measured 0.00603 vs 0.00129 at identical weights), and `identlowalign`
-        # already showed that alpha 0.06 recovers most of what the identity family loses at 0.12.
+        # alpha is swept at the recipe value (0.12) and 0.06, because a channel-local projection
+        # passes about 4.7x more align gradient to the student tap than the shipped DeconvNet
+        # (0.00603 vs 0.00129 at identical weights), and `identlowalign` already showed that 0.06
+        # recovers most of what the identity family loses at 0.12.
         "alocst12": {**_DICT_A_ST, "dict_align_loss": 0.12},
         "alocst06": {**_DICT_A_ST, "dict_align_loss": 0.06},
         "alocsoft12": {**_DICT_A_SOFT, "dict_align_loss": 0.12},
@@ -634,30 +611,27 @@ _DFIRE_KD_VARIANTS.update(
             "dict_student_encoder": "depthwise",
         },
         # --- (2)+(3) on top of pindw: size-weighted align + confidence-weighted box term ------
-        # Every number below is measured on the D-Fire test split, not assumed.
-        #
-        # (2) align_size_weight. ``align_loss`` is a plain mean over ASSIGNED ANCHORS, so an
+        # (2) align_size_weight. ``align_loss`` is a plain mean over assigned anchors, so an
         #     object's gradient share is proportional to its anchor count. On the stride-32 grid
         #     that is 2.9% for small objects vs 75.5% for large, while the teacher's headroom is
-        #     0.046 small vs 0.018 large -- the gradient is spent where the teacher has least to
+        #     0.046 small vs 0.018 large, so the gradient is spent where the teacher has least to
         #     give. w_i = clip((median_side/side_i)**1, 0.25, 4), mass-normalised by
         #     sum(w*v)/sum(w) so the loss scale (and therefore `align_box`) needs no retuning.
-        #     Measured effect on the small-object gradient share: 2.9% -> 14.4% (stride 32) and
+        #     Effect on the small-object gradient share: 2.9% -> 14.4% (stride 32) and
         #     7.4% -> 24.5% (stride 16). A weaker exponent barely moves it (p=0.5 -> 7.3%).
         #
         # (3) align_box_conf_weight. The class term is already soft in `tconf` (a 0.05-confidence
-        #     box yields a near-uniform target), but the BOX term is an unweighted mean, so such a
-        #     box pulls the student's box at full strength. Measured: the band admitted by
-        #     lowering the threshold carries 9.7 false positives per new true positive. Weighting
-        #     the box term by tconf makes a target's contribution proportional to the teacher's
-        #     own confidence in it. The class term is deliberately NOT weighted again.
+        #     box yields a near-uniform target), but the box term is an unweighted mean, so such a
+        #     box pulls the student's box at full strength. The band admitted by lowering the
+        #     threshold carries 9.7 false positives per new true positive. Weighting the box
+        #     term by tconf makes a target's contribution proportional to the teacher's own
+        #     confidence in it. The class term is not weighted a second time.
         #
-        # distill_conf_thres stays at the recipe value (0.25) on purpose: (3) removes the need to
-        # lower it, so this arm changes exactly two things and both are attributable.
+        # distill_conf_thres stays at the recipe value (0.25): (3) removes the need to lower it,
+        # so this arm moves exactly two keys.
         #
-        # Caveat carried from the analysis: 57.2% of small objects receive ZERO assigned anchor
-        # at stride 32 (20.3% at stride 16). No weighting can reach those, which is why this arm
-        # is run on a tap student and why it is expected to be a <=1 pp effect, not a rescue.
+        # 57.2% of small objects receive no assigned anchor at stride 32 (20.3% at stride 16).
+        # No weighting reaches those, so on a tap student this is a <=1 pp effect, not a fix.
         "pindwsz": {
             **_DICT_ST_DIAG,
             "dict_init_seed": _DICT_INIT_SEED,
@@ -669,29 +643,25 @@ _DFIRE_KD_VARIANTS.update(
             "align_size_weight_max": 4.0,
             "align_box_conf_weight": True,
         },
-        # --- pindwsz with the dictionary pairing moved to the SHAPE-MATCHED layer pair ------------
-        # Every earlier D-Fire arm pairs teacher x6 (128ch, stride 16, 40x40) with student n10
-        # (256ch, stride 32, 20x20): two axes mismatched at once, which forces the projector to
-        # INVENT a 2x spatial resolution and to bridge a 2:1 channel change. Measured shapes:
+        # --- pindwsz with the dictionary pairing moved to a shape-matched layer pair -----------
+        # The other D-Fire arms pair teacher x6 (128ch, stride 16, 40x40) with student n10
+        # (256ch, stride 32, 20x20): both axes are mismatched, so the projector has to resample
+        # 2x spatially and bridge a 2:1 channel change. Measured shapes:
         #     T[6] = 128ch 40x40 stride 16        S[6] = 128ch 40x40 stride 16
-        # so S[6] <-> T[6] shares channel count, spatial size AND stride. The projector degrades to
-        # a plain depthwise 3x3 with no resampling, and the matching compares two features that live
-        # in the same space.
+        # S[6] <-> T[6] shares channel count, spatial size and stride. The projector degrades to
+        # a plain depthwise 3x3 without resampling, and the matching compares two features that
+        # live in the same space.
         #
-        # Why this is the right experiment (motivated by CanKD, WACV 2026): CanKD's cross-attention
-        # correspondence sits on the SPATIAL axis and it hard-asserts y_s.shape == y_t.shape, i.e. it
-        # never has to bridge a shape mismatch; it also COARSENS the teacher with maxpool rather than
-        # expanding the student. Our channel-axis correspondence has no observable anchor (measured:
-        # label-aware reproducibility 0.271, below a constant central box at 0.307), so the question
-        # this arm isolates is whether the failure is the CHANNEL axis itself or the SHAPE MISMATCH
-        # that every previous arm confounded with it.
+        # This separates the channel-axis correspondence from the shape mismatch that every
+        # earlier arm carried with it. CanKD's cross-attention correspondence sits on the
+        # spatial axis and asserts y_s.shape == y_t.shape, so it never bridges a mismatch; the
+        # channel-axis correspondence has no such anchor (label-aware reproducibility 0.271,
+        # below a constant central box at 0.307).
         #
-        # `dict_student_encoder="depthwise"` (not `depthwise_upsample`): no resampling is needed at
-        # equal spatial size, and keeping the plain depthwise form avoids the learnable transposed
-        # conv entirely, so the residual is computed with no upsampling branch at all.
-        # `dict_match_pool="avg"` is kept (the shipped tokenisation): CanKD's own softmax-free
-        # attention is not adopted here, so this arm changes the PAIRING and nothing else about the
-        # matching machinery -- that keeps it a single-variable delta against `pindwsz`.
+        # `dict_student_encoder="depthwise"` (not `depthwise_upsample`): nothing needs
+        # resampling at equal spatial size, so the residual is computed with no upsampling
+        # branch. `dict_match_pool="avg"` keeps the shipped tokenisation, so this arm changes the
+        # pairing and nothing else about the matching machinery.
         "pindwsz_s6": {
             **_DICT_ST_DIAG,
             "dict_init_seed": _DICT_INIT_SEED,
@@ -758,22 +728,21 @@ _DFIRE_KD_VARIANTS.update(
             "align_loss": 0.0,
             "feature_loss": 0.0,
         },
-        # --- dictionary-ONLY, carrying the dictionary-side changes that measured best ---------
-        # `pindwonly` alone reached +0.0027 val95 over solo (99% of epochs positive) -- a real but
-        # small effect. The question these arms answer is whether the dictionary branch does better
-        # when it also carries the two implementation changes that measured as consistent net wins:
-        #   uniform weighting            (saliency dLdx weighting measured +0.0060/+0.0042/+0.0046/
-        #                                 +0.0025 when replaced by uniform, 91% of epochs)
-        #   finer matching grid (10x10)  (measured +0.0054/+0.0039/+0.0022/+0.0020, 83% of epochs)
-        # The design keeps `pindwonly` as the common reference, so each arm adds exactly one idea
-        # and `pindwonlyures` is the best-case combination:
-        #     pindwonly      saliency + coarse grid      (already measured)
+        # --- dictionary-only, carrying the dictionary-side changes that helped most ---------
+        # `pindwonly` alone reached +0.0027 val95 over solo (99% of epochs positive). These arms
+        # ask whether the dictionary branch does better when it also carries the two changes that
+        # were consistent net wins:
+        #   uniform weighting            (+0.0060/+0.0042/+0.0046/+0.0025 over saliency dLdx,
+        #                                 91% of epochs)
+        #   finer matching grid (10x10)  (+0.0054/+0.0039/+0.0022/+0.0020, 83% of epochs)
+        # `pindwonly` stays the common reference, so each arm adds exactly one idea and
+        # `pindwonlyures` is the best-case combination:
+        #     pindwonly      saliency + coarse grid
         #     pindwonlyu     uniform  + coarse grid
         #     pindwonlyres   saliency + fine grid
         #     pindwonlyures  uniform  + fine grid
-        #     dictonlyu      recipe encoders + uniform   -> isolates the ARCHITECTURE question with
-        #                    the weighting held uniform, since `dictonlyu` vs `pindwonlyu` then
-        #                    differs only in teacher-encoder removal + depthwise student encoder.
+        #     dictonlyu      recipe encoders + uniform, so `dictonlyu` vs `pindwonlyu` differs
+        #                    only in teacher-encoder removal and the depthwise student encoder.
         "pindwonlyu": {
             **_DICT_ST_DIAG,
             "dict_init_seed": _DICT_INIT_SEED,
@@ -802,8 +771,8 @@ _DFIRE_KD_VARIANTS.update(
             "dict_weight": "none",
             "dict_match_grid_divisor": 4,
         },
-        # Recipe encoders (teacher-side present, full-conv student) with the dictionary branch as the
-        # ONLY distillation, weighting held uniform. Deliberately sets no architecture key.
+        # Recipe encoders (teacher-side present, full-conv student) with the dictionary branch as
+        # the only distillation and uniform weighting. Sets no architecture key.
         "dictonlyu": {
             **_DICT_ST_DIAG,
             "align_loss": 0.0,
@@ -865,27 +834,24 @@ _DFIRE_KD_VARIANTS.update(
             "dict_match_init": "identity",
         },
         # --- delayed / delayed+reduced versions of the fixed-map arms -------------------
-        # oraclemap-r1 ran with the identity projection and a high-accuracy fixed map, and is
-        # persistently behind the reference trio at every epoch sampled: the gap is -0.0043
-        # over e1-20, widest at -0.0083 over e21-40, then narrows to -0.0033 by e101-120.
-        # A measured property of that configuration explains a large early constraint: the
-        # identity projection passes the align gradient to the student tap about 4.7x more
-        # strongly than the shipped DeconvNet does at the SAME alpha (2.16 vs 0.46, stable
-        # across four projection seeds). So the arm is not merely "a different correspondence",
-        # it is also roughly five times harder on the backbone, and alpha=0.12 was tuned under
-        # the DeconvNet form.
+        # oraclemap-r1 ran with the identity projection and a high-accuracy fixed map, and was
+        # behind the reference trio at every epoch sampled: -0.0043 over e1-20, widest at
+        # -0.0083 over e21-40, narrowing to -0.0033 by e101-120. One property of that
+        # configuration explains much of the early gap: the identity projection passes the align
+        # gradient to the student tap about 4.7x more strongly than the shipped DeconvNet at the
+        # same alpha (2.16 vs 0.46, stable across four projection seeds). The arm is therefore
+        # both a different correspondence and roughly five times harder on the backbone, and
+        # alpha=0.12 was tuned under the DeconvNet form.
         #
         # These arms separate "too strong, too early" from "the correspondence does not help":
         #   *delay     hold the whole dictionary branch (align + AT + commit + InfoMax) off
         #              until dict_start_epoch, so the backbone develops before the added
-        #              constraint appears. `_dict_active()` gates the entire branch, so nothing
-        #              from the dictionary reaches the student until then. 40 is chosen because
-        #              the widest deficit sits in e21-40.
-        #   *delaylow  the same delay AND dict_align_loss halved to 0.06, which is the setting
-        #              that recovered identinit in the identlowalign arm.
-        # Each is defined for the oracle map AND its shuffled counterpart, because the delay
-        # and the correspondence are otherwise confounded: only the (delay, delay-shuffled)
-        # pair isolates whether an accurate correspondence helps once the schedule is sane.
+        #              constraint appears. `_dict_active()` gates the entire branch. 40 is chosen
+        #              because the widest deficit sits in e21-40.
+        #   *delaylow  the same delay with dict_align_loss halved to 0.06, the setting that
+        #              recovered identinit in the identlowalign arm.
+        # Each exists for the oracle map and its shuffled counterpart, so the (delay,
+        # delay-shuffled) pair isolates whether an accurate correspondence helps.
         "oraclemapdelay": {
             **_DICT_ST_DIAG,
             "dict_match": "fixed",
@@ -916,11 +882,11 @@ _DFIRE_KD_VARIANTS.update(
             "dict_start_epoch": _DICT_DELAY_EPOCH,
             "dict_align_loss": 0.06,
         },
-        # Diagnostic arm: keep the baseline recipe (both encoders present, full conv,
-        # default init) but replace the projected-token argmax with a data-adaptive
-        # matcher that correlates per-channel activation series across the batch. The
-        # only moved variable is therefore matching quality: if a near-perfect matcher
-        # still does not beat basefix, the matching axis is not the lever.
+        # Diagnostic arm: keep the baseline recipe (both encoders present, full conv, default
+        # init) and replace the projected-token argmax with a data-adaptive matcher that
+        # correlates per-channel activation series across the batch. The only moved variable is
+        # matching quality, so if a near-perfect matcher still does not beat basefix, matching
+        # quality is not what limits the metric.
         "oracle": {
             **_DICT_ST_DIAG,
             "dict_match": "batch_corr",
@@ -944,14 +910,13 @@ _DFIRE_KD_VARIANTS.update(
 # whose output channel c is structurally tied to student channel c, so the correspondence
 # survives into the loss.
 #
-# The map comes from --dict-fixed-map; every arm uses a map with the SAME target histogram
+# The map comes from --dict-fixed-map; every arm uses a map with the same target histogram,
 # so the only variable is the fraction of correctly paired student channels
 # (q = 0.00 / 0.50 / 1.00 built by tools_exp/build_match_maps_v2.py).
 #
 #   msq000 / msq050 / msq100 : q = 0 / 0.5 / 1; alpha at the channel-local recovery value
-#   msctrl                   : q = 1 with alpha = 1.0 -- a positive control proving the
-#                              branch can move the metric at all (the sweep is only
-#                              informative if this arm is visibly harmed).
+#   msctrl                   : q = 1 with alpha = 1.0, a positive control that the branch can
+#                              move the metric at all
 # ----------------------------------------------------------------------------------
 _MSWEEP_BASE: dict[str, Any] = {
     **_DICT_ST_DIAG,
@@ -1228,9 +1193,8 @@ def build_overrides(baseline: str, args: argparse.Namespace) -> dict[str, Any]:
         if args.dataset == "voc2007":
             cfg.update(_VOC_KD_OVERRIDES)
         _apply_kd_variant(cfg, args.dataset, str(getattr(args, "kd_variant", "") or ""))
-        # The fixed-map arms differ ONLY in the map file, so the path and its recorded
-        # sha256 are injected after the variant. Both are logged for provenance, and the
-        # trainer refuses to run if the file's hash does not match.
+        # The fixed-map arms differ only in the map file, so the path and its sha256 are injected
+        # after the variant. The trainer refuses to run if the hash does not match.
         fixed_map = str(getattr(args, "dict_fixed_map", "") or "")
         if fixed_map:
             cfg["dict_fixed_map"] = fixed_map
@@ -1285,13 +1249,12 @@ def assert_cfg_supported() -> None:
     if not missing:
         return
     raise SystemExit(
-        "This Ultra tree is missing CONTROLLED_ARGS keys: %s\n"
-        "You copied scripts/train_dfs.py onto an older ultralytics. Sync the current fork, at least:\n"
+        "This tree is missing CONTROLLED_ARGS keys: %s\n"
+        "The script was copied onto an older ultralytics. Sync at least:\n"
         "  ultralytics/cfg/default.yaml\n"
         "  ultralytics/engine/trainer.py\n"
         "  dfire_parity/\n"
-        "  scripts/train_dfs.py\n"
-        "Do not strip these keys: the protocol fork needs them."
+        "  scripts/train_dfs.py"
         % missing
     )
 

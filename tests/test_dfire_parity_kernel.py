@@ -9,7 +9,14 @@ import pytest
 import torch
 from torch import nn
 
-from dfire_parity import build_args, build_optimizer, lr_lambda, scaled_weight_decay, warmup_iterations
+from dfire_parity import (
+    build_args,
+    build_optimizer,
+    lr_lambda,
+    scaled_weight_decay,
+    warmup_epochs_for,
+    warmup_iterations,
+)
 from dfire_parity.engine import UltralyticsParityEngine
 from ultralytics.engine.trainer import BaseTrainer
 
@@ -25,7 +32,7 @@ def _tiny_model() -> nn.Module:
 
 
 def test_controlled_args_match_full_aug_protocol():
-    args = build_args(data="dfire.yaml", model="yolo26n-DCN.yaml")
+    args = build_args(data="dfire.yaml", model="models/yolo26n-DCN.yaml")
     assert (args.epochs, args.batch, args.nbs) == (200, 32, 32)
     assert (args.lr0, args.lrf, args.momentum, args.weight_decay) == (0.01, 0.01, 0.9, 0.0005)
     assert args.optimizer == "SGD" and not args.cos_lr and args.amp and not args.rect
@@ -78,8 +85,19 @@ def test_weight_decay_is_unscaled_when_batch_equals_nbs():
 def test_warmup_iterations_match_reference_run():
     args = build_args()
     nb = math.ceil(REFERENCE_IMAGES / args.batch)
-    assert nb == 127
+    assert nb == 442
     assert warmup_iterations(args, nb) == 101
+
+
+def test_warmup_length_survives_a_batch_change():
+    at_32 = build_args()
+    at_112 = build_args()
+    at_112.batch = 112
+    at_112.nbs = 112
+    at_112.warmup_epochs = warmup_epochs_for(112)
+    nb_112 = math.ceil(REFERENCE_IMAGES / at_112.batch)
+    assert warmup_iterations(at_32, math.ceil(REFERENCE_IMAGES / at_32.batch)) == 101
+    assert warmup_iterations(at_112, nb_112) == 101
 
 
 def test_lr_lambda_matches_reference_curve():

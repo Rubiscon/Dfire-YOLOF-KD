@@ -48,7 +48,7 @@ def test_enforce_and_manifest_roundtrip(tmp_path):
     assert reference.read_text(encoding="utf-8").strip() == current
     # Second call with same hash passes.
     enforce_student_init_hash(current, str(reference), create_if_missing=False)
-    with pytest.raises(RuntimeError, match="differs from controlled reference"):
+    with pytest.raises(RuntimeError, match="differs from the reference"):
         enforce_student_init_hash("b" * 64, str(reference), create_if_missing=False)
 
     work = tmp_path / "run"
@@ -56,7 +56,7 @@ def test_enforce_and_manifest_roundtrip(tmp_path):
         str(work),
         seed=0,
         current_hash=current,
-        student_model_yaml="yolo26n-DCN.yaml",
+        student_model_yaml="models/yolo26n-DCN.yaml",
         student_init_weights="yolo26n.pt",
         reference_path=str(reference),
     )

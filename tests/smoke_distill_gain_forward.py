@@ -1,20 +1,18 @@
 """Smoke: gradient routing of the distillation terms, and inference independence.
 
-Two claims are pinned here, both of which are easy to get wrong and hard to notice:
-
   A. GAIN ISOLATION. The distillation terms are separate additive contributions to the total
      loss, so:
-       A1  with the task gain set to 0, the distillation terms ALONE still deliver non-zero
+       A1  with the task gain set to 0, the distillation terms alone still deliver non-zero
            gradients to the student;
        A2  with every distillation gain set to 0, the task loss alone still trains the student.
-     A failure of A1 means the "master gain" (the task loss) silently gates the auxiliary
-     supervision, e.g. through an early return or a detached tensor.
+     A failure of A1 means the task loss gates the auxiliary supervision, e.g. through an
+     early return or a detached tensor.
 
-  B. INFERENCE INDEPENDENCE. The teacher and the distillation modules are training-only. Neither
-     the distillation gains nor the teacher's weights may change a test-time forward.
+  B. INFERENCE INDEPENDENCE. The teacher and the distillation modules are training-only, so
+     neither the distillation gains nor the teacher's weights change a test-time forward.
 
 Needs a real teacher checkpoint and real images: a randomly initialised teacher emits no boxes,
-which would leave the align branch at exactly 0 and make the gradient assertions vacuous.
+which leaves the align branch at exactly 0 and makes the gradient assertions vacuous.
 """
 import os
 import pathlib
@@ -119,7 +117,7 @@ def harness():
 
     def build(**over):
         args = _args(**over)
-        model = YOLOFDistillationModel("yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
+        model = YOLOFDistillationModel("models/yolo26n-DCN.yaml", nc=2, ch=3, verbose=False)
         model.args = args
         model.nc = 2
         model.names = {0: "smoke", 1: "fire"}

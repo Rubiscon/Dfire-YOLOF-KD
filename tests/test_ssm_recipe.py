@@ -1,8 +1,8 @@
 """Tests for the `ssm` / `ssm_sz` recipes.
 
-Each test fixes one property of the shipped configuration or of the weighting code. The failure
-mode they cover is that an unregistered cfg key is dropped without an error, so the run silently
-uses different settings than the launch line names.
+Each test fixes one property of the shipped configuration or of the weighting code. The main
+failure mode is an unregistered cfg key being dropped without an error, which makes a run use
+different settings than the launch line names.
 """
 import math
 import pathlib
